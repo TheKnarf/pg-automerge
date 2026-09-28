@@ -3,19 +3,48 @@
 A Postgres 18 extension that stores [Automerge](https://automerge.org)
 documents in an `automerge` column, lets you query them with every `jsonb`
 operator, function and index, and merges concurrent writes so that two
-backends never overwrite each other's changes.
+backends never overwrite each other's changes. It also exposes a
+document's history (changes, and the state as of earlier heads) and
+notifies listening backends when a document changes.
 
-The extension does not edit documents and never creates changes (it can
-list and return the changes a document already has). Your backend
-syncs with its frontends, owns the actor IDs, and persists Automerge saves;
-Postgres stores them, merges them and makes them queryable. See
-[docs/DESIGN.md](docs/DESIGN.md) for the full specification.
+The extension does not edit documents and never creates changes. Your
+backend syncs with its frontends, owns the actor IDs, and persists
+Automerge saves; Postgres stores them, merges them and makes them
+queryable. [docs/DESIGN.md](docs/DESIGN.md) is the full specification.
 
-## Usage
+## Requirements
+
+- PostgreSQL 18 (the only supported version).
+- To build: Rust 1.98 and `cargo-pgrx` 0.19.3 (the exact version of the
+  `pgrx` crate), both pinned in `mise.toml`, plus what pgrx needs to build
+  against Postgres (a C toolchain, libclang).
+- Installing needs superuser rights (`superuser = true`, not trusted).
+
+## Install
+
+From source, with [mise](https://mise.jdx.dev):
+
+```sh
+mise install                 # Rust and cargo-pgrx as pinned in mise.toml
+mise run pgrx-init           # once: download and build the Postgres 18 pgrx develops against
+# into your Postgres 18 (the one whose pg_config you pass):
+cargo pgrx install --release --pg-config /usr/lib/postgresql/18/bin/pg_config
+```
+
+Without mise, install Rust 1.98 and `cargo install --locked cargo-pgrx
+--version 0.19.3`, run `cargo pgrx init --pg18 /path/to/pg_config`, then
+the same `cargo pgrx install`. No `shared_preload_libraries` entry is
+needed. Then, in each database:
 
 ```sql
 CREATE EXTENSION pg_automerge;
+```
 
+There are no prebuilt packages yet.
+
+## Quick start
+
+```sql
 CREATE TABLE docs (id uuid PRIMARY KEY, doc automerge NOT NULL);
 
 -- Persist: $2 is the output of Automerge save() (or save + incremental saves),
@@ -43,7 +72,8 @@ SELECT seq, actor, time, message FROM docs, automerge_changes_meta(doc) WHERE id
 SELECT automerge_to_jsonb(doc, ARRAY[$2]) FROM docs WHERE id = $1;
 ```
 
-For read-heavy tables, keep a jsonb copy and index it (the cast is IMMUTABLE):
+Every read through `jsonb` loads the document. For read-heavy tables, keep
+a jsonb copy and index it (the cast is IMMUTABLE):
 
 ```sql
 ALTER TABLE docs ADD COLUMN data jsonb GENERATED ALWAYS AS (doc::jsonb) STORED;
@@ -52,7 +82,7 @@ CREATE INDEX ON docs USING gin (data jsonb_path_ops);
 CREATE INDEX ON docs USING gin ((doc::jsonb));
 ```
 
-### Keeping backends in sync
+## Keeping backends in sync
 
 Each backend holds replicas of the documents its clients use. To learn
 when another backend persisted changes, attach the notification trigger and
@@ -101,7 +131,7 @@ For bare changes (`$1` bytea) the check usually needs no load of the
 document; for a full save (`$1::automerge`) it costs one extra load when
 there is something new.
 
-### Merging in PL/pgSQL and nested merges
+## Merging in PL/pgSQL and nested merges
 
 A merge result stays loaded in memory (an expanded value) until it is
 stored, sent or cast to `bytea`, so chains of merges do not save and
@@ -119,44 +149,63 @@ BEGIN
 END;
 ```
 
-On a 3 MB document, 20 change sets took 106 s this way before and 5.6 s
-now; `merge(merge(merge(doc, a), b), c)`, `merge(...)::jsonb` and
+On a 3 MB document, merging 20 change sets this way and storing the result
+takes 5.6 s, about two loads of the document in total;
+`merge(merge(merge(doc, a), b), c)`, `merge(...)::jsonb` and
 `merge_agg(...)::jsonb` also skip the intermediate saves and loads. A
-single `UPDATE .. SET doc = merge(doc, $1)` costs the same as before (the
-column arrives flat). Like `merge_agg`'s state, the in-memory document is
-outside Postgres' memory accounting. A failed `merge` leaves the variable unchanged, also
-inside a `BEGIN .. EXCEPTION` block. Details in
+single `UPDATE .. SET doc = merge(doc, $1)` gains nothing (the column
+arrives flat). A failed `merge` leaves the variable unchanged, also inside
+a `BEGIN .. EXCEPTION` block. Details in
 [DESIGN.md](docs/DESIGN.md#expanded-values).
 
-### SQL API
+## SQL API
 
-| | |
-|---|---|
-| `automerge` | Type. Stores `save_nocompress()` bytes; every input is validated and normalized. Text form is `\x` + hex (lossless, used by `pg_dump`/`COPY`). |
-| `bytea → automerge` | Assignment cast (validates). |
-| `automerge → bytea` | Explicit cast: the stored Automerge bytes. |
-| `automerge → jsonb` | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
-| `merge(a, b)`, `a \|\| b` | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. |
-| `merge(doc, changes bytea)`, `doc \|\| changes` | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them). |
-| `merge_agg(automerge)` | Aggregate merge of all non-null inputs. |
-| `automerge_heads(automerge) → text[]` | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
-| `automerge_contains(a, b) → bool` | Whether `a` already has every change of `b`. |
-| `automerge_contains(doc, changes bytea) → bool` | Whether `merge(doc, changes)` would add nothing (every change in the save or change chunks is already in `doc`). Usually decided without loading the document. |
-| `automerge_notify('channel', 'key_col' [, ...])` | `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW` trigger: `NOTIFY channel` with the row key and the new/previous heads of `automerge` columns whose heads changed. |
-| `automerge_changes(doc, since_heads text[] DEFAULT '{}')` | `SETOF automerge_change (hash, actor, seq, start_op, op_count, time, message, deps, change bytea)`: every change not reachable from `since_heads` (all by default), dependencies first. Rebuilds change bytes (costly on big documents). |
-| `automerge_changes_meta(doc, since_heads DEFAULT '{}')` | The same rows without `change` (`SETOF automerge_change_meta`); needs only the change graph. |
-| `automerge_changes_bytes(doc, since_heads DEFAULT '{}') → bytea` | Those changes as concatenated change chunks (`save_after(since_heads)`); `merge(replica, ...)` or `loadIncremental` applies them. |
-| `automerge_get_change(doc, hash) → automerge_change` | One change with its bytes; NULL if absent. |
-| `automerge_change_count(doc) → bigint` | Number of changes, read from the stored bytes without loading the document. |
-| `automerge_to_jsonb(doc, heads text[]) → jsonb` | The state as of `heads` (`'{}'`: before any change). |
+Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 
-jsonb mapping: maps/tables → objects, lists → arrays, text → strings,
-integers and counters → exact numbers, NaN/±Infinity → `null`, timestamps →
-ISO 8601 UTC strings with milliseconds, bytes → base64 strings. Conflicting
-concurrent values show Automerge's winner.
+| | Volatility | |
+|---|---|---|
+| `automerge` | | Type. Stores `save_nocompress()` bytes; every input is validated and normalized. Text form is `\x` + hex (lossless, used by `pg_dump`/`COPY`). |
+| `bytea → automerge` | I S P | Assignment cast (validates). |
+| `automerge → bytea` | | Explicit binary-coercible cast: the stored Automerge bytes. |
+| `automerge → jsonb` | I S P | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
+| `merge(a, b)`, `a \|\| b` | I S P | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. |
+| `merge(doc, changes bytea)`, `doc \|\| changes` | I S P | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them in the DETAIL). |
+| `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. |
+| `automerge_heads(automerge) → text[]` | I S P | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
+| `automerge_contains(a, b) → bool` | I S P | Whether `a` already has every change of `b`. |
+| `automerge_contains(doc, changes bytea) → bool` | I S P | Whether `merge(doc, changes)` would add nothing (every change in the save or change chunks is already in `doc`). Usually decided without loading the document. |
+| `automerge_notify('channel', 'key_col' [, ...])` | volatile, parallel unsafe | `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW` trigger: `NOTIFY channel` with the row key and the new/previous heads of `automerge` columns whose heads changed. |
+| `automerge_changes(doc, since_heads text[] DEFAULT '{}')` | I S P | `SETOF automerge_change (hash, actor, seq, start_op, op_count, time, message, deps, change bytea)`: every change not reachable from `since_heads` (all by default), dependencies first. Rebuilds change bytes (costly on big documents). |
+| `automerge_changes_meta(doc, since_heads DEFAULT '{}')` | I S P | The same rows without `change` (`SETOF automerge_change_meta`); needs only the change graph. |
+| `automerge_changes_bytes(doc, since_heads DEFAULT '{}') → bytea` | I S P | Those changes as concatenated change chunks (`save_after(since_heads)`); `merge(replica, ...)` or `loadIncremental` applies them. |
+| `automerge_get_change(doc, hash) → automerge_change` | I S P | One change with its bytes; NULL if absent. |
+| `automerge_change_count(doc) → bigint` | I S P | Number of changes, read from the stored bytes without loading the document. |
+| `automerge_to_jsonb(doc, heads text[]) → jsonb` | I S P | The state as of `heads` (`'{}'`: before any change). |
 
-Gotchas:
+Every object has a `COMMENT` (`\df+`, `\dT+`). Error codes are listed in
+[DESIGN.md](docs/DESIGN.md#error-codes).
 
+## jsonb mapping
+
+Maps/tables → objects, lists → arrays, text → strings, integers and
+counters → exact numbers, NaN/±Infinity → `null`, timestamps → ISO 8601
+UTC strings with milliseconds, bytes → base64 strings. Conflicting
+concurrent values show Automerge's winner. Details in
+[DESIGN.md](docs/DESIGN.md#jsonb-mapping).
+
+## Limitations and gotchas
+
+- **Each jsonb access is a load.** `SELECT doc->>'a', doc->>'b', doc->>'c'`
+  converts the document three times (1275 ms against 414 ms for one
+  access in a measurement). Convert once with
+  `FROM docs, LATERAL (SELECT doc::jsonb AS j OFFSET 0) x` and read
+  `x.j->>'a'` (the `OFFSET 0` stops the planner from inlining the cast
+  back), or keep the generated jsonb column shown above.
+- **Compressed input costs two loads.** A value that is not already in the
+  stored form (e.g. a compressed `Automerge.save()`) is loaded, re-saved
+  and loaded again to verify it; input in the stored form
+  (`save_nocompress()`, `automerge_changes_bytes`, `doc::bytea`) is loaded
+  once.
 - `merge(doc, $1)` with a parameter the driver types as `bytea` uses
   `merge(automerge, bytea)`, which accepts full saves and bare change
   chunks. An *untyped* literal or parameter (`merge(doc, '\x..')`) resolves
@@ -167,26 +216,28 @@ Gotchas:
   `automerge` on its own first, and bare changes are not a document.
 - `doc || '{"a": 1}'` means `merge`, not jsonb concatenation; write
   `doc::jsonb || '{"a": 1}'`.
-- There is no `automerge` equality or btree opclass, so no
-  `DISTINCT`/`GROUP BY` on `automerge` columns. But `a = b`, `a <> b`, `<`
-  etc. do *not* fail: through the implicit cast they become **jsonb**
-  comparisons of the current state. Two documents with different histories
-  but the same content compare equal. For "same document/history" compare
+- **No equality or btree opclass**, so no `DISTINCT`/`GROUP BY` on
+  `automerge` columns. But `a = b`, `a <> b`, `<` etc. do *not* fail:
+  through the implicit cast they become **jsonb** comparisons of the
+  current state. Two documents with different histories but the same
+  content compare equal. For "same document/history" compare
   `automerge_heads(a) = automerge_heads(b)` (or `automerge_contains` both
   ways).
 - `merge(a, b)` and `merge(b, a)` have the same heads and jsonb but can differ
   in bytes when neither contains the other. Don't dedupe or cache on
   `doc::bytea` / `md5(doc::bytea)`; use `automerge_heads(doc)`.
-- `merge_agg` keeps a fully loaded document per group in backend memory
-  outside Postgres' memory accounting; HashAgg cannot spill it, and
-  `work_mem`/`hash_mem_multiplier` do not limit it. The aggregate declares a
-  1 MB state size so the planner favours sorted grouping, but for a grouped
-  `merge_agg` over many large documents check `EXPLAIN` and use
-  `SET enable_hashagg = off` if needed.
-- Loading, merging and converting a single document runs without interrupt
-  checks, so a cancel or `statement_timeout` takes effect only once that call
-  returns (for `merge_agg`, at the next input row). With documents of tens of
-  MB a single call can take a noticeable time.
+- **Memory outside Postgres' accounting.** `merge_agg` keeps a fully
+  loaded document per group in backend memory; HashAgg cannot spill it,
+  and `work_mem`/`hash_mem_multiplier` do not limit it. The aggregate
+  declares a 1 MB state size so the planner favours sorted grouping, but
+  for a grouped `merge_agg` over many large documents check `EXPLAIN` and
+  use `SET enable_hashagg = off` if needed. In-memory merge results (the
+  PL/pgSQL example above) are likewise not counted.
+- **Loads are not interruptible.** Loading, merging and converting a
+  single document runs without interrupt checks, so a cancel or
+  `statement_timeout` takes effect only once that call returns (for
+  `merge_agg`, at the next input row). With documents of tens of MB a
+  single call can take a noticeable time.
 - Malformed input is always SQLSTATE `22P02` (`invalid automerge document`),
   including input that passes Automerge's checksums but panics its decoder.
   One rare case is reported late: a result of `merge(doc, bytea)` is checked
@@ -207,10 +258,35 @@ Gotchas:
   `pg_notify`, while `LISTEN` lower-cases unquoted names: use a lower-case
   channel. On a partitioned table, `table` is the partition.
 - `automerge_changes`, `automerge_changes_bytes` and `automerge_get_change`
-  rebuild change bytes from the document (on a 3 MB document, all changes
-  took 5 s against 2.8 s for `automerge_changes_meta`); prefer
-  `automerge_changes_meta` for listings. The set-returning functions
-  compute all rows up front, so `LIMIT` does not make them cheaper.
+  rebuild change bytes from the document; prefer `automerge_changes_meta`
+  for listings. The set-returning functions compute all rows up front, so
+  `LIMIT` does not make them cheaper.
+- **Replication.** Physical replication and backups carry the values as
+  ordinary bytes, and a hot standby answers every read, but `LISTEN` is not
+  available on a standby: listeners connect to the primary. With logical
+  replication the subscriber needs the extension too; it validates every
+  replicated value again on the way in (one load each), and
+  `automerge_notify()` does not fire there for replicated rows unless the
+  trigger is enabled with `ALTER TABLE .. ENABLE ALWAYS TRIGGER` (or
+  `ENABLE REPLICA`).
+
+## Performance
+
+Loading a document dominates everything; the rest is cheap. On a 3 MB
+document (3,000,000-character text; release build, warm cache):
+
+| Operation | Time |
+|---|---|
+| `Automerge::load` (what `doc::jsonb`, history and most merges pay) | 2.6 s |
+| `automerge_heads`, `automerge_change_count` (header only) | 0.3 ms, 2 ms |
+| `merge(doc, x)` when `x` adds nothing | 16 ms (detoasting) |
+| `UPDATE .. SET doc = merge(doc, one change set)` | 5.5 s (load, save, verification load) |
+| PL/pgSQL: merge 20 change sets into a variable, then store | 5.6 s |
+| `automerge_changes_meta(doc)` / `automerge_changes(doc)` (201 changes) | 2.8 s / 5.1 s |
+
+On an 83 kB document (2,000 list items) the same single-change `UPDATE`
+takes 42 ms. More numbers, and what each function loads, in
+[DESIGN.md](docs/DESIGN.md#performance).
 
 ## Development
 
@@ -219,8 +295,17 @@ Tooling runs through [mise](https://mise.jdx.dev):
 ```sh
 mise run pgrx-init   # once: build the Postgres pgrx develops against
 mise run test        # core unit tests + #[pg_test] tests + the concurrency and notify tests
-mise run regress     # pg_regress examples in tests/pg_regress
+mise run regress     # pg_regress examples in tests/pg_regress (checks their fixtures first)
+mise run lint        # rustfmt, clippy -D warnings (all build configurations), rustdoc
 mise run concurrency # only: two real psql sessions merging into one row, pg_dump round trip
 mise run notify      # only: a real LISTEN session receiving automerge_notify() payloads
 mise run bench-expanded  # timings of merge-heavy workloads on a release build (minutes)
+mise run run         # install and open psql against the pgrx-managed Postgres
 ```
+
+`crates/pg_automerge_core` holds all Automerge logic as plain Rust; `src/`
+is the pgrx glue. See [DESIGN.md](docs/DESIGN.md#architecture).
+
+## License
+
+Not decided yet; until a license is chosen, no license is granted.
