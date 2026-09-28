@@ -117,9 +117,24 @@ CREATE OPERATOR || (
     RIGHTARG = bytea,
     FUNCTION = merge
 );
+
+COMMENT ON FUNCTION merge(automerge, automerge) IS
+    'CRDT merge: a plus every change of b it lacks. Commutative and idempotent in state.';
+COMMENT ON FUNCTION merge(automerge, bytea) IS
+    'Apply an Automerge save or change chunks (save_incremental / save_after output) on top of the document.';
+COMMENT ON FUNCTION automerge_merge_support(internal) IS
+    'Planner support function of merge: lets PL/pgSQL merge into a variable in place.';
+COMMENT ON OPERATOR || (automerge, automerge) IS 'merge(automerge, automerge): CRDT merge.';
+COMMENT ON OPERATOR || (automerge, bytea) IS
+    'merge(automerge, bytea): apply an Automerge save or change chunks.';
 "#,
     name = "automerge_merge_operator",
-    requires = ["automerge_type", merge, merge_bytea],
+    requires = [
+        "automerge_type",
+        merge,
+        merge_bytea,
+        automerge_merge_support
+    ],
 );
 
 /// Transition function of `merge_agg`. The state is a [`MergeAccumulator`]
@@ -185,6 +200,10 @@ CREATE AGGREGATE merge_agg(automerge) (
     SSPACE = 1048576,
     PARALLEL = SAFE
 );
+
+COMMENT ON AGGREGATE merge_agg(automerge) IS 'CRDT merge of all non-null inputs.';
+COMMENT ON FUNCTION merge_agg_trans(internal, automerge) IS 'Transition function of merge_agg.';
+COMMENT ON FUNCTION merge_agg_final(internal) IS 'Final function of merge_agg.';
 "#,
     name = "automerge_merge_agg",
     requires = ["automerge_type", merge_agg_trans, merge_agg_final],

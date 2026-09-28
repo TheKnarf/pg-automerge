@@ -215,3 +215,28 @@ fn automerge_to_jsonb_at(doc: AutomergeArg, heads: Vec<Option<String>>) -> JsonB
             .or_raise(),
     )
 }
+
+extension_sql!(
+    r#"
+COMMENT ON FUNCTION automerge_changes(automerge, text[]) IS
+    'Every change not reachable from since_heads (all by default), dependencies first, with its bytes.';
+COMMENT ON FUNCTION automerge_changes_meta(automerge, text[]) IS
+    'Every change not reachable from since_heads (all by default), dependencies first, without its bytes.';
+COMMENT ON FUNCTION automerge_changes_bytes(automerge, text[]) IS
+    'The changes not reachable from since_heads as concatenated change chunks (save_after).';
+COMMENT ON FUNCTION automerge_get_change(automerge, text) IS
+    'The change with the given hash, with its bytes; NULL if the document does not have it.';
+COMMENT ON FUNCTION automerge_change_count(automerge) IS 'Number of changes in the document.';
+COMMENT ON FUNCTION automerge_to_jsonb(automerge, text[]) IS
+    'The state of the document as of the given heads as jsonb (''{}'': before any change).';
+"#,
+    name = "automerge_history_comments",
+    requires = [
+        automerge_changes,
+        automerge_changes_meta,
+        automerge_changes_bytes,
+        automerge_get_change,
+        automerge_change_count,
+        automerge_to_jsonb_at
+    ],
+);

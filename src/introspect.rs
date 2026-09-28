@@ -55,3 +55,20 @@ fn automerge_contains_changes(a: AutomergeArg, changes: &[u8]) -> bool {
             .or_raise(),
     }
 }
+
+extension_sql!(
+    r#"
+COMMENT ON FUNCTION automerge_heads(automerge) IS
+    'Current heads as sorted hex change hashes, read from the stored header without loading the document.';
+COMMENT ON FUNCTION automerge_contains(automerge, automerge) IS
+    'Whether a already has every change of b, i.e. merge(a, b) adds nothing.';
+COMMENT ON FUNCTION automerge_contains(automerge, bytea) IS
+    'Whether every change in an Automerge save or change chunks is already in the document, i.e. merge(doc, changes) adds nothing.';
+"#,
+    name = "automerge_introspect_comments",
+    requires = [
+        automerge_heads,
+        automerge_contains,
+        automerge_contains_changes
+    ],
+);

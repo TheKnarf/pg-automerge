@@ -624,3 +624,38 @@ fn checksummed_garbage_is_a_clean_error() {
     }
     assert!(decoder_panics > 0, "no decoder panic provoked");
 }
+
+#[pg_test]
+fn every_extension_object_has_a_comment() {
+    // Members of the extension (pg_depend deptype 'e') among functions and
+    // aggregates, types, operators and casts that have no COMMENT, except
+    // the pg_tests themselves (schema tests) and the implicit array types.
+    let uncommented: Option<String> = Spi::get_one(
+        "SELECT string_agg(pg_describe_object(d.classid, d.objid, d.objsubid), '; ' ORDER BY 1)
+         FROM pg_depend d
+         WHERE d.deptype = 'e'
+           AND d.refclassid = 'pg_extension'::regclass
+           AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname = 'pg_automerge')
+           AND d.classid IN ('pg_proc'::regclass, 'pg_type'::regclass,
+                             'pg_operator'::regclass, 'pg_cast'::regclass)
+           AND NOT (d.classid = 'pg_proc'::regclass AND EXISTS (
+               SELECT 1 FROM pg_proc p
+               WHERE p.oid = d.objid AND p.pronamespace = 'tests'::regnamespace))
+           AND NOT (d.classid = 'pg_type'::regclass AND EXISTS (
+               SELECT 1 FROM pg_type t WHERE t.typarray = d.objid))
+           AND obj_description(d.objid, d.classid::regclass::text) IS NULL",
+    )
+    .unwrap();
+    assert_eq!(uncommented, None, "objects without a COMMENT");
+    // The check sees every kind of object.
+    let kinds: String = one(
+        "SELECT string_agg(DISTINCT d.classid::regclass::text, ',')
+         FROM pg_depend d
+         WHERE d.deptype = 'e'
+           AND d.refobjid = (SELECT oid FROM pg_extension WHERE extname = 'pg_automerge')",
+        &[],
+    );
+    for kind in ["pg_cast", "pg_operator", "pg_proc", "pg_type"] {
+        assert!(kinds.contains(kind), "{kinds}");
+    }
+}

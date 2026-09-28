@@ -82,6 +82,14 @@ CREATE TYPE automerge (
 
 COMMENT ON TYPE automerge IS
     'An Automerge CRDT document (uncompressed save format). Implicitly castable to jsonb.';
+COMMENT ON FUNCTION automerge_in(cstring) IS
+    'Input function of type automerge: \x followed by the hex of an Automerge save.';
+COMMENT ON FUNCTION automerge_out(automerge) IS
+    'Output function of type automerge: \x followed by the hex of the stored bytes.';
+COMMENT ON FUNCTION automerge_recv(internal) IS
+    'Binary input function of type automerge: an Automerge save.';
+COMMENT ON FUNCTION automerge_send(automerge) IS
+    'Binary output function of type automerge: the stored bytes.';
 "#,
     name = "automerge_type",
     creates = [
@@ -118,6 +126,17 @@ CREATE CAST (automerge AS bytea) WITHOUT FUNCTION;
 -- The only implicit cast from automerge, so every jsonb operator and
 -- function applies to automerge values directly.
 CREATE CAST (automerge AS jsonb) WITH FUNCTION automerge_to_jsonb(automerge) AS IMPLICIT;
+
+COMMENT ON FUNCTION automerge_from_bytea(bytea) IS
+    'An Automerge save (or change chunks) as an automerge value, validated and normalized; the bytea to automerge cast.';
+COMMENT ON FUNCTION automerge_to_jsonb(automerge) IS
+    'The current state of the document as jsonb; the implicit automerge to jsonb cast.';
+COMMENT ON CAST (bytea AS automerge) IS
+    'Assignment cast: validates and normalizes an Automerge save.';
+COMMENT ON CAST (automerge AS bytea) IS
+    'Explicit cast: the stored Automerge bytes (an uncompressed save).';
+COMMENT ON CAST (automerge AS jsonb) IS
+    'Implicit cast: the current state of the document as jsonb.';
 "#,
     name = "automerge_casts",
     requires = ["automerge_type", automerge_from_bytea, automerge_to_jsonb],
