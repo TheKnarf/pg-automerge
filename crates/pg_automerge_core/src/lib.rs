@@ -525,6 +525,25 @@ pub fn contains_changes_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Opti
     }
 }
 
+/// [`contains_changes_by_heads`], extended to a save: input that is
+/// exactly one document chunk with a valid checksum whose header heads are
+/// all heads of `a` is contained (`Some(true)`; what a load of
+/// `a ++ changes` decides from the same header, see
+/// [`loaded::merge_changes`]). Needs only `a`'s heads, so callers can
+/// answer before they fetch or load `a`.
+pub fn contains_input_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Option<bool> {
+    if changes.is_empty() {
+        return Some(true);
+    }
+    if let Some(answer) = contains_changes_by_heads(heads_a, changes) {
+        return Some(answer);
+    }
+    match header::document_chunk(changes) {
+        Some(chunk) if is_subset(&chunk.heads, heads_a) => Some(true),
+        _ => None,
+    }
+}
+
 /// Sorted lowercase hex strings of `heads`.
 pub fn heads_to_strings(heads: Vec<ChangeHash>) -> Vec<String> {
     let mut heads: Vec<String> = heads.iter().map(ToString::to_string).collect();

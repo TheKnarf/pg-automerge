@@ -147,10 +147,13 @@ impl AutomergeArg {
     pub(crate) fn detoast(&self) -> Detoasted<'_> {
         match self {
             // SAFETY: a non-null varlena datum of this call.
-            Self::Flat(datum) => Detoasted::Flat(
-                unsafe { Vec::<u8>::from_polymorphic_datum(*datum, false, pg_sys::InvalidOid) }
-                    .expect("not null"),
-            ),
+            Self::Flat(datum) => Detoasted::Flat {
+                datum: *datum,
+                bytes: unsafe {
+                    Vec::<u8>::from_polymorphic_datum(*datum, false, pg_sys::InvalidOid)
+                }
+                .expect("not null"),
+            },
             Self::Expanded { datum, .. } => Detoasted::Expanded {
                 datum: *datum,
                 doc: self.loaded().expect("expanded"),
@@ -232,6 +235,16 @@ impl AutomergeArg {
         am::history::nothing_since(&self.heads().or_raise(), since)
     }
 
+    /// This argument, unchanged, as a result: the datum itself, flat (as it
+    /// arrived: compressed, or a TOAST pointer, which an `UPDATE` then
+    /// keeps without rewriting the value) or expanded (see
+    /// [`Detoasted::into_value`]).
+    pub(crate) fn unchanged(&self) -> AutomergeValue {
+        match self {
+            Self::Flat(datum) | Self::Expanded { datum, .. } => AutomergeValue::Datum(*datum),
+        }
+    }
+
     /// Whether this argument and `other` are the same expanded object
     /// (through a read-write and a read-only pointer, say).
     pub(crate) fn same_object(&self, other: &AutomergeArg) -> bool {
@@ -274,8 +287,11 @@ impl AutomergeArg {
 /// An argument's whole value for the rest of a call (see
 /// [`AutomergeArg::detoast`]).
 pub(crate) enum Detoasted<'a> {
-    /// The detoasted stored bytes of a flat value.
-    Flat(Vec<u8>),
+    /// A flat value: its datum and its detoasted stored bytes.
+    Flat {
+        datum: pg_sys::Datum,
+        bytes: Vec<u8>,
+    },
     /// An expanded value: its datum and its document.
     Expanded {
         datum: pg_sys::Datum,
@@ -287,7 +303,7 @@ impl Detoasted<'_> {
     /// The value as a core [`Input`].
     pub(crate) fn input(&self) -> Input<'_> {
         match self {
-            Self::Flat(bytes) => Input::Stored(bytes),
+            Self::Flat { bytes, .. } => Input::Stored(bytes),
             Self::Expanded { doc, .. } => Input::Loaded(doc),
         }
     }
@@ -296,18 +312,20 @@ impl Detoasted<'_> {
     /// save (computed once and cached in the object).
     pub(crate) fn stored(&self) -> &[u8] {
         match self {
-            Self::Flat(bytes) => bytes,
+            Self::Flat { bytes, .. } => bytes,
             Self::Expanded { doc, .. } => doc.stored().or_raise(),
         }
     }
 
-    /// The argument, unchanged, as a result: the bytes of a flat value, the
-    /// datum itself for an expanded one (its owner keeps it alive for as
-    /// long as the result can be used, as for any argument passed through).
+    /// The argument, unchanged, as a result: the datum itself, as
+    /// [`AutomergeArg::unchanged`] (whoever owns the argument keeps it
+    /// alive for as long as the result can be used, as for any argument
+    /// passed through, e.g. by `COALESCE`). A flat value is not copied: it
+    /// stays compressed or a TOAST pointer, so an `UPDATE` storing it keeps
+    /// the old TOAST value instead of compressing and writing it again.
     pub(crate) fn into_value(self) -> AutomergeValue {
         match self {
-            Self::Flat(bytes) => AutomergeValue::Bytes(bytes),
-            Self::Expanded { datum, .. } => AutomergeValue::Datum(datum),
+            Self::Flat { datum, .. } | Self::Expanded { datum, .. } => AutomergeValue::Datum(datum),
         }
     }
 }

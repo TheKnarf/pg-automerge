@@ -323,7 +323,7 @@ document (3,000,000-character text; release build, warm cache):
 | Writing a save, compressed or not (`$1::automerge`: validation) | 2.6 s (one load) |
 | `doc->>'status'` (load, then jsonb) | 2.8 s |
 | `automerge_heads`, `automerge_change_count` (header only) | 0.3 ms, 2 ms |
-| `merge(doc, x)` when `x` adds nothing | 16 ms (detoasting) |
+| `merge(doc, x)` when `x` adds nothing | 1 ms (heads from a prefix; an `UPDATE` keeps the TOAST value) |
 | `UPDATE .. SET doc = merge(doc, one change set)` | 5.2 s (load, save, verification load); 2.7 s with `pg_automerge.verify_writes = off` |
 | `UPDATE .. SET doc = merge(doc, newer full save)` | 2.8 s (one load, of the save) |
 | `INSERT .. ON CONFLICT DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc)`, newer save | 5.3 s (two loads) |

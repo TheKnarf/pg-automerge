@@ -38,17 +38,20 @@ fn automerge_contains(a: AutomergeArg, b: AutomergeArg) -> bool {
 /// `merge(automerge, bytea)`) is already in `doc`, i.e. whether
 /// `merge(doc, changes)` returns `doc` unchanged.
 ///
-/// Decided from `doc`'s heads and the chunks' hashes and dependencies when
-/// `changes` is bare change chunks that re-send the current heads or build
-/// on them (no load); otherwise `doc ++ changes` is loaded once (no save),
-/// or for an expanded `doc` each chunk's hash is looked up.
+/// Decided from `doc`'s heads (read from a prefix) and the chunks' hashes
+/// and dependencies when `changes` is bare change chunks that re-send the
+/// current heads or build on them, or from a save's header heads when they
+/// are heads of `doc` (no load); for another single save `doc` is loaded
+/// and checked for the save's heads (the save never is); otherwise
+/// `doc ++ changes` is loaded once (no save), or for an expanded `doc`
+/// each chunk's hash is looked up.
 /// Changes with dependencies in neither input are not contained (false).
 #[pg_extern(immutable, strict, parallel_safe, name = "automerge_contains")]
 fn automerge_contains_changes(a: AutomergeArg, changes: &[u8]) -> bool {
     if changes.is_empty() {
         return true;
     }
-    match am::contains_changes_by_heads(&a.heads().or_raise(), changes) {
+    match am::contains_input_by_heads(&a.heads().or_raise(), changes) {
         Some(answer) => answer,
         None => a
             .with_input(|input| loaded::contains_changes(input, changes))

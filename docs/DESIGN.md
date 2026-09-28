@@ -278,13 +278,20 @@ enforces it).
     unchanged, with no re-save; symmetrically, if `b` already contains all
     of `a`, return `b` unchanged (the state is the same; this is the common
     case of a backend sending a full, newer save). Checked cheapest first:
-    identical bytes (or the same expanded object); the heads read from both
-    headers (no load, see [Heads fast path](#heads-fast-path)):
-    `heads(b) ⊆ heads(a)` → `a`, `heads(a) ⊊ heads(b)` → `b`; the history
+    the same expanded object; the heads read from a prefix of each value
+    (no load, and nothing else detoasted, see
+    [Heads fast path](#heads-fast-path)): `heads(b) ⊆ heads(a)` → `a`,
+    `heads(a) ⊊ heads(b)` → `b`; the history
     of an input that is already loaded; then the larger stored input is
     loaded and checked against the other's heads (a containing document is
     usually the larger one, so one load decides the common linear case);
     only then the other.
+  - An unchanged input is returned as the datum it arrived as, not a copy:
+    a stored value stays compressed or a TOAST pointer, so `UPDATE docs
+    SET doc = merge(doc, x)` with nothing new keeps the row's TOAST value
+    (Postgres reuses an identical TOAST pointer) instead of detoasting,
+    compressing and writing the document again. On the 3 MB document such
+    an update takes about 1 ms instead of 185 ms.
   - A new document is returned as an expanded value (see
     [Expanded values](#expanded-values)): kept loaded in memory and saved
     only when it is stored, sent or cast to `bytea`. When `a` is a
@@ -342,11 +349,13 @@ enforces it).
     the document nor the input contains`), with the hashes in the DETAIL
     (`Missing changes: <hash>.`; at most five, then "and N more"). Nothing
     orphaned is ever stored.
-  - Empty `changes`, or nothing new (heads unchanged): returns `a` unchanged,
-    no re-save. When `changes` is bare change chunks that are all heads of
-    `a` (a re-send of the latest changes), this is seen from the chunks'
-    hashes without loading anything (see `automerge_contains(a, bytea)`);
-    a re-sent save of `a`, from its header (case 1 above).
+  - Empty `changes`, or nothing new (heads unchanged): returns `a` unchanged
+    (the datum as it arrived, as above), no re-save. When `changes` is bare
+    change chunks that are all heads of `a` (a re-send of the latest
+    changes), this is seen from the chunks' hashes and `a`'s heads, read
+    from a prefix, without detoasting or loading `a` (see
+    `automerge_contains(a, bytea)`); a re-sent save of `a`, from its
+    header (case 1 above).
   - Malformed input, including decoder panics, is `22P02`. A changed result
     is marked unverified (unless it is a save's own encoding, case 3
     above): it gets the save-and-load check of normalization when it is
@@ -705,8 +714,10 @@ the server though not in pgrx's bindings). It is written like pgrx's
 #### Skipping no-op writes
 
 A no-op `UPDATE docs SET doc = merge(doc, $1)` still writes a new row
-version (and a new copy of a TOASTed document, plus WAL) and fires
-triggers (`automerge_notify` stays silent, since the heads are unchanged).
+version (with WAL and index entries unless it is a HOT update; a TOASTed
+document is not rewritten, since `merge` returns the stored TOAST pointer
+unchanged) and fires triggers (`automerge_notify` stays silent, since the
+heads are unchanged).
 To skip it:
 
 ```sql
@@ -853,10 +864,12 @@ Where it does not:
   (`doc::bytea` is binary-coercible) get the flattened bytes through the
   normal detoast.
 - No-op results: an input that already contains the other is returned as
-  is: a flat input as a copy of its bytes, an expanded input as the same
-  pointer, the way `COALESCE` passes an argument through (whoever keeps
-  the result beyond the expression copies it: slots, PL/pgSQL assignment
-  and SQL function results flatten a read-only pointer).
+  is, the datum itself: a flat input as it arrived (possibly compressed or
+  a TOAST pointer), an expanded input as the same pointer, the way
+  `COALESCE` passes an argument through (whoever keeps the result beyond
+  the expression copies it: slots, PL/pgSQL assignment and SQL function
+  results flatten a read-only pointer; storing a TOAST pointer of the same
+  row keeps its TOAST value).
 - `merge(automerge, bytea)` on an expanded document parses the change
   chunks (`Change::try_from`, the parser `Automerge::load` uses) and
   applies them to a clone, so it needs no load; a save is loaded on its
@@ -1027,7 +1040,8 @@ What costs a load, per call:
   stored document (one head; release build, warm cache), where a load
   takes about 2.7 s: `automerge_heads` 0.3 ms;
   `automerge_contains(doc, ''::bytea::automerge)` 0.5 ms;
-  `merge(doc, ''::bytea::automerge)` 16 ms (detoasting the 3 MB argument);
+  `merge(doc, ''::bytea::automerge)` 1 ms (only a prefix of the 3 MB
+  argument is detoasted);
   `merge` with a newer version of it, in either argument order, one load
   (2.6 s), as is a `merge_agg` over both.
 - Writing a value: a full save, canonical (what `doc::bytea` or another
@@ -1112,10 +1126,13 @@ What costs a load, per call:
   unchanged argument or a new expanded object, e.g. the `bytea` cast's).
 - `AutomergeArg` is not detoasted up front: the heads fast path fetches a
   prefix with `pg_detoast_datum_slice`, and `AutomergeArg::detoast()`
-  returns a `Detoasted` guard holding either the detoasted bytes of a flat
-  value (fetched once per call, then used as the core `Input` and, for an
-  unchanged result, returned as is) or the loaded document of an expanded
-  one. Neither outlives the call.
+  returns a `Detoasted` guard holding either the datum and the detoasted
+  bytes of a flat value (fetched once per call and used as the core
+  `Input`; an unchanged result is the original datum, not the bytes) or
+  the loaded document of an expanded one. Neither outlives the call.
+  `merge`, `merge(automerge, bytea)` and `automerge_contains` first decide
+  what they can from the heads (a prefix of a flat value), before
+  anything is detoasted.
 - Errors go through one `raise()` (`src/error.rs`) taking a core `Error`
   or a `PgError` (code, message, optional DETAIL and HINT). `raise` and
   `or_raise()` are `#[track_caller]`, so the error's LOCATION is the line
@@ -1383,22 +1400,29 @@ by the pg_tests of `src/tests/loads.rs`.
 
 | Path | loads before → after | 877 kB before | after | 3.0 MB before | after |
 |---|---|---|---|---|---|
-| R1 `doc->>'status'` | 1 → 1 | 310 | 314 | 2817 | 2813 |
-| R2 three accessors in one `SELECT` | 3 → 3 | 908 | 915 | 8423 | 8358 |
+| R1 `doc->>'status'` | 1 → 1 | 310 | 313 | 2817 | 2793 |
+| R2 three accessors in one `SELECT` | 3 → 3 | 908 | 921 | 8423 | 8383 |
 | R3 `automerge_heads(doc)` | 0 → 0 | 0.5 | 0.5 | 0.5 | 0.5 |
-| I1 `INSERT` of newer (bytea) | 1 → 1 | 210 | 216 | 2778 | 2788 |
-| W1 `merge(doc, changes::bytea)` | 2 → 2 | 362 | 365 | 5217 | 5253 |
-| W2 `merge(doc, newer::bytea)` | 3 → 1 | 505 | 213 | 7390 | 2789 |
-| W3 `merge(doc, newer::automerge)` | 2 → 1 | 395 | 217 | 5311 | 2761 |
-| W4 upsert of newer, `merge(docs.doc, excluded.doc)` | 2 → 2 | 381 | 370 | 5342 | 5345 |
-| W5 W1 again (already there) | 0 → 0 | 35 | 35 | 185 | 189 |
-| W6 W3 with a text parameter (`\bind`, custom plan) | 2 → 2 | 391 | 381 | 5365 | 5352 |
+| I1 `INSERT` of newer (bytea) | 1 → 1 | 210 | 218 | 2778 | 2744 |
+| W1 `merge(doc, changes::bytea)` | 2 → 2 | 362 | 375 | 5217 | 5205 |
+| W2 `merge(doc, newer::bytea)` | 3 → 1 | 505 | 210 | 7390 | 2772 |
+| W3 `merge(doc, newer::automerge)` | 2 → 1 | 395 | 209 | 5311 | 2775 |
+| W4 upsert of newer, `merge(docs.doc, excluded.doc)` | 2 → 2 | 381 | 373 | 5342 | 5288 |
+| W5 W1 again (already there) | 0 → 0 | 35 | 1.0 | 185 | 0.9 |
+| W6 W3 with a text parameter (`\bind`, custom plan) | 2 → 2 | 391 | 380 | 5365 | 5344 |
 
-With `pg_automerge.verify_writes = off`, W1 takes one load (210 ms and
-2722 ms); the other paths are unchanged (their writes need no check).
+With `pg_automerge.verify_writes = off`, W1 takes one load (207 ms and
+2739 ms); the other paths are unchanged (their writes need no check).
 W2 no longer loads the stored document plus the save (as `a ++ save`)
 and then verifies the result: the save is loaded on its own and, since
 it contains the stored document, is the result, verified by its own
-encoding. W3's cast hands its loaded document to `merge`. W4 and W6 stay
-at two loads because Postgres flattens `EXCLUDED` and constant-folded
-parameters (see [Expanded values](#expanded-values)).
+encoding. W3's cast hands its loaded document to `merge`. W5 decides from
+the heads in a prefix of the stored value and returns the TOAST pointer
+it was given, which the `UPDATE` keeps: no detoasting, compressing or
+writing of the document. W4 and W6 stay at two loads because Postgres
+flattens `EXCLUDED` and constant-folded parameters (see
+[Expanded values](#expanded-values)).
+
+The pgrx-managed Postgres these numbers come from is an assert-enabled
+build (`randomize_mem` shows up in profiles of the jsonb paths), so the
+jsonb part of R1 and R2 is somewhat slower than on a production build.

@@ -54,7 +54,7 @@ fn automerge_recv(buf: Internal) -> AutomergeDatum {
 #[pg_extern(sql = false)]
 fn automerge_send(doc: AutomergeArg) -> Vec<u8> {
     match doc.detoast() {
-        Detoasted::Flat(bytes) => bytes,
+        Detoasted::Flat { bytes, .. } => bytes,
         expanded => expanded.stored().to_vec(),
     }
 }

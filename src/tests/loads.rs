@@ -269,3 +269,57 @@ fn verify_writes_setting_switches_the_save_and_load_check() {
         .starts_with("22P02: ")
     );
 }
+
+#[pg_test]
+fn no_op_merges_keep_the_stored_toast_value() {
+    // About 20 kB of text that does not compress below the TOAST threshold.
+    let mut doc = AutoCommit::new().with_actor(actor(1));
+    let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let body: String = (0..20_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'a' + (state % 26) as u8)
+        })
+        .collect();
+    doc.splice_text(&text, 0, 0, &body).unwrap();
+    doc.commit();
+    let older = am::normalize(&doc.save()).unwrap();
+    let older_heads = doc.get_heads();
+    doc.put(ROOT, "status", "stored").unwrap();
+    doc.commit();
+    let changes = doc.save_after(&older_heads);
+    let save = doc.save();
+    let base = am::normalize(&save).unwrap();
+    Spi::run("CREATE TEMP TABLE tv (id int PRIMARY KEY, doc automerge NOT NULL)").unwrap();
+    Spi::run_with_args("INSERT INTO tv VALUES (1, $1::automerge)", &[base.clone().into()]).unwrap();
+    let chunk_id = || -> String { one("SELECT pg_column_toast_chunk_id(doc)::text FROM tv", &[]) };
+    let stored_id = chunk_id();
+
+    // Re-sent changes, a re-sent save, the same document and an older one:
+    // the stored value comes back as it arrived (a TOAST pointer), so the
+    // UPDATE keeps the TOAST value instead of writing a new one. Only the
+    // older document needs loads (its cast, and the stored document to see
+    // that it has the older heads).
+    for (sql, arg, want_loads) in [
+        ("UPDATE tv SET doc = merge(doc, $1::bytea)", changes, 0),
+        ("UPDATE tv SET doc = merge(doc, $1::bytea)", save, 0),
+        ("UPDATE tv SET doc = merge(doc, $1::bytea::automerge)", base.clone(), 1),
+        ("UPDATE tv SET doc = merge(doc, $1::bytea::automerge)", older.clone(), 2),
+        ("UPDATE tv SET doc = merge($1::bytea::automerge, doc)", older, 2),
+    ] {
+        let before = loads();
+        Spi::run_with_args(sql, &[arg.into()]).unwrap();
+        assert_eq!(loads() - before, want_loads, "{sql}");
+        assert_eq!(chunk_id(), stored_id, "{sql}");
+    }
+    let same: bool = one("SELECT doc::bytea = $1 FROM tv", &[base.into()]);
+    assert!(same);
+    // A real change writes a new value.
+    doc.put(ROOT, "status", "changed").unwrap();
+    let newer = doc.save();
+    Spi::run_with_args("UPDATE tv SET doc = merge(doc, $1::bytea)", &[newer.into()]).unwrap();
+    assert_ne!(chunk_id(), stored_id);
+}

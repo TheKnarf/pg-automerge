@@ -20,7 +20,17 @@ fn merge(a: AutomergeArg, b: AutomergeArg) -> AutomergeValue {
     // The same object twice (`doc := merge(doc, doc)`): nothing to do, and
     // no document is borrowed while it could be replaced.
     if a.same_object(&b) {
-        return a.detoast().into_value();
+        return a.unchanged();
+    }
+    // The heads decide the common no-op cases from a prefix of each value,
+    // before anything is detoasted: an unchanged flat input is returned as
+    // it arrived (see `AutomergeArg::unchanged`).
+    let (heads_a, heads_b) = (a.heads().or_raise(), b.heads().or_raise());
+    if am::is_subset(&heads_b, &heads_a) {
+        return a.unchanged();
+    }
+    if am::is_subset(&heads_a, &heads_b) {
+        return b.unchanged();
     }
     let doc = {
         let (da, db) = (a.detoast(), b.detoast());
@@ -39,6 +49,11 @@ fn merge(a: AutomergeArg, b: AutomergeArg) -> AutomergeValue {
 /// Changes with missing dependencies are rejected (22P02), naming them.
 #[pg_extern(immutable, strict, parallel_safe, name = "merge", support = automerge_merge_support)]
 fn merge_bytea(a: AutomergeArg, changes: &[u8]) -> AutomergeValue {
+    // Nothing new by `a`'s heads (read from a prefix): `a` as it arrived,
+    // never detoasted (see `AutomergeArg::unchanged`).
+    if am::contains_input_by_heads(&a.heads().or_raise(), changes) == Some(true) {
+        return a.unchanged();
+    }
     let doc = {
         let da = a.detoast();
         match loaded::merge_changes(da.input(), changes).or_raise() {
