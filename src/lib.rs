@@ -733,6 +733,433 @@ mod tests {
                 .join("\n")
         })
     }
+
+    // -----------------------------------------------------------------------
+    // Edge cases (see also crates/pg_automerge_core/tests/edge_cases.rs)
+    // -----------------------------------------------------------------------
+
+    fn stored(doc: &mut AutoCommit) -> Vec<u8> {
+        doc.document().save_nocompress()
+    }
+
+    #[pg_test]
+    fn empty_and_delete_only_documents() {
+        let empty_bytes = pg_automerge_core::normalize(&[]).unwrap();
+        for sql in [
+            "SELECT ''::bytea::automerge::bytea",
+            "SELECT '\\x'::automerge::bytea",
+            "SELECT $1::automerge::bytea",
+        ] {
+            let bytes: Vec<u8> = one(sql, &[AutoCommit::new().save().into()]);
+            assert_eq!(bytes, empty_bytes, "{sql}");
+        }
+        let json: JsonB = one("SELECT ''::bytea::automerge::jsonb", &[]);
+        assert_eq!(json.0, json!({}));
+
+        let mut doc = AutoCommit::new().with_actor(actor(1));
+        doc.put(ROOT, "gone", 1i64).unwrap();
+        doc.delete(ROOT, "gone").unwrap();
+        let args = [doc.save().into()];
+        let json: JsonB = one("SELECT $1::automerge::jsonb", &args);
+        assert_eq!(json.0, json!({}));
+        let n: i32 = one("SELECT cardinality(automerge_heads($1::automerge))", &args);
+        assert_eq!(n, 1);
+        // Merging with the empty document is a no-op in both directions.
+        let same: bool = one(
+            "SELECT merge($1::automerge, ''::bytea::automerge)::bytea = $1::automerge::bytea \
+               AND merge(''::bytea::automerge, $1::automerge)::bytea = $1::automerge::bytea",
+            &args,
+        );
+        assert!(same);
+    }
+
+    #[pg_test]
+    fn null_handling() {
+        let mut doc = AutoCommit::new();
+        doc.put(ROOT, "x", 1i64).unwrap();
+        let args = [doc.save().into()];
+        for expr in [
+            "merge(NULL::automerge, $1::automerge)",
+            "merge($1::automerge, NULL::automerge)",
+            "$1::automerge || NULL::automerge",
+            "automerge_heads(NULL::automerge)",
+            "automerge_contains($1::automerge, NULL)",
+            "automerge_contains(NULL, $1::automerge)",
+            "NULL::bytea::automerge",
+            "NULL::automerge::jsonb",
+            "NULL::automerge::bytea",
+            "(NULL::automerge)->'x'",
+            "(SELECT merge_agg(d) FROM (VALUES (NULL::automerge), (NULL)) v(d))",
+            "(SELECT merge_agg(d) FROM (SELECT $1::automerge WHERE false) v(d))",
+        ] {
+            let is_null: bool = one(&format!("SELECT ({expr}) IS NULL"), &args);
+            assert!(is_null, "{expr} should be NULL");
+        }
+        // NULL inputs are skipped, not poisoning the aggregate.
+        let json: JsonB = one(
+            "SELECT merge_agg(d)::jsonb FROM (VALUES (NULL::automerge), ($1::automerge), (NULL)) v(d)",
+            &args,
+        );
+        assert_eq!(json.0, json!({ "x": 1 }));
+    }
+
+    #[pg_test]
+    fn merge_agg_as_window_function() {
+        Spi::run("CREATE TEMP TABLE win (id int, doc automerge)").unwrap();
+        let mut base = AutoCommit::new().with_actor(actor(1));
+        for i in 1..=4u8 {
+            let mut fork = base.fork().with_actor(actor(i + 1));
+            fork.put(ROOT, format!("k{i}"), i64::from(i)).unwrap();
+            Spi::run_with_args(
+                "INSERT INTO win VALUES ($1, $2)",
+                &[i32::from(i).into(), fork.save().into()],
+            )
+            .unwrap();
+        }
+        // Running merge: the final function is called repeatedly on a state
+        // that keeps growing.
+        let keys: Vec<i64> = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT (SELECT count(*) FROM jsonb_object_keys(m)) FROM \
+                       (SELECT id, merge_agg(doc) OVER (ORDER BY id)::jsonb FROM win) s(id, m) \
+                     ORDER BY id",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| row.get::<i64>(1).unwrap().unwrap())
+                .collect()
+        });
+        assert_eq!(keys, vec![1, 2, 3, 4]);
+        // Sliding frame: Postgres restarts the aggregate (resetting its
+        // memory context) for every row, since there is no inverse function.
+        let sliding: Vec<JsonB> = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT merge_agg(doc) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)::jsonb \
+                     FROM win ORDER BY id",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| row.get::<JsonB>(1).unwrap().unwrap())
+                .collect()
+        });
+        let sliding: Vec<_> = sliding.into_iter().map(|j| j.0).collect();
+        assert_eq!(
+            sliding,
+            vec![
+                json!({ "k1": 1 }),
+                json!({ "k1": 1, "k2": 2 }),
+                json!({ "k2": 2, "k3": 3 }),
+                json!({ "k3": 3, "k4": 4 }),
+            ]
+        );
+    }
+
+    /// A document of several megabytes that does not compress well.
+    fn large_doc() -> AutoCommit {
+        let mut doc = AutoCommit::new().with_actor(actor(1));
+        let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let body: String = (0..3_000_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'a' + (state % 26) as u8)
+            })
+            .collect();
+        doc.splice_text(&text, 0, 0, &body).unwrap();
+        doc.put(ROOT, "status", "big").unwrap();
+        doc
+    }
+
+    #[pg_test]
+    fn large_document_is_toasted_and_round_trips() {
+        let mut doc = large_doc();
+        let normalized = stored(&mut doc);
+        assert!(normalized.len() > 2_000_000, "{}", normalized.len());
+        Spi::run("CREATE TEMP TABLE big (id int PRIMARY KEY, doc automerge NOT NULL)").unwrap();
+        // Compressed save in, normalized bytes stored.
+        Spi::run_with_args("INSERT INTO big VALUES (1, $1)", &[doc.save().into()]).unwrap();
+
+        // Stored out of line in the TOAST table.
+        let toast_bytes: i64 = one(
+            "SELECT pg_relation_size(reltoastrelid) FROM pg_class WHERE oid = 'big'::regclass",
+            &[],
+        );
+        assert!(toast_bytes > 1_000_000, "toast size {toast_bytes}");
+        let back: Vec<u8> = one("SELECT doc::bytea FROM big", &[]);
+        assert_eq!(back, normalized);
+        let text_round_trip: bool = one(
+            "SELECT doc::text::automerge::bytea = doc::bytea FROM big",
+            &[],
+        );
+        assert!(text_round_trip);
+
+        let mut fork = doc.fork().with_actor(actor(2));
+        doc.put(ROOT, "a", true).unwrap();
+        fork.put(ROOT, "b", true).unwrap();
+        Spi::run_with_args(
+            "UPDATE big SET doc = merge(doc, $1::automerge)",
+            &[doc.save().into()],
+        )
+        .unwrap();
+        Spi::run_with_args(
+            "UPDATE big SET doc = doc || $1::automerge",
+            &[fork.save().into()],
+        )
+        .unwrap();
+        let (a, b) =
+            Spi::get_two::<bool, bool>("SELECT (doc->>'a')::bool, (doc->>'b')::bool FROM big")
+                .unwrap();
+        assert_eq!((a, b), (Some(true), Some(true)));
+        let len: i32 = one("SELECT length(doc->>'text') FROM big", &[]);
+        assert_eq!(len, 3_000_000);
+        doc.merge(&mut fork).unwrap();
+        let expected: Vec<String> = {
+            let mut h: Vec<String> = doc.get_heads().iter().map(ToString::to_string).collect();
+            h.sort();
+            h
+        };
+        let heads: Vec<String> = one("SELECT automerge_heads(doc) FROM big", &[]);
+        assert_eq!(heads, expected);
+    }
+
+    #[pg_test]
+    fn scalar_edge_cases_through_jsonb() {
+        use pg_automerge_core::automerge::ScalarValue;
+        let mut doc = AutoCommit::new();
+        doc.put(ROOT, "imin", i64::MIN).unwrap();
+        doc.put(ROOT, "imax", i64::MAX).unwrap();
+        doc.put(ROOT, "umax", u64::MAX).unwrap();
+        doc.put(ROOT, "neg_zero", -0.0f64).unwrap();
+        doc.put(ROOT, "nan", f64::NAN).unwrap();
+        doc.put(ROOT, "inf", f64::INFINITY).unwrap();
+        doc.put(ROOT, "fmax", f64::MAX).unwrap();
+        doc.put(ROOT, "subnormal", 5e-324f64).unwrap();
+        doc.put(ROOT, "tenth", 0.1f64).unwrap();
+        doc.put(ROOT, "counter", ScalarValue::counter(i64::MAX))
+            .unwrap();
+        doc.increment(ROOT, "counter", 1).unwrap();
+        doc.put(ROOT, "before_epoch", ScalarValue::Timestamp(-1))
+            .unwrap();
+        doc.put(
+            ROOT,
+            "year_minus_1",
+            ScalarValue::Timestamp(-62_167_219_200_001),
+        )
+        .unwrap();
+        doc.put(ROOT, "bytes", ScalarValue::Bytes(vec![0, 1, 0xfe, 0xff]))
+            .unwrap();
+        doc.put(ROOT, "😀", "emoji key").unwrap();
+        doc.put(ROOT, "nul\0key", "nul\0value").unwrap();
+        let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
+        doc.splice_text(&text, 0, 0, "a👩‍👩‍👧‍👦b").unwrap();
+        let args = [doc.save().into()];
+        for (expr, expected) in [
+            ("d->'imin' = '-9223372036854775808'", true),
+            ("d->'imax' = '9223372036854775807'", true),
+            ("d->'umax' = '18446744073709551615'", true),
+            ("(d->>'umax')::numeric = 18446744073709551615", true),
+            ("d->'neg_zero' = '0'", true),
+            ("jsonb_typeof(d->'nan') = 'null'", true),
+            ("jsonb_typeof(d->'inf') = 'null'", true),
+            ("(d->>'fmax')::float8 = 1.7976931348623157e308", true),
+            ("(d->>'subnormal')::float8 = 5e-324", true),
+            ("d->>'tenth' = '0.1'", true),
+            // Wraps like the release build of Automerge does.
+            ("d->'counter' = '-9223372036854775808'", true),
+            ("d->>'before_epoch' = '1969-12-31T23:59:59.999Z'", true),
+            (
+                "(d->>'before_epoch')::timestamptz = '1969-12-31 23:59:59.999+00'",
+                true,
+            ),
+            ("d->>'year_minus_1' = '-000001-12-31T23:59:59.999Z'", true),
+            ("decode(d->>'bytes', 'base64') = '\\x0001feff'::bytea", true),
+            ("d->>'😀' = 'emoji key'", true),
+            ("d->>'nul\u{FFFD}key' = 'nul\u{FFFD}value'", true),
+            ("d->>'text' = 'a👩‍👩‍👧‍👦b'", true),
+            ("d ? 'nul'", false),
+        ] {
+            let got: bool = one(
+                &format!("SELECT {expr} FROM (SELECT $1::automerge::jsonb) v(d)"),
+                &args,
+            );
+            assert_eq!(got, expected, "{expr}");
+        }
+    }
+
+    #[pg_test]
+    fn deep_nesting_limit() {
+        let nest = |depth: usize| {
+            let mut doc = AutoCommit::new();
+            let mut obj = ROOT;
+            for _ in 0..depth {
+                obj = doc.put_object(&obj, "k", ObjType::Map).unwrap();
+            }
+            doc.save()
+        };
+        let max = pg_automerge_core::json::MAX_DEPTH;
+        // The deepest document still accepted converts and is queryable.
+        let depth: i32 = one(
+            "WITH RECURSIVE r(j, n) AS (SELECT $1::automerge::jsonb, 0 \
+               UNION ALL SELECT j->'k', n + 1 FROM r WHERE j ? 'k') SELECT max(n) FROM r",
+            &[nest(max - 1).into()],
+        );
+        assert_eq!(depth as usize, max - 1);
+        let hex = pg_automerge_core::encoding::to_hex_literal(&nest(max));
+        let err = sql_error(&format!("SELECT '{hex}'::automerge::jsonb"));
+        assert_eq!(
+            err,
+            format!("XX000: automerge document is nested more than {max} levels deep")
+        );
+        // Storing and merging it is still fine; only the jsonb view fails.
+        let ok: bool = one(
+            "SELECT cardinality(automerge_heads(merge($1::automerge, ''::bytea::automerge))) = 1",
+            &[nest(max).into()],
+        );
+        assert!(ok);
+    }
+
+    #[pg_test]
+    fn incremental_and_compressed_input_is_normalized() {
+        let mut doc = AutoCommit::new().with_actor(actor(1));
+        doc.put(ROOT, "v", 0i64).unwrap();
+        let mut bytes = doc.save();
+        for i in 1..=3i64 {
+            doc.put(ROOT, "v", i).unwrap();
+            doc.put(ROOT, format!("pad{i}"), "x".repeat(400)).unwrap();
+            bytes.extend(doc.save_incremental());
+        }
+        let compressed = doc.save();
+        let normalized = stored(&mut doc);
+        assert!(compressed.len() < normalized.len());
+        for input in [bytes, compressed, normalized.clone()] {
+            let got: Vec<u8> = one("SELECT $1::automerge::bytea", &[input.into()]);
+            assert_eq!(got, normalized);
+        }
+        // An incremental chunk on its own lacks its base and is rejected.
+        let heads = doc.get_heads();
+        doc.put(ROOT, "v", 4i64).unwrap();
+        let hex = pg_automerge_core::encoding::to_hex_literal(&doc.save_after(&heads));
+        let err = sql_error(&format!("SELECT '{hex}'::bytea::automerge"));
+        assert!(err.starts_with("22P02: "), "{err}");
+    }
+
+    #[pg_test]
+    fn text_output_round_trips_exactly() {
+        // What pg_dump / COPY rely on: text out -> text in is the identity.
+        let mut a = AutoCommit::new().with_actor(actor(7));
+        a.put(ROOT, "k", "😀").unwrap();
+        let mut b = a.fork().with_actor(actor(8));
+        a.put(ROOT, "k", "a").unwrap();
+        b.put(ROOT, "k", "b").unwrap();
+        Spi::run("CREATE TEMP TABLE dump_src (id int, doc automerge)").unwrap();
+        for (i, bytes) in [a.save(), b.save(), Vec::new(), large_doc().save()]
+            .into_iter()
+            .enumerate()
+        {
+            Spi::run_with_args(
+                "INSERT INTO dump_src VALUES ($1, $2)",
+                &[(i as i32).into(), bytes.into()],
+            )
+            .unwrap();
+        }
+        Spi::run("INSERT INTO dump_src SELECT 10, merge_agg(doc) FROM dump_src").unwrap();
+        let all_same: bool = one(
+            "SELECT bool_and(doc::text::automerge::bytea = doc::bytea \
+                AND automerge_heads(doc::text::automerge) = automerge_heads(doc)) FROM dump_src",
+            &[],
+        );
+        assert!(all_same);
+        // Through COPY's text format, as pg_dump does.
+        Spi::run(
+            "CREATE TEMP TABLE dump_dst (LIKE dump_src); \
+             COPY dump_src TO '/tmp/pg_automerge_copy_test.txt'; \
+             COPY dump_dst FROM '/tmp/pg_automerge_copy_test.txt';",
+        )
+        .unwrap();
+        let mismatches: i64 = one(
+            "SELECT count(*) FROM dump_src s FULL JOIN dump_dst d USING (id) \
+             WHERE s.doc::bytea IS DISTINCT FROM d.doc::bytea",
+            &[],
+        );
+        assert_eq!(mismatches, 0);
+    }
+
+    #[pg_test]
+    fn garbage_input_is_a_clean_error() {
+        let mut doc = AutoCommit::new().with_actor(actor(1));
+        doc.put(ROOT, "s", "hello").unwrap();
+        let l = doc.put_object(ROOT, "l", ObjType::List).unwrap();
+        doc.insert(&l, 0, 1i64).unwrap();
+        let save = doc.save();
+        // Every truncation and a bit flip at every position: either a valid
+        // document or 22P02, never another error or a crashed backend.
+        let mut inputs: Vec<Vec<u8>> = (1..save.len()).map(|n| save[..n].to_vec()).collect();
+        inputs.extend((0..save.len()).map(|i| {
+            let mut b = save.clone();
+            b[i] ^= 0x55;
+            b
+        }));
+        inputs.push([save.as_slice(), b"trailing"].concat());
+        inputs.push(vec![0; 64]);
+        inputs.push(vec![0xff; 64]);
+        for input in inputs {
+            let hex = pg_automerge_core::encoding::to_hex_literal(&input);
+            let result = sql_error(&format!("SELECT '{hex}'::bytea::automerge::jsonb"));
+            assert!(
+                result == "no error" || result.starts_with("22P02: invalid automerge document"),
+                "{hex}: {result}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn reused_actor_id_is_a_clean_merge_error() {
+        // Two different histories that both claim (actor 1, seq 1): a
+        // backend bug, e.g. a hard-coded actor id. Automerge refuses to
+        // merge them; that must surface as an ERROR, not a crash.
+        let mut a = AutoCommit::new().with_actor(actor(1));
+        let mut b = AutoCommit::new().with_actor(actor(1));
+        a.put(ROOT, "x", 1i64).unwrap();
+        b.put(ROOT, "x", 2i64).unwrap();
+        let (a, b) = (
+            pg_automerge_core::encoding::to_hex_literal(&a.save()),
+            pg_automerge_core::encoding::to_hex_literal(&b.save()),
+        );
+        for sql in [
+            format!("SELECT merge('{a}'::bytea::automerge, '{b}'::bytea::automerge)"),
+            format!("SELECT merge_agg(d) FROM (VALUES ('{a}'::bytea::automerge), ('{b}')) v(d)"),
+            // Concatenated saves go through Automerge::load instead.
+            format!("SELECT ('{a}'::bytea || '{b}'::bytea)::automerge"),
+        ] {
+            let err = sql_error(&sql);
+            assert!(err.contains("duplicate seq 1"), "{sql}: {err}");
+        }
+    }
+
+    #[pg_test]
+    fn merge_unrelated_documents_in_sql() {
+        let mut a = AutoCommit::new().with_actor(actor(1));
+        let mut b = AutoCommit::new().with_actor(actor(2));
+        a.put(ROOT, "same", "a").unwrap();
+        a.put(ROOT, "only_a", 1i64).unwrap();
+        b.put(ROOT, "same", "b").unwrap();
+        b.put(ROOT, "only_b", 2i64).unwrap();
+        let args = [a.save().into(), b.save().into()];
+        let json: JsonB = one("SELECT merge($1::automerge, $2::automerge)::jsonb", &args);
+        assert_eq!(json.0, json!({ "same": "b", "only_a": 1, "only_b": 2 }));
+        let symmetric: bool = one(
+            "SELECT automerge_heads($1::automerge || $2::automerge) \
+                  = automerge_heads($2::automerge || $1::automerge)",
+            &args,
+        );
+        assert!(symmetric);
+    }
 }
 
 /// This module is required by `cargo pgrx test` invocations.

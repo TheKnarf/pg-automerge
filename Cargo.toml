@@ -37,6 +37,23 @@ version = "=0.19.3"
 [profile.dev]
 panic = "unwind"
 
+# Dependencies are optimized even in dev builds (what `cargo pgrx test` and
+# `cargo pgrx install` use): Automerge is very slow unoptimized, which made
+# the multi-megabyte test documents take minutes.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Make Automerge behave in dev builds as it does in release, so tests
+# exercise what ships:
+# - It sums counter values with plain `+`. Release builds wrap on i64
+#   overflow, but with overflow checks a document whose counter exceeds
+#   i64::MAX panicked on read (ERROR in Postgres) only in dev builds.
+# - Its debug assertions include O(n) "_slow" cross-checks per op, which made
+#   building/loading large documents quadratic.
+[profile.dev.package.automerge]
+overflow-checks = false
+debug-assertions = false
+
 [profile.release]
 panic = "unwind"
 opt-level = 3

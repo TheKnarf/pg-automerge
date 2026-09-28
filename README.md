@@ -76,4 +76,5 @@ Tooling runs through [mise](https://mise.jdx.dev):
 mise run pgrx-init   # once: build the Postgres pgrx develops against
 mise run test        # core unit tests + #[pg_test] tests
 mise run regress     # pg_regress examples in tests/pg_regress
+mise run concurrency # two real psql sessions merging into one row, pg_dump round trip
 ```

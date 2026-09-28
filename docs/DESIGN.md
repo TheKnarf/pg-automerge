@@ -27,7 +27,11 @@ documents in Postgres:
 ```sql
 CREATE TABLE docs (id uuid PRIMARY KEY, doc automerge NOT NULL);
 
--- persist (bytes from Automerge.save() / save_incremental() passed as bytea)
+-- persist: $2 is a full Automerge.save(), optionally followed by later
+-- save_incremental() chunks, passed as bytea. A save_incremental() chunk on
+-- its own depends on changes it does not contain and is rejected (22P02).
+-- Every writer must use its own actor id: two different histories claiming
+-- the same (actor, seq) cannot be merged (ERROR "duplicate seq").
 INSERT INTO docs (id, doc) VALUES ($1, $2)
 ON CONFLICT (id) DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc);
 
@@ -129,8 +133,8 @@ conflicting concurrent values, Automerge's winner is used (what `get` returns).
 | Text | string (`doc.text(obj)`; block markers are included as the characters Automerge's `text()` returns) |
 | Str | string |
 | (any string or map key containing U+0000) | U+0000 replaced by U+FFFD (Postgres text and jsonb cannot hold NUL) |
-| Int, Uint, Counter | number (exact) |
-| F64 | number. NaN/±Inf become `null` (jsonb cannot represent them) |
+| Int, Uint, Counter | number (exact). A counter summing past the i64 range wraps, as in Automerge release builds |
+| F64 | number. NaN/±Inf become `null` (jsonb cannot represent them); -0.0 becomes `0` (jsonb numeric has no negative zero) |
 | Boolean | boolean |
 | Null | null |
 | Timestamp (ms since epoch) | string, ISO 8601 UTC with milliseconds, e.g. `"2024-01-02T03:04:05.678Z"`; years outside 0000–9999 use the six-digit signed form (`"+010000-01-01T00:00:00.000Z"`), like JavaScript's `toISOString` |
@@ -179,5 +183,13 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   `automerge` with `TypeOrigin::ThisExtension`, so pgrx orders every other
   function after the type.
 - Tests: `#[pg_test]` for SQL behaviour, plain `#[test]` for the pure
-  conversion logic, and `tests/pg_regress` for user-facing examples. Build test
-  documents in Rust with `automerge::AutoCommit` and pass them in as `bytea`.
+  conversion logic (edge cases in `crates/pg_automerge_core/tests/`), and
+  `tests/pg_regress` for user-facing examples. `tests/concurrency.sh`
+  (`mise run concurrency`) runs two real psql sessions against one row to
+  check the EvalPlanQual claim above, the upsert path and REPEATABLE READ,
+  plus a pg_dump/restore round trip. Build test documents in Rust with
+  `automerge::AutoCommit` and pass them in as `bytea`.
+- Build profile: dev builds compile dependencies optimized and Automerge
+  without debug assertions or overflow checks (Cargo.toml). Its debug
+  assertions make large documents quadratic, and its overflow checks turned a
+  counter past i64::MAX into a panic on read in dev builds only.

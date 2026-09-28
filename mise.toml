@@ -31,3 +31,7 @@ run = "cargo pgrx regress pg{{env.PG_VERSION}}"
 [tasks.run]
 description = "Install the extension and open psql against a pgrx-managed Postgres"
 run = "cargo pgrx run pg{{env.PG_VERSION}}"
+
+[tasks.concurrency]
+description = "Two concurrent psql sessions merging into one row (installs + starts the pgrx Postgres)"
+run = "bash tests/concurrency.sh"
