@@ -3,65 +3,36 @@
 //! chain of small incremental change sets (`bench_changes`, change `i`
 //! builds on change `i - 1`, as a backend persisting edit by edit sends
 //! them) plus concurrent forks (`bench_forks`, full saves of the base with
-//! one extra change each, for `merge_agg`).
+//! one extra change each, for `merge_agg`), and each document's compressed
+//! save as `bytea` (`bench_saves`, for timing writes).
 
 use automerge::transaction::Transactable;
-use automerge::{ActorId, AutoCommit, ObjType, ROOT};
+use automerge::{ActorId, ROOT};
 use pg_automerge_core::encoding::to_hex_literal;
+
+#[path = "shared/bench_docs.rs"]
+mod bench_docs;
+
+use bench_docs::{big_text, structured};
 
 const CHANGES: usize = 20;
 const FORKS: usize = 8;
-
-/// One large text (3,000,000 characters) in one change: expensive to load.
-fn big_text() -> AutoCommit {
-    let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
-    let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let body: String = (0..3_000_000)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            char::from(b'a' + (state % 26) as u8)
-        })
-        .collect();
-    doc.splice_text(&text, 0, 0, &body).unwrap();
-    doc.put(ROOT, "status", "new").unwrap();
-    doc.commit();
-    doc
-}
-
-/// A list of `n` small maps, committed every 50 items.
-fn structured(n: usize) -> AutoCommit {
-    let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
-    let items = doc.put_object(ROOT, "items", ObjType::List).unwrap();
-    for i in 0..n {
-        let m = doc.insert_object(&items, i, ObjType::Map).unwrap();
-        doc.put(&m, "id", i as i64).unwrap();
-        doc.put(&m, "title", format!("item number {i}")).unwrap();
-        doc.put(&m, "done", i % 3 == 0).unwrap();
-        if i % 50 == 49 {
-            doc.commit();
-        }
-    }
-    doc.put(ROOT, "status", "new").unwrap();
-    doc.commit();
-    doc
-}
 
 fn main() {
     println!("CREATE TABLE bench_doc (name text PRIMARY KEY, doc automerge NOT NULL);");
     println!("CREATE TABLE bench_changes (name text, i int, c bytea, PRIMARY KEY (name, i));");
     println!("CREATE TABLE bench_forks (name text, i int, doc automerge, PRIMARY KEY (name, i));");
+    println!("CREATE TABLE bench_saves (name text PRIMARY KEY, save bytea NOT NULL);");
     for (name, mut doc) in [
         ("text3mb", big_text()),
         ("items20k", structured(20_000)),
         ("items2k", structured(2_000)),
     ] {
-        println!(
-            "INSERT INTO bench_doc VALUES ('{name}', '{}');",
-            to_hex_literal(&doc.save())
-        );
+        // The compressed save a backend sends (`Automerge.save()`), stored
+        // as bytea so the benchmark can time its validation.
+        let save = to_hex_literal(&doc.save());
+        println!("INSERT INTO bench_doc VALUES ('{name}', '{save}');");
+        println!("INSERT INTO bench_saves VALUES ('{name}', '{save}');");
         let mut writer = doc.fork().with_actor(ActorId::from([2u8; 16]));
         for i in 1..=CHANGES {
             let heads = writer.get_heads();

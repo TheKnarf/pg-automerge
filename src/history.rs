@@ -5,12 +5,13 @@
 use pg_automerge_core::automerge::ChangeHash;
 use pg_automerge_core::header;
 use pg_automerge_core::{self as am, Error};
+use pgrx::PgTupleDesc;
 use pgrx::heap_tuple::PgHeapTuple;
 use pgrx::prelude::*;
-use pgrx::{JsonB, PgTupleDesc};
 
 use crate::datum::AutomergeArg;
 use crate::error::{OrRaise, null_element, raise};
+use crate::jsonb::{JsonbBuilder, JsonbDatum};
 
 extension_sql!(
     r#"
@@ -208,12 +209,16 @@ fn automerge_change_count(doc: AutomergeArg) -> i64 {
 /// The document's state as of `heads` as jsonb. Every head must be a change
 /// of the document (22023 otherwise); `'{}'` is the state before any change.
 #[pg_extern(immutable, strict, parallel_safe, name = "automerge_to_jsonb")]
-fn automerge_to_jsonb_at(doc: AutomergeArg, heads: Vec<Option<String>>) -> JsonB {
+fn automerge_to_jsonb_at(doc: AutomergeArg, heads: Vec<Option<String>>) -> JsonbDatum {
     let heads = hashes_arg("heads", &heads);
-    JsonB(
-        doc.with_input(|input| am::history::to_json_at(input, &heads))
-            .or_raise(),
-    )
+    let mut jsonb = JsonbBuilder::default();
+    doc.with_input(|input| am::history::write_json_at(input, &heads, &mut jsonb))
+        .or_raise();
+    jsonb.finish().unwrap_or_else(|| {
+        raise(Error::Internal(
+            "automerge to jsonb: incomplete result".into(),
+        ))
+    })
 }
 
 extension_sql!(

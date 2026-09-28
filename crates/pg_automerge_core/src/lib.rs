@@ -10,7 +10,8 @@
 #![warn(missing_docs)]
 
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::OnceLock;
 
 use automerge::{Automerge, AutomergeError, ChangeHash, ReadDoc};
 
@@ -20,6 +21,9 @@ pub mod history;
 pub mod json;
 pub mod loaded;
 pub mod notify;
+
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
 
 pub use automerge;
 pub use serde_json;
@@ -119,6 +123,15 @@ impl std::error::Error for Error {}
 /// "invalid automerge document" error, so every public entry point runs its
 /// Automerge calls through this.
 ///
+/// Only panics with a string payload (`panic!` with a message, which is
+/// what Rust code such as automerge raises) are converted. Any other payload
+/// is passed on with `resume_unwind`: in a backend that is a Postgres ERROR
+/// raised inside `f` (a query cancel reached through
+/// [`set_interrupt_check`], or an error from a Postgres function a
+/// [`json::JsonSink`] calls), which pgrx carries as a panic with its own
+/// payload type and must reach pgrx's boundary unchanged, not be
+/// relabelled 22P02/XX000.
+///
 /// `AssertUnwindSafe` is fine: nothing captured outlives a panic in a usable
 /// state that anyone observes. In Postgres the resulting ERROR aborts the
 /// statement, which discards e.g. a half-updated `merge_agg` state.
@@ -130,13 +143,49 @@ fn guard<T>(
     on_panic: impl FnOnce(&str) -> Error,
 ) -> Result<T, Error> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|payload| {
-        let msg = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("unknown panic");
+        let msg = match payload.downcast_ref::<&str>() {
+            Some(msg) => *msg,
+            None => match payload.downcast_ref::<String>() {
+                Some(msg) => msg.as_str(),
+                None => resume_unwind(payload),
+            },
+        };
         Err(on_panic(msg))
     })
+}
+
+/// The interrupt check of the embedding process (see
+/// [`set_interrupt_check`]).
+static INTERRUPT_CHECK: OnceLock<fn()> = OnceLock::new();
+
+/// Register a function that the long-running loops of this crate (the
+/// JSON walk, building history rows) call every [`TICK_EVERY`] steps. The
+/// extension registers Postgres' `CHECK_FOR_INTERRUPTS()`, so a cancel or
+/// `statement_timeout` takes effect between steps; it raises by panicking
+/// with a non-string payload, which the panic guard around Automerge calls
+/// passes through. Only the first registration counts. Single Automerge
+/// calls (a load, a save, a text read) cannot be interrupted.
+pub fn set_interrupt_check(check: fn()) {
+    let _ = INTERRUPT_CHECK.set(check);
+}
+
+/// How many steps pass between interrupt checks.
+pub const TICK_EVERY: u32 = 1024;
+
+/// Counts loop steps and runs the interrupt check every [`TICK_EVERY`].
+#[derive(Default)]
+pub(crate) struct Ticker(u32);
+
+impl Ticker {
+    #[inline]
+    pub(crate) fn tick(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+        if self.0.is_multiple_of(TICK_EVERY)
+            && let Some(check) = INTERRUPT_CHECK.get()
+        {
+            check();
+        }
+    }
 }
 
 /// `guard` for operations on external input.
@@ -197,12 +246,25 @@ fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
 ///
 /// The save is guarded too: a document that loaded from malformed (but
 /// checksummed) input could still trip an assertion when re-encoded.
-/// Unless the input already was the canonical encoding, the result is loaded
-/// back and must have the same heads. Malformed input with valid checksums
-/// can load "successfully" into a document whose re-save does not load
-/// (seen in fuzzing: "mismatching heads"); storing that would make the value
-/// unreadable forever, so it is rejected here as invalid input instead. This
-/// costs a second load on writes of non-canonical (e.g. compressed) saves.
+///
+/// The result is loaded back and must have the same heads, unless loading
+/// it provably parses the very bytes the first load already accepted:
+///
+/// - the input already was the canonical encoding (`saved == bytes`), or
+/// - the input is one document chunk with deflated columns (a compressed
+///   `save()`) whose inflated form ([`header::inflate_document`], which
+///   inflates exactly as Automerge's loader does) is byte for byte
+///   `saved`: Automerge inflates a compressed chunk before reading it, so
+///   the first load read those same uncompressed bytes.
+///
+/// Malformed input with valid checksums can load "successfully" into a
+/// document whose re-save does not load (seen in fuzzing: "mismatching
+/// heads"); storing that would make the value unreadable forever, so it is
+/// rejected here as invalid input instead. Such input never takes the
+/// shortcut: its re-save differs from what was loaded. Anything else (bare
+/// change chunks, a document plus trailing changes, a document encoded
+/// differently, e.g. by another Automerge implementation) costs this
+/// second load.
 ///
 /// # Errors
 ///
@@ -214,7 +276,7 @@ pub fn normalize(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     guard_input(|| {
         let doc = load_external(bytes)?;
         let saved = doc.save_nocompress();
-        if saved != bytes {
+        if saved != bytes && header::inflate_document(bytes).as_deref() != Some(saved.as_slice()) {
             let mut heads = doc.get_heads();
             heads.sort_unstable();
             reload_check(&saved, &heads, "invalid automerge document")?;
@@ -228,6 +290,12 @@ pub fn normalize(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 /// (sorted). Otherwise [`Error::InvalidInput`], with messages starting with
 /// `what`.
 pub(crate) fn reload_check(saved: &[u8], heads: &[ChangeHash], what: &str) -> Result<(), Error> {
+    #[cfg(feature = "test-hooks")]
+    if test_hooks::reload_check_hook() {
+        return Err(Error::InvalidInput(format!(
+            "{what}: does not survive a save and load (forced by a test hook)"
+        )));
+    }
     let reloaded = Automerge::load(saved).map_err(|e| {
         Error::InvalidInput(format!("{what}: does not survive a save and load ({e})"))
     })?;

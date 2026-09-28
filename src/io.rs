@@ -5,11 +5,12 @@ use std::ffi::{CStr, CString};
 
 use pg_automerge_core::loaded;
 use pg_automerge_core::{self as am, Error};
+use pgrx::Internal;
 use pgrx::prelude::*;
-use pgrx::{Internal, JsonB};
 
 use crate::datum::{AutomergeArg, AutomergeDatum, AutomergeValue, Detoasted};
 use crate::error::{OrRaise, raise};
+use crate::jsonb::{JsonbBuilder, JsonbDatum};
 
 // The I/O functions are declared by hand in the `automerge_type` block (they
 // must exist before `CREATE TYPE`), so pgrx emits no SQL for them.
@@ -111,11 +112,17 @@ fn automerge_from_bytea(bytes: &[u8]) -> AutomergeDatum {
 
 /// The current state of the document as jsonb (see the mapping in DESIGN.md).
 #[pg_extern(immutable, strict, parallel_safe)]
-fn automerge_to_jsonb(doc: AutomergeArg) -> JsonB {
-    JsonB(
-        doc.with_input(|input| loaded::with_doc(input, am::json::doc_to_json))
-            .or_raise(),
-    )
+fn automerge_to_jsonb(doc: AutomergeArg) -> JsonbDatum {
+    let mut jsonb = JsonbBuilder::default();
+    doc.with_input(|input| {
+        loaded::with_doc(input, |doc| am::json::write_json_at(doc, None, &mut jsonb))
+    })
+    .or_raise();
+    jsonb.finish().unwrap_or_else(|| {
+        raise(Error::Internal(
+            "automerge to jsonb: incomplete result".into(),
+        ))
+    })
 }
 
 extension_sql!(

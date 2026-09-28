@@ -10,7 +10,8 @@ categories = ["database"]
 publish = false
 
 [features]
-# Instrumentation for the extension's tests: loaded::live_count().
+# Instrumentation for tests: loaded::live_count() and the test_hooks
+# module. The core's own tests enable it through the dev-dependency below.
 test-hooks = []
 
 [dependencies]
@@ -19,3 +20,12 @@ serde_json.workspace = true
 # Change hashes of bare change chunks (header::change_chunks); the same
 # version automerge uses, already in the lock file through it.
 sha2 = "0.11"
+# Inflating the deflated columns of a compressed document chunk
+# (header::inflate_document). Must be the very crate and backend automerge
+# uses (same requirement and features, so Cargo unifies them): the
+# normalize() fast path relies on inflating exactly as automerge does.
+flate2 = { version = "1.0.22", default-features = false, features = ["zlib-rs"] }
+
+[dev-dependencies]
+# The integration tests use the test hooks.
+pg_automerge_core = { path = ".", features = ["test-hooks"] }

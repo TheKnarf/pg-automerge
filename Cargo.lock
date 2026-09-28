@@ -1060,6 +1060,8 @@ name = "pg_automerge_core"
 version = "0.1.0"
 dependencies = [
  "automerge",
+ "flate2",
+ "pg_automerge_core",
  "serde_json",
  "sha2",
 ]

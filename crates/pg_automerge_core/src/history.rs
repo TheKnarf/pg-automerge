@@ -26,8 +26,9 @@ use std::collections::{BinaryHeap, HashMap};
 
 use automerge::{Automerge, Change, ChangeHash, ReadDoc};
 
+use crate::json::JsonSink;
 use crate::loaded::{Input, with_doc};
-use crate::{Error, is_subset};
+use crate::{Error, Ticker, is_subset};
 
 /// One change of a document, as returned by the history functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,7 +179,9 @@ fn causal_order(changes: Vec<ChangeInfo>) -> Result<Vec<ChangeInfo>, Error> {
         .map(|(i, _)| std::cmp::Reverse(i))
         .collect();
     let mut order = Vec::with_capacity(changes.len());
+    let mut ticker = Ticker::default();
     while let Some(std::cmp::Reverse(i)) = ready.pop() {
+        ticker.tick();
         order.push(i);
         for &j in &dependents[i] {
             waiting_on[j] -= 1;
@@ -209,10 +212,14 @@ fn causal_order(changes: Vec<ChangeInfo>) -> Result<Vec<ChangeInfo>, Error> {
 /// [`Error::Internal`] if a stored `input` does not load.
 pub fn changes_meta(input: Input<'_>, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
     self::since(input, since, |doc| {
+        let mut ticker = Ticker::default();
         let rows = doc
             .get_changes_meta(since)
             .iter()
-            .map(ChangeInfo::from_meta)
+            .map(|meta| {
+                ticker.tick();
+                ChangeInfo::from_meta(meta)
+            })
             .collect();
         causal_order(rows)
     })
@@ -228,10 +235,14 @@ pub fn changes(input: Input<'_>, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>
 }
 
 fn changes_of(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
+    let mut ticker = Ticker::default();
     let rows = doc
         .get_changes(since)
         .iter()
-        .map(ChangeInfo::from_change)
+        .map(|change| {
+            ticker.tick();
+            ChangeInfo::from_change(change)
+        })
         .collect();
     causal_order(rows)
 }
@@ -305,6 +316,22 @@ pub fn change_count(input: Input<'_>) -> Result<u64, Error> {
 /// [`Error::InvalidParameter`] naming the first missing head (sorted);
 /// [`Error::Internal`] if a stored `input` does not load.
 pub fn to_json_at(input: Input<'_>, heads: &[ChangeHash]) -> Result<serde_json::Value, Error> {
+    let mut sink = crate::json::ValueSink::default();
+    write_json_at(input, heads, &mut sink)?;
+    Ok(sink.into_value().expect("the walk emits one object"))
+}
+
+/// [`to_json_at`] into a [`JsonSink`].
+///
+/// # Errors
+///
+/// As [`to_json_at`]; the sink has then received an incomplete walk (or
+/// nothing).
+pub fn write_json_at<S: JsonSink + ?Sized>(
+    input: Input<'_>,
+    heads: &[ChangeHash],
+    sink: &mut S,
+) -> Result<(), Error> {
     with_doc(input, |doc| {
         check_heads(doc, heads)?;
         let mut current = doc.get_heads();
@@ -313,9 +340,9 @@ pub fn to_json_at(input: Input<'_>, heads: &[ChangeHash]) -> Result<serde_json::
         wanted.sort_unstable();
         wanted.dedup();
         if wanted == current {
-            return crate::json::doc_to_json(doc);
+            return crate::json::write_json_at(doc, None, sink);
         }
-        crate::json::doc_to_json_at(doc, Some(&wanted))
+        crate::json::write_json_at(doc, Some(&wanted), sink)
     })
 }
 

@@ -224,3 +224,55 @@ pub fn random_replicas(seed: u64) -> Vec<Vec<u8>> {
         .map(|r| normalize(&r.save()).unwrap())
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// Reference implementations
+// ---------------------------------------------------------------------------
+
+/// What `normalize` computes, the long way: load strictly (no missing
+/// dependencies), save uncompressed, load the save back and compare heads.
+/// `None` where `normalize` must fail (a panic counts as a failure).
+pub fn reference_normalize(bytes: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| {
+        let doc = automerge::Automerge::load(bytes).ok()?;
+        if !doc.get_missing_deps(&[]).is_empty() {
+            return None;
+        }
+        let saved = doc.save_nocompress();
+        let reloaded = automerge::Automerge::load(&saved).ok()?;
+        let mut before = doc.get_heads();
+        before.sort();
+        let mut after = reloaded.get_heads();
+        after.sort();
+        (before == after).then_some(saved)
+    })
+    .ok()
+    .flatten()
+}
+
+/// A chunk of type `chunk_type` around `data`, with a correct checksum.
+pub fn chunk(chunk_type: u8, data: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut len = Vec::new();
+    let mut v = data.len() as u64;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            len.push(b);
+            break;
+        }
+        len.push(b | 0x80);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update([chunk_type]);
+    hasher.update(&len);
+    hasher.update(data);
+    let hash: [u8; 32] = hasher.finalize().into();
+    let mut out = vec![0x85, 0x6f, 0x4a, 0x83];
+    out.extend_from_slice(&hash[..4]);
+    out.push(chunk_type);
+    out.extend_from_slice(&len);
+    out.extend_from_slice(data);
+    out
+}

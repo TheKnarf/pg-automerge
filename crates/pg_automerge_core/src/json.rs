@@ -1,7 +1,15 @@
 //! Conversion of the state of an Automerge document (current, or as of given
 //! heads) to JSON, following the mapping table in docs/DESIGN.md.
+//!
+//! The walk ([`write_json_at`]) emits events into a [`JsonSink`]: the
+//! extension builds jsonb directly from them, and [`ValueSink`] builds a
+//! `serde_json::Value` ([`doc_to_json`], used by tests and tools).
 
-use automerge::iter::{ListRange, MapRange};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use automerge::iter::{DocItem, ListRange, MapRange, Span};
 use automerge::{Automerge, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValueRef, ValueRef};
 use serde_json::{Map, Number, Value};
 
@@ -9,10 +17,45 @@ use crate::Error;
 use crate::encoding::{base64, iso8601_millis};
 
 /// Maximum object nesting depth converted. The walk below is iterative, but
-/// serializing and dropping the resulting `serde_json::Value` recurse, so a
-/// hostile document could otherwise exhaust the backend's stack. Real
-/// documents are nowhere near this deep.
+/// building the result recurses (jsonb's `convertToJsonb`, dropping a
+/// `serde_json::Value`), so a hostile document could otherwise exhaust the
+/// backend's stack (Postgres' `check_stack_depth` would stop that too, but
+/// this cap gives a clear error). Real documents are nowhere near this deep.
 pub const MAX_DEPTH: usize = 1000;
+
+/// Receiver of the events of a JSON walk, in document order: a value is a
+/// scalar call or a `begin_*` .. `end_*` bracket, and inside an object
+/// every value is preceded by its [`JsonSink::key`].
+///
+/// Strings and keys never contain U+0000 (replaced by U+FFFD), floats are
+/// always finite (non-finite ones arrive as [`JsonSink::null`]), and an
+/// object may repeat a key only if the document has two keys that differ
+/// just in U+0000 vs U+FFFD; the last one wins, as in `jsonb` and in a
+/// `serde_json::Map`.
+pub trait JsonSink {
+    /// Start an object.
+    fn begin_object(&mut self);
+    /// End the innermost open object.
+    fn end_object(&mut self);
+    /// Start an array of (at least, and usually exactly) `len_hint` elements.
+    fn begin_array(&mut self, len_hint: usize);
+    /// End the innermost open array.
+    fn end_array(&mut self);
+    /// The key of the next value of the innermost open object.
+    fn key(&mut self, key: &str);
+    /// A string.
+    fn string(&mut self, value: &str);
+    /// A signed integer (exact).
+    fn int(&mut self, value: i64);
+    /// An unsigned integer (exact; may exceed `i64::MAX`).
+    fn uint(&mut self, value: u64);
+    /// A finite float.
+    fn float(&mut self, value: f64);
+    /// A boolean.
+    fn bool(&mut self, value: bool);
+    /// `null`.
+    fn null(&mut self);
+}
 
 /// Convert the current state of `doc` to a JSON object.
 ///
@@ -31,42 +74,231 @@ pub fn doc_to_json(doc: &Automerge) -> Result<Value, Error> {
 /// Convert the state of `doc` as of `heads` (`None`: the current state) to a
 /// JSON object, with the same mapping as [`doc_to_json`].
 ///
-/// `heads` must all be changes of `doc` (callers check); Automerge ignores
-/// unknown ones. Every container read with `heads` recomputes Automerge's
-/// clock for them, which costs a walk of the change graph back to the
-/// nearest cached clock, so historical reads are somewhat slower than
-/// current ones. Heads equal to the document's current heads take the
-/// current-state path inside Automerge.
-///
 /// # Errors
 ///
 /// As [`doc_to_json`].
 pub fn doc_to_json_at(doc: &Automerge, heads: Option<&[ChangeHash]>) -> Result<Value, Error> {
-    // Depth-first walk with an explicit stack of containers being filled, so
-    // the native stack does not grow with document depth.
-    let mut stack = vec![Frame::new(doc, heads, &ROOT, ObjType::Map, None)];
-    loop {
-        let top = stack
-            .last_mut()
-            .expect("the root frame is only popped to return");
-        let Some((key, value, id)) = top.next_item() else {
-            let done = stack.pop().expect("checked above");
-            let (key, value) = done.finish();
-            match stack.last_mut() {
-                Some(parent) => parent.push(key, value),
-                None => return Ok(value),
+    let mut sink = ValueSink::default();
+    write_json_at(doc, heads, &mut sink)?;
+    Ok(sink.into_value().expect("the walk emits one object"))
+}
+
+/// Walk the state of `doc` as of `heads` (`None`: the current state) into
+/// `sink`: one object, with the mapping of [`doc_to_json`]. Checks for
+/// interrupts (see [`crate::set_interrupt_check`]) every
+/// [`crate::TICK_EVERY`] steps.
+///
+/// Two passes: Automerge's document iterator (`ReadDoc::iter_at`) visits
+/// every reachable object once, in one sweep over the op set, and the
+/// entries are buffered per object (borrowing from `doc`); then they are
+/// emitted depth first from the root. Setting up a `map_range` /
+/// `list_range` iterator per object ([`write_json_per_object`]) costs about
+/// 5 µs per object, which dominated documents made of many small objects
+/// (a list of 20,000 small maps: 144 ms per-object, 75 ms in one sweep).
+/// Text comes from the sweep's spans: string runs, and U+FFFC for each
+/// block marker, exactly the characters `ReadDoc::text` returns (both put
+/// U+FFFC for anything in a text that is not a string, and nothing for
+/// marks); on one huge text that is about a quarter slower than `text()`.
+/// A document with a `Table` object (legacy: automerge 0.12 no longer
+/// creates them, but loads them from old saves; the sweep would read one
+/// as a list) takes the per-object walk.
+///
+/// `heads` must all be changes of `doc` (callers check); Automerge ignores
+/// unknown ones. Heads equal to the document's current heads take the
+/// current-state path inside Automerge.
+///
+/// On an error the sink has received an incomplete walk.
+///
+/// # Errors
+///
+/// As [`doc_to_json`].
+pub fn write_json_at<S: JsonSink + ?Sized>(
+    doc: &Automerge,
+    heads: Option<&[ChangeHash]>,
+    sink: &mut S,
+) -> Result<(), Error> {
+    match Sweep::collect(doc, heads) {
+        Some(sweep) => sweep.emit(sink),
+        None => write_json_per_object(doc, heads, sink),
+    }
+}
+
+/// The visible content of every reachable object, from one sweep.
+struct Sweep<'a> {
+    objects: Vec<Content<'a>>,
+    index: HashMap<ObjId, usize>,
+}
+
+enum Content<'a> {
+    /// A map's or list's entries, in order.
+    Entries(Vec<Entry<'a>>),
+    /// A text's characters.
+    Text(String),
+}
+
+struct Entry<'a> {
+    /// The map key; `None` in lists.
+    key: Option<Cow<'a, str>>,
+    value: EntryValue<'a>,
+}
+
+enum EntryValue<'a> {
+    Scalar(ScalarValueRef<'a>),
+    Object(ObjId, ObjType),
+}
+
+impl<'a> Sweep<'a> {
+    /// `None` if the document has a `Table` object.
+    fn collect(doc: &'a Automerge, heads: Option<&[ChangeHash]>) -> Option<Self> {
+        let mut ticker = crate::Ticker::default();
+        let mut sweep = Sweep {
+            objects: Vec::new(),
+            index: HashMap::new(),
+        };
+        let mut current: Option<Arc<ObjId>> = None;
+        for item in doc.iter_at(ROOT, heads) {
+            ticker.tick();
+            // The iterator yields each object's items together, and hands
+            // out one shared id per object.
+            if current.as_ref().is_none_or(|c| !Arc::ptr_eq(c, &item.obj)) {
+                let content = match item.item {
+                    DocItem::Text(_) => Content::Text(String::new()),
+                    DocItem::Map(_) | DocItem::List(_) => Content::Entries(Vec::new()),
+                };
+                sweep.index.insert((*item.obj).clone(), sweep.objects.len());
+                sweep.objects.push(content);
+                current = Some(item.obj);
+            }
+            let content = sweep.objects.last_mut().expect("pushed above");
+            let (key, value, id) = match item.item {
+                DocItem::Map(m) => {
+                    let id = matches!(m.value, ValueRef::Object(_)).then(|| m.id());
+                    (Some(m.key), m.value, id)
+                }
+                DocItem::List(l) => {
+                    let id = matches!(l.value, ValueRef::Object(_)).then(|| l.id());
+                    (None, l.value, id)
+                }
+                DocItem::Text(span) => {
+                    if let Content::Text(text) = content {
+                        match span {
+                            Span::Text { text: run, .. } => text.push_str(&run),
+                            Span::Block(_) => text.push('\u{FFFC}'),
+                        }
+                    }
+                    continue;
+                }
+            };
+            let value = match (value, id) {
+                (ValueRef::Scalar(scalar), _) => EntryValue::Scalar(scalar),
+                (ValueRef::Object(ObjType::Table), _) => return None,
+                (ValueRef::Object(typ), Some(id)) => EntryValue::Object(id, typ),
+                (ValueRef::Object(_), None) => unreachable!("objects get an id above"),
+            };
+            if let Content::Entries(entries) = content {
+                entries.push(Entry { key, value });
+            }
+        }
+        Some(sweep)
+    }
+
+    fn content(&self, id: &ObjId) -> Option<&Content<'a>> {
+        self.index.get(id).map(|&i| &self.objects[i])
+    }
+
+    /// The entries of a map or list (none if it has no visible entries).
+    fn entries(&self, id: &ObjId) -> &[Entry<'a>] {
+        match self.content(id) {
+            Some(Content::Entries(entries)) => entries,
+            _ => &[],
+        }
+    }
+
+    fn emit<S: JsonSink + ?Sized>(&self, sink: &mut S) -> Result<(), Error> {
+        let mut ticker = crate::Ticker::default();
+        sink.begin_object();
+        // Open containers: their remaining entries, and whether a map.
+        let mut stack = vec![(self.entries(&ROOT).iter(), true)];
+        while let Some((iter, is_map)) = stack.last_mut() {
+            ticker.tick();
+            let is_map = *is_map;
+            let Some(entry) = iter.next() else {
+                stack.pop();
+                if is_map {
+                    sink.end_object();
+                } else {
+                    sink.end_array();
+                }
+                continue;
+            };
+            if let Some(key) = &entry.key {
+                sink.key(&sanitize(key));
+            }
+            match &entry.value {
+                EntryValue::Scalar(scalar) => write_scalar(scalar, sink),
+                EntryValue::Object(id, ObjType::Text) => match self.content(id) {
+                    Some(Content::Text(text)) => sink.string(&sanitize(text)),
+                    _ => sink.string(""),
+                },
+                EntryValue::Object(id, typ) => {
+                    if stack.len() >= MAX_DEPTH {
+                        return Err(Error::Internal(format!(
+                            "automerge document is nested more than {MAX_DEPTH} levels deep"
+                        )));
+                    }
+                    let children = self.entries(id);
+                    let is_map = *typ != ObjType::List;
+                    if is_map {
+                        sink.begin_object();
+                    } else {
+                        sink.begin_array(children.len());
+                    }
+                    stack.push((children.iter(), is_map));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`write_json_at`] one object at a time: a `map_range` / `list_range`
+/// iterator per object, `text()` per text. The same output; slower on many
+/// small objects, faster on one huge text. Used for documents with `Table`
+/// objects (and by tests, as the reference).
+///
+/// # Errors
+///
+/// As [`doc_to_json`].
+pub fn write_json_per_object<S: JsonSink + ?Sized>(
+    doc: &Automerge,
+    heads: Option<&[ChangeHash]>,
+    sink: &mut S,
+) -> Result<(), Error> {
+    // Depth-first walk with an explicit stack of the containers being
+    // read, so the native stack does not grow with document depth. Every
+    // container read with `heads` recomputes Automerge's clock for them,
+    // which costs a walk of the change graph back to the nearest cached
+    // clock.
+    let mut ticker = crate::Ticker::default();
+    let mut stack = vec![Frame::new(doc, heads, &ROOT, ObjType::Map, sink)];
+    while let Some(top) = stack.last_mut() {
+        ticker.tick();
+        let Some((value, id)) = top.next_item(sink) else {
+            match stack.pop().expect("not empty") {
+                Frame::Map(_) => sink.end_object(),
+                Frame::List(_) => sink.end_array(),
             }
             continue;
         };
         match (value, id) {
-            (ValueRef::Scalar(scalar), _) => top.push(key, scalar_to_json(&scalar)),
+            (ValueRef::Scalar(scalar), _) => write_scalar(&scalar, sink),
             (ValueRef::Object(ObjType::Text), Some(id)) => {
                 let text = match heads {
                     Some(heads) => doc.text_at(&id, heads),
                     None => doc.text(&id),
                 }
                 .map_err(|e| Error::Internal(format!("could not read automerge text: {e}")))?;
-                top.push(key, Value::String(sanitize(&text).into_owned()));
+                sink.string(&sanitize(&text));
             }
             (ValueRef::Object(typ), Some(id)) => {
                 if stack.len() >= MAX_DEPTH {
@@ -74,37 +306,29 @@ pub fn doc_to_json_at(doc: &Automerge, heads: Option<&[ChangeHash]>) -> Result<V
                         "automerge document is nested more than {MAX_DEPTH} levels deep"
                     )));
                 }
-                stack.push(Frame::new(doc, heads, &id, typ, key));
+                stack.push(Frame::new(doc, heads, &id, typ, sink));
             }
             (ValueRef::Object(_), None) => unreachable!("next_item returns an id for objects"),
         }
     }
+    Ok(())
 }
 
-/// A map or list whose visible entries are being converted.
+/// A map or list whose visible entries are being walked.
 enum Frame<'a> {
-    Map {
-        key_in_parent: Option<String>,
-        // `map_range` yields one item per visible key: the conflict winner.
-        iter: MapRange<'a>,
-        out: Map<String, Value>,
-    },
-    List {
-        key_in_parent: Option<String>,
-        iter: ListRange<'a>,
-        out: Vec<Value>,
-    },
+    // `map_range` yields one item per visible key: the conflict winner.
+    Map(MapRange<'a>),
+    List(ListRange<'a>),
 }
 
 impl<'a> Frame<'a> {
-    /// `key_in_parent` is the map key this container is stored under, or
-    /// `None` for list elements and the root.
-    fn new(
+    /// Open the container `obj` of type `typ` (and tell the sink).
+    fn new<S: JsonSink + ?Sized>(
         doc: &'a Automerge,
         heads: Option<&[ChangeHash]>,
         obj: &ObjId,
         typ: ObjType,
-        key_in_parent: Option<String>,
+        sink: &mut S,
     ) -> Self {
         match typ {
             ObjType::List => {
@@ -113,75 +337,141 @@ impl<'a> Frame<'a> {
                     Some(heads) => (doc.list_range_at(obj, .., heads), 0),
                     None => (doc.list_range(obj, ..), doc.length(obj)),
                 };
-                Frame::List {
-                    key_in_parent,
-                    iter,
-                    out: Vec::with_capacity(len),
-                }
+                sink.begin_array(len);
+                Frame::List(iter)
             }
             // Text never gets a frame; it is converted in one go via `text()`.
-            ObjType::Map | ObjType::Table | ObjType::Text => Frame::Map {
-                key_in_parent,
-                iter: match heads {
+            ObjType::Map | ObjType::Table | ObjType::Text => {
+                sink.begin_object();
+                Frame::Map(match heads {
                     Some(heads) => doc.map_range_at(obj, .., heads),
                     None => doc.map_range(obj, ..),
-                },
-                out: Map::new(),
-            },
+                })
+            }
         }
     }
 
-    /// The next entry: its map key (maps only), value, and object id when the
-    /// value is an object (building an id is not free, so scalars skip it).
-    fn next_item(&mut self) -> Option<(Option<String>, ValueRef<'a>, Option<ObjId>)> {
+    /// The next entry (its key already passed to the sink, for maps): its
+    /// value, and its object id when the value is an object (building an id
+    /// is not free, so scalars skip it).
+    fn next_item<S: JsonSink + ?Sized>(
+        &mut self,
+        sink: &mut S,
+    ) -> Option<(ValueRef<'a>, Option<ObjId>)> {
         fn id_if_object(value: &ValueRef<'_>, id: impl FnOnce() -> ObjId) -> Option<ObjId> {
             matches!(value, ValueRef::Object(_)).then(id)
         }
         match self {
-            Frame::Map { iter, .. } => iter.next().map(|item| {
+            Frame::Map(iter) => iter.next().map(|item| {
+                sink.key(&sanitize(&item.key));
                 let id = id_if_object(&item.value, || item.id());
-                (Some(sanitize(&item.key).into_owned()), item.value, id)
+                (item.value, id)
             }),
-            Frame::List { iter, .. } => iter.next().map(|item| {
+            Frame::List(iter) => iter.next().map(|item| {
                 let id = id_if_object(&item.value, || item.id());
-                (None, item.value, id)
+                (item.value, id)
             }),
-        }
-    }
-
-    fn push(&mut self, key: Option<String>, value: Value) {
-        match self {
-            Frame::Map { out, .. } => {
-                out.insert(key.unwrap_or_default(), value);
-            }
-            Frame::List { out, .. } => out.push(value),
-        }
-    }
-
-    fn finish(self) -> (Option<String>, Value) {
-        match self {
-            Frame::Map {
-                key_in_parent, out, ..
-            } => (key_in_parent, Value::Object(out)),
-            Frame::List {
-                key_in_parent, out, ..
-            } => (key_in_parent, Value::Array(out)),
         }
     }
 }
 
-/// Map a scalar per the DESIGN.md table.
-pub fn scalar_to_json(scalar: &ScalarValueRef<'_>) -> Value {
+/// Emit a scalar per the DESIGN.md table.
+pub fn write_scalar<S: JsonSink + ?Sized>(scalar: &ScalarValueRef<'_>, sink: &mut S) {
     match scalar {
-        ScalarValueRef::Str(s) => Value::String(sanitize(s).into_owned()),
-        ScalarValueRef::Int(i) | ScalarValueRef::Counter(i) => Value::Number(Number::from(*i)),
-        ScalarValueRef::Uint(u) => Value::Number(Number::from(*u)),
-        // jsonb has no NaN / Infinity; `from_f64` returns None for those.
-        ScalarValueRef::F64(f) => Number::from_f64(*f).map_or(Value::Null, Value::Number),
-        ScalarValueRef::Boolean(b) => Value::Bool(*b),
-        ScalarValueRef::Timestamp(ms) => Value::String(iso8601_millis(*ms)),
-        ScalarValueRef::Bytes(bytes) => Value::String(base64(bytes)),
-        ScalarValueRef::Null | ScalarValueRef::Unknown { .. } => Value::Null,
+        ScalarValueRef::Str(s) => sink.string(&sanitize(s)),
+        ScalarValueRef::Int(i) | ScalarValueRef::Counter(i) => sink.int(*i),
+        ScalarValueRef::Uint(u) => sink.uint(*u),
+        // jsonb has no NaN / Infinity.
+        ScalarValueRef::F64(f) if f.is_finite() => sink.float(*f),
+        ScalarValueRef::F64(_) => sink.null(),
+        ScalarValueRef::Boolean(b) => sink.bool(*b),
+        ScalarValueRef::Timestamp(ms) => sink.string(&iso8601_millis(*ms)),
+        ScalarValueRef::Bytes(bytes) => sink.string(&base64(bytes)),
+        ScalarValueRef::Null | ScalarValueRef::Unknown { .. } => sink.null(),
+    }
+}
+
+/// Map a scalar per the DESIGN.md table, as a `serde_json::Value`.
+pub fn scalar_to_json(scalar: &ScalarValueRef<'_>) -> Value {
+    let mut sink = ValueSink::default();
+    write_scalar(scalar, &mut sink);
+    sink.into_value().expect("one scalar was written")
+}
+
+/// A [`JsonSink`] building a `serde_json::Value`.
+#[derive(Default)]
+pub struct ValueSink {
+    /// Open containers, innermost last; an object with the key of its next
+    /// value.
+    open: Vec<Open>,
+    done: Option<Value>,
+}
+
+enum Open {
+    Object(Map<String, Value>, Option<String>),
+    Array(Vec<Value>),
+}
+
+impl ValueSink {
+    /// The value written, once complete.
+    pub fn into_value(self) -> Option<Value> {
+        if self.open.is_empty() {
+            self.done
+        } else {
+            None
+        }
+    }
+
+    fn put(&mut self, value: Value) {
+        match self.open.last_mut() {
+            Some(Open::Object(map, key)) => {
+                map.insert(key.take().unwrap_or_default(), value);
+            }
+            Some(Open::Array(items)) => items.push(value),
+            None => self.done = Some(value),
+        }
+    }
+}
+
+impl JsonSink for ValueSink {
+    fn begin_object(&mut self) {
+        self.open.push(Open::Object(Map::new(), None));
+    }
+    fn end_object(&mut self) {
+        if let Some(Open::Object(map, _)) = self.open.pop() {
+            self.put(Value::Object(map));
+        }
+    }
+    fn begin_array(&mut self, len_hint: usize) {
+        self.open.push(Open::Array(Vec::with_capacity(len_hint)));
+    }
+    fn end_array(&mut self) {
+        if let Some(Open::Array(items)) = self.open.pop() {
+            self.put(Value::Array(items));
+        }
+    }
+    fn key(&mut self, key: &str) {
+        if let Some(Open::Object(_, pending)) = self.open.last_mut() {
+            *pending = Some(key.to_owned());
+        }
+    }
+    fn string(&mut self, value: &str) {
+        self.put(Value::String(value.to_owned()));
+    }
+    fn int(&mut self, value: i64) {
+        self.put(Value::Number(Number::from(value)));
+    }
+    fn uint(&mut self, value: u64) {
+        self.put(Value::Number(Number::from(value)));
+    }
+    fn float(&mut self, value: f64) {
+        self.put(Number::from_f64(value).map_or(Value::Null, Value::Number));
+    }
+    fn bool(&mut self, value: bool) {
+        self.put(Value::Bool(value));
+    }
+    fn null(&mut self) {
+        self.put(Value::Null);
     }
 }
 

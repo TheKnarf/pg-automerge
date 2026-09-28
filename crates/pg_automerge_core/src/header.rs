@@ -316,6 +316,155 @@ fn count_rle(column: &[u8]) -> Result<u64, Stop> {
     Ok(count)
 }
 
+/// The uncompressed form of a compressed document chunk: `bytes` with
+/// every deflated column inflated, the column metadata rewritten for the
+/// inflated columns, and a new chunk header (length and checksum). `None`
+/// unless `bytes` is exactly one document chunk with at least one deflated
+/// column whose layout parses (callers then take the general path).
+///
+/// This mirrors what Automerge's loader does with such a chunk before it
+/// reads it (automerge 0.12 `storage/document.rs` `Document::parse` and
+/// `document/compression.rs`): it copies everything before the change
+/// column metadata verbatim, rewrites both metadata blocks with the
+/// deflate bit cleared and the inflated lengths (canonical LEB128), copies
+/// the change and op column data with each deflated column inflated by
+/// `flate2::bufread::DeflateDecoder::read_to_end` (the same crate and
+/// backend: Cargo unifies them), and copies the rest of the chunk (the
+/// head indices) verbatim. So when [`crate::normalize`] finds this equal
+/// to `save_nocompress()` of the document it loaded from `bytes`, loading
+/// that save parses exactly the bytes the first load already accepted,
+/// and the save-and-load check can be skipped.
+///
+/// The checksum of the input is not checked here (a successful load did).
+/// Never panics; the output is at most as large as what Automerge's loader
+/// already inflated.
+pub fn inflate_document(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut r = Reader {
+        prefix: bytes,
+        total_len: bytes.len(),
+        pos: 0,
+    };
+    let parsed = (|| -> Result<_, Stop> {
+        if r.take(4)? != MAGIC {
+            return Err(Stop::NotSingleDoc);
+        }
+        r.take(4)?; // checksum
+        if r.take(1)?[0] != DOCUMENT_CHUNK {
+            return Err(Stop::NotSingleDoc);
+        }
+        let data_len = r.uleb_usize()?;
+        if r.pos.checked_add(data_len) != Some(r.total_len) {
+            return Err(Stop::NotSingleDoc);
+        }
+        let data_start = r.pos;
+        let actors = r.uleb_usize()?;
+        for _ in 0..actors {
+            let len = r.uleb_usize()?;
+            r.take(len)?;
+        }
+        let heads = r.uleb_usize()?;
+        r.take(heads.checked_mul(32).ok_or(Stop::NotSingleDoc)?)?;
+        let prefix_end = r.pos;
+        let change_cols = column_specs(&mut r)?;
+        let op_cols = column_specs(&mut r)?;
+        Ok((data_start, prefix_end, change_cols, op_cols))
+    })();
+    let (data_start, prefix_end, change_cols, op_cols) = parsed.ok()?;
+    if !change_cols
+        .iter()
+        .chain(&op_cols)
+        .any(|(spec, _)| spec & DEFLATE_BIT != 0)
+    {
+        return None;
+    }
+
+    // Column data, in order: change columns, then op columns.
+    let mut columns = Vec::new();
+    let mut inflated_lens = Vec::with_capacity(change_cols.len() + op_cols.len());
+    for &(spec, len) in change_cols.iter().chain(&op_cols) {
+        let raw = r.take(len).ok()?;
+        let start = columns.len();
+        if spec & DEFLATE_BIT != 0 {
+            flate2::bufread::DeflateDecoder::new(raw)
+                .read_to_end(&mut columns)
+                .ok()?;
+        } else {
+            columns.extend_from_slice(raw);
+        }
+        inflated_lens.push(columns.len() - start);
+    }
+    let suffix = &bytes[r.pos..];
+
+    let mut data = Vec::with_capacity(prefix_end - data_start + columns.len() + suffix.len() + 64);
+    data.extend_from_slice(&bytes[data_start..prefix_end]);
+    let mut lens = inflated_lens.into_iter();
+    for cols in [&change_cols, &op_cols] {
+        write_uleb(&mut data, cols.len() as u64);
+        for &(spec, _) in cols {
+            write_uleb(&mut data, spec & !DEFLATE_BIT);
+            write_uleb(&mut data, lens.next()? as u64);
+        }
+    }
+    data.extend_from_slice(&columns);
+    data.extend_from_slice(suffix);
+    Some(chunk(DOCUMENT_CHUNK, &data))
+}
+
+/// A column metadata block: the (spec, length) of each column. Specs must
+/// fit in 32 bits, as Automerge requires.
+fn column_specs(r: &mut Reader<'_>) -> Result<Vec<(u64, usize)>, Stop> {
+    let count = r.uleb_usize()?;
+    // Each entry takes at least two bytes.
+    if count > r.total_len / 2 {
+        return Err(Stop::NotSingleDoc);
+    }
+    let mut cols = Vec::with_capacity(count);
+    for _ in 0..count {
+        let spec = r.uleb()?;
+        if spec > u64::from(u32::MAX) {
+            return Err(Stop::NotSingleDoc);
+        }
+        cols.push((spec, r.uleb_usize()?));
+    }
+    Ok(cols)
+}
+
+fn write_uleb(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A chunk of type `chunk_type` around `data`: magic, checksum (the first
+/// four bytes of `sha256(type || uleb128 length || data)`), type, length,
+/// data (automerge `storage/chunk.rs`).
+fn chunk(chunk_type: u8, data: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    let mut len = Vec::with_capacity(10);
+    write_uleb(&mut len, data.len() as u64);
+    let mut hasher = Sha256::new();
+    hasher.update([chunk_type]);
+    hasher.update(&len);
+    hasher.update(data);
+    let hash: [u8; 32] = hasher.finalize().into();
+    let mut out = Vec::with_capacity(9 + len.len() + data.len());
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&hash[..4]);
+    out.push(chunk_type);
+    out.extend_from_slice(&len);
+    out.extend_from_slice(data);
+    out
+}
+
 /// Chunk type of an uncompressed change chunk.
 const CHANGE_CHUNK: u8 = 1;
 
@@ -450,6 +599,35 @@ mod tests {
             b[i] ^= 0x55;
             // Every byte is covered by the magic, the checksum or the hash.
             assert_eq!(change_chunks(&b), None, "byte {i} flipped");
+        }
+    }
+
+    #[test]
+    fn inflates_compressed_saves_to_the_uncompressed_save() {
+        let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
+        let text = doc
+            .put_object(ROOT, "text", automerge::ObjType::Text)
+            .unwrap();
+        doc.splice_text(&text, 0, 0, &"compressible ".repeat(200))
+            .unwrap();
+        doc.put(ROOT, "n", 1i64).unwrap();
+        let compressed = doc.save();
+        let plain = doc.document().save_nocompress();
+        assert_ne!(compressed, plain, "the save should have deflated columns");
+        assert_eq!(inflate_document(&compressed), Some(plain.clone()));
+        // Nothing to inflate: None, as for anything but one document chunk.
+        assert_eq!(inflate_document(&plain), None);
+        assert_eq!(inflate_document(&[]), None);
+        assert_eq!(inflate_document(b"garbage"), None);
+        let heads = doc.get_heads();
+        doc.put(ROOT, "m", 2i64).unwrap();
+        let trailing = [compressed.as_slice(), &doc.save_after(&heads)].concat();
+        assert_eq!(inflate_document(&trailing), None);
+        assert_eq!(inflate_document(&compressed[..compressed.len() - 1]), None);
+        for i in 0..compressed.len() {
+            let mut b = compressed.clone();
+            b[i] ^= 0x5a;
+            let _ = inflate_document(&b);
         }
     }
 

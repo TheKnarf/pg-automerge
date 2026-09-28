@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Benchmark of the workloads where expanded (in-memory) automerge values
-# matter: PL/pgSQL loops merging change sets into a variable, repeated reads
-# of a variable, nested merges, merge(...)::jsonb and merge_agg(...)::jsonb,
-# plus the single-UPDATE path that must not get slower. Run via
-# `mise run bench-expanded`; prints average milliseconds per case.
+# Benchmark of the SQL-level workloads: writes (validating a compressed
+# save or canonical bytes), jsonb reads, and the workloads where expanded
+# (in-memory) automerge values matter: PL/pgSQL loops merging change sets
+# into a variable, repeated reads of a variable, nested merges,
+# merge(...)::jsonb and merge_agg(...)::jsonb, plus the single-UPDATE path.
+# Run via `mise run bench-expanded`; prints average milliseconds per case.
+# (Rust-level timings of the primitives: `mise run bench-core`.)
 #
 # Installs a release build into the pgrx-managed pg18 and uses database
 # pg_automerge_bench. Not part of `mise run test` (it takes minutes).
@@ -118,7 +120,12 @@ C1="(SELECT c FROM bench_changes WHERE name = '@DOC@' AND i = 1)"
 C2="(SELECT c FROM bench_changes WHERE name = '@DOC@' AND i = 2)"
 C3="(SELECT c FROM bench_changes WHERE name = '@DOC@' AND i = 3)"
 DOC="(SELECT doc FROM bench_doc WHERE name = '@DOC@')"
+SAVE="(SELECT save FROM bench_saves WHERE name = '@DOC@')"
 CASES=(
+    "SELECT length($SAVE::automerge::bytea)"
+    "SELECT length($DOC::bytea::automerge::bytea)"
+    "SELECT doc->>'status' FROM bench_doc WHERE name = '@DOC@'"
+    "SELECT jsonb_array_length(doc->'items') FROM bench_doc WHERE name = '@DOC@'"
     "UPDATE bench_copy SET doc = merge(doc, $C1) WHERE name = '@DOC@'"
     "SELECT automerge_heads(merge($DOC, $C1))"
     "SELECT merge($DOC, $C1)::jsonb->>'status'"
@@ -138,7 +145,9 @@ for doc in $DOCS; do
         stmt="${c//@DOC@/$doc}"
         ms="$(sql -v stmt="$stmt" -v reps="$REPS" <<<"SELECT bench(:'stmt', :reps)")"
         label="$(sed -E -e "s/\(SELECT c FROM bench_changes WHERE name = '[^']*' AND i = ([0-9]+)\)/c\1/g" \
-                        -e "s/\(SELECT doc FROM bench_doc WHERE name = '[^']*'\)/doc/g" <<<"$stmt")"
+                        -e "s/\(SELECT doc FROM bench_doc WHERE name = '[^']*'\)/doc/g" \
+                        -e "s/\(SELECT save FROM bench_saves WHERE name = '[^']*'\)/save/g" \
+                        -e "s/ FROM bench_doc WHERE name = '[^']*'//" <<<"$stmt")"
         printf '%-10s | %10s | %s\n' "$doc" "$ms" "$label"
     done
 done
