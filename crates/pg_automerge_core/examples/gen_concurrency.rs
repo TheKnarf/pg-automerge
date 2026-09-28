@@ -1,12 +1,15 @@
-//! Prints the fixture documents used by tests/concurrency.sh as shell
-//! assignments (`NAME='\x<hex>'`), for `eval` in the script.
+//! Prints the fixture documents used by tests/concurrency.sh and
+//! tests/notify.sh as shell assignments (`NAME='\x<hex>'`), for `eval` in
+//! the scripts.
 //!
 //! Every fixture is a full save of a fork of one common base document, as a
 //! backend would persist after syncing with a client, except `INC_*`: those
 //! are only the fork's own changes (`save_after(base heads)`), as a backend
 //! persisting incrementally with `merge(doc, $1::bytea)` sends them. Each fork has its own
 //! actor id and makes its own edit, so the correct final state contains all of
-//! them; a lost update shows up as a missing key.
+//! them; a lost update shows up as a missing key. `MANY` (for the notify
+//! test) is the base merged with 150 concurrent forks: 150 heads, too many
+//! for a NOTIFY payload.
 
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, ObjType, ROOT};
@@ -42,4 +45,14 @@ fn main() {
             print(name, &mut fork);
         }
     }
+
+    let mut many = base.fork().with_actor(ActorId::from([0xeeu8; 16]));
+    for i in 0..150u32 {
+        let mut id = [0xa0u8; 16];
+        id[12..].copy_from_slice(&i.to_be_bytes());
+        let mut fork = base.fork().with_actor(ActorId::from(id));
+        fork.put(ROOT, format!("many{i}"), i64::from(i)).unwrap();
+        many.merge(&mut fork).unwrap();
+    }
+    print("MANY", &mut many);
 }

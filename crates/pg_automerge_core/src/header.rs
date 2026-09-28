@@ -316,11 +316,134 @@ fn count_rle(column: &[u8]) -> Result<u64, Stop> {
     Ok(count)
 }
 
+/// Chunk type of an uncompressed change chunk.
+const CHANGE_CHUNK: u8 = 1;
+
+/// One uncompressed change chunk of external input: its change hash and
+/// its dependencies, read without decoding the change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeChunk {
+    pub hash: ChangeHash,
+    pub deps: Vec<ChangeHash>,
+}
+
+/// Split `bytes` into uncompressed change chunks (`save_incremental()` /
+/// `save_after()` output), computing each change's hash and reading its
+/// dependencies, without loading anything.
+///
+/// A change hash is `sha256(chunk type || uleb128 data length || data)`
+/// (automerge `storage/chunk.rs`), and the chunk's checksum is its first
+/// four bytes; the data starts with the dependencies (uleb128 count, 32
+/// bytes each; `storage/change.rs`). Only the framing, the checksum and the
+/// dependency list are checked, not the rest of the change.
+///
+/// `None` unless `bytes` is one or more such chunks and nothing else: a
+/// document chunk, a compressed change, a bad checksum, a non-canonical
+/// length, or trailing bytes all give `None` (callers then load). Empty
+/// input is `Some(vec![])`. Never panics.
+pub fn change_chunks(bytes: &[u8]) -> Option<Vec<ChangeChunk>> {
+    use sha2::{Digest, Sha256};
+
+    let mut r = Reader {
+        prefix: bytes,
+        total_len: bytes.len(),
+        pos: 0,
+    };
+    let mut chunks = Vec::new();
+    while r.pos < bytes.len() {
+        let chunk = (|| -> Result<ChangeChunk, Stop> {
+            if r.take(4)? != MAGIC {
+                return Err(Stop::NotSingleDoc);
+            }
+            let checksum: [u8; 4] = r.take(4)?.try_into().map_err(|_| Stop::NotSingleDoc)?;
+            if r.take(1)?[0] != CHANGE_CHUNK {
+                return Err(Stop::NotSingleDoc);
+            }
+            let len_start = r.pos;
+            let len = r.uleb_usize()?;
+            let len_bytes = &bytes[len_start..r.pos];
+            // Automerge rejects overlong LEB128; the hash covers the
+            // canonical encoding, so only accept that.
+            if len_bytes.len() > 1 && len_bytes[len_bytes.len() - 1] == 0 {
+                return Err(Stop::NotSingleDoc);
+            }
+            let data = r.take(len)?;
+            let mut hasher = Sha256::new();
+            hasher.update([CHANGE_CHUNK]);
+            hasher.update(len_bytes);
+            hasher.update(data);
+            let hash: [u8; 32] = hasher.finalize().into();
+            if hash[..4] != checksum {
+                return Err(Stop::NotSingleDoc);
+            }
+            let mut d = Reader {
+                prefix: data,
+                total_len: data.len(),
+                pos: 0,
+            };
+            let count = d.uleb_usize()?;
+            if count > data.len() / 32 {
+                return Err(Stop::NotSingleDoc);
+            }
+            let mut deps = Vec::with_capacity(count);
+            for _ in 0..count {
+                let dep: [u8; 32] = d.take(32)?.try_into().map_err(|_| Stop::NotSingleDoc)?;
+                deps.push(ChangeHash(dep));
+            }
+            Ok(ChangeChunk {
+                hash: ChangeHash(hash),
+                deps,
+            })
+        })()
+        .ok()?;
+        chunks.push(chunk);
+    }
+    Some(chunks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use automerge::transaction::Transactable;
     use automerge::{ActorId, AutoCommit, ROOT};
+
+    #[test]
+    fn change_chunks_match_automerge() {
+        let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
+        doc.put(ROOT, "x", 1i64).unwrap();
+        let first = doc.get_heads();
+        let mut fork = doc.fork().with_actor(ActorId::from([2u8; 16]));
+        fork.put(ROOT, "y", 1i64).unwrap();
+        doc.put(ROOT, "z", "a longer value ".repeat(20)).unwrap();
+        doc.merge(&mut fork).unwrap();
+        doc.put(ROOT, "w", 1i64).unwrap();
+
+        let bytes = doc.save_after(&first);
+        let chunks = change_chunks(&bytes).unwrap();
+        let expected = doc.get_changes(&first);
+        assert_eq!(chunks.len(), expected.len());
+        for (chunk, change) in chunks.iter().zip(&expected) {
+            assert_eq!(chunk.hash, change.hash());
+            assert_eq!(chunk.deps, change.deps());
+        }
+        // The very first change has no deps.
+        let all = change_chunks(&doc.save_after(&[])).unwrap();
+        assert!(all[0].deps.is_empty());
+
+        assert_eq!(change_chunks(&[]), Some(vec![]));
+        // A document chunk, a compressed save, garbage, truncation and a
+        // flipped byte are all None.
+        assert_eq!(change_chunks(&doc.document().save_nocompress()), None);
+        assert_eq!(change_chunks(&doc.save()), None);
+        assert_eq!(change_chunks(b"garbage"), None);
+        assert_eq!(change_chunks(&bytes[..bytes.len() - 1]), None);
+        for i in 0..bytes.len() {
+            let mut b = bytes.clone();
+            b[i] ^= 0x55;
+            // Every byte is covered by the magic, the checksum or the hash.
+            assert_eq!(change_chunks(&b), None, "byte {i} flipped");
+        }
+    }
 
     #[test]
     fn reads_heads_and_asks_for_more() {

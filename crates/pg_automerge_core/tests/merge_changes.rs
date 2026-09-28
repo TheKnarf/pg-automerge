@@ -222,3 +222,117 @@ fn reused_actor_id_is_an_error() {
     let msg = invalid(merge_changes(&stored(&mut a), &b.save()));
     assert!(msg.contains("duplicate seq"), "{msg}");
 }
+
+mod common;
+
+use pg_automerge_core::{contains_changes, contains_changes_by_heads, stored_heads};
+
+#[test]
+fn contains_changes_common_cases_need_no_load() {
+    let mut doc = AutoCommit::new().with_actor(actor(1));
+    doc.put(ROOT, "v", 0i64).unwrap();
+    let base = stored(&mut doc);
+    let base_heads = doc.get_heads();
+    doc.put(ROOT, "v", 1i64).unwrap();
+    let next = doc.save_after(&base_heads);
+    let one = apply(&base, &next);
+    let heads_base = stored_heads(&base).unwrap();
+    let heads_one = stored_heads(&one).unwrap();
+
+    // New changes on top of the current heads: known missing.
+    assert_eq!(contains_changes_by_heads(&heads_base, &next), Some(false));
+    assert!(!contains_changes(&base, &next).unwrap());
+    // Re-sending the change that made the current head: known present, and
+    // merge returns the value as is without loading it.
+    assert_eq!(contains_changes_by_heads(&heads_one, &next), Some(true));
+    assert!(contains_changes(&one, &next).unwrap());
+    assert_eq!(merge_changes(&one, &next).unwrap(), None);
+    // Empty input is contained.
+    assert_eq!(contains_changes_by_heads(&heads_base, &[]), Some(true));
+    assert!(contains_changes(&base, &[]).unwrap());
+
+    // An older change (not a head) needs a load: still contained.
+    doc.put(ROOT, "v", 2i64).unwrap();
+    let two = apply(&one, &doc.save_after(&heads_one));
+    let heads_two = stored_heads(&two).unwrap();
+    assert_eq!(contains_changes_by_heads(&heads_two, &next), None);
+    assert!(contains_changes(&two, &next).unwrap());
+
+    // A full save goes through the load, either way.
+    assert_eq!(contains_changes_by_heads(&heads_two, &doc.save()), None);
+    assert!(contains_changes(&two, &doc.save()).unwrap());
+    assert!(!contains_changes(&base, &doc.save()).unwrap());
+
+    // Orphaned changes are not contained (merge would reject them).
+    let orphan = doc.save_after(&heads_one);
+    assert_eq!(contains_changes_by_heads(&heads_base, &orphan), None);
+    assert!(!contains_changes(&base, &orphan).unwrap());
+
+    // Garbage is invalid input, whichever path.
+    assert!(matches!(
+        contains_changes(&base, b"garbage"),
+        Err(Error::InvalidInput(_))
+    ));
+    let mut bad = next.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1; // checksum no longer matches
+    assert_eq!(contains_changes_by_heads(&heads_one, &bad), None);
+    assert!(matches!(
+        contains_changes(&one, &bad),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+/// `contains_changes` (and its no-load shortcut, whenever it answers)
+/// agrees with a direct check against the loaded document, over generated
+/// histories and slices of their change lists.
+#[test]
+fn contains_changes_matches_loaded_document() {
+    let (mut fast_true, mut fast_false, mut slow) = (0, 0, 0);
+    for seed in 1..=60u64 {
+        let replicas = common::random_replicas(seed);
+        let docs: Vec<Automerge> = replicas.iter().map(|r| load(r)).collect();
+        let mut rng = common::Rng(seed | 1);
+        for (i, a) in replicas.iter().enumerate() {
+            let heads_a = stored_heads(a).unwrap();
+            for (j, other) in docs.iter().enumerate() {
+                let since = match rng.below(3) {
+                    0 => vec![],
+                    1 => docs[i].get_heads(),
+                    _ => docs[rng.below(docs.len() as u64) as usize].get_heads(),
+                };
+                let changes = other.get_changes(&since);
+                if changes.is_empty() {
+                    continue;
+                }
+                // A contiguous slice (causal order kept, but possibly
+                // without its dependencies).
+                let start = rng.below(changes.len() as u64) as usize;
+                let end = start + 1 + rng.below((changes.len() - start) as u64) as usize;
+                let slice = &changes[start..end];
+                let bytes: Vec<u8> = slice.iter().flat_map(|c| c.raw_bytes().to_vec()).collect();
+                let expected = slice
+                    .iter()
+                    .all(|c| docs[i].get_change_meta_by_hash(&c.hash()).is_some());
+                let got = contains_changes(a, &bytes).unwrap();
+                assert_eq!(got, expected, "seed {seed} a={i} other={j} {start}..{end}");
+                match contains_changes_by_heads(&heads_a, &bytes) {
+                    Some(true) => fast_true += 1,
+                    Some(false) => fast_false += 1,
+                    None => slow += 1,
+                }
+                // merge agrees: a no-op exactly when contained (or an
+                // error for orphaned changes, which are not contained).
+                match merge_changes(a, &bytes) {
+                    Ok(None) => assert!(expected),
+                    Ok(Some(_)) | Err(Error::InvalidInput(_)) => assert!(!expected),
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+    }
+    assert!(
+        fast_true > 50 && fast_false > 50 && slow > 50,
+        "{fast_true} {fast_false} {slow}"
+    );
+}

@@ -52,6 +52,53 @@ CREATE INDEX ON docs USING gin (data jsonb_path_ops);
 CREATE INDEX ON docs USING gin ((doc::jsonb));
 ```
 
+### Keeping backends in sync
+
+Each backend holds replicas of the documents its clients use. To learn
+when another backend persisted changes, attach the notification trigger and
+`LISTEN`:
+
+```sql
+CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
+    FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id');
+
+LISTEN docs_changed;
+-- payloads look like
+-- {"table":"public.docs","op":"UPDATE","key":{"id":"…"},
+--  "columns":{"doc":{"heads":["79df…"],"prev_heads":["891e…"]}}}
+```
+
+On a notification for a document you hold, skip it if you already have
+every hash in `heads` (you probably wrote them), otherwise fetch exactly
+what your replica lacks and apply it with `loadIncremental` /
+`applyChanges`:
+
+```sql
+SELECT automerge_changes_bytes(doc, $2) FROM docs WHERE id = $1;  -- $2: your replica's heads
+```
+
+Notifications are sent at commit and only to connected listeners, so after
+(re)connecting, `LISTEN` first and then run the same query for every
+document you hold. INSERT and DELETE always notify; an UPDATE notifies only
+when a document's heads (or the key) change, so no-op merges are silent.
+Payloads over NOTIFY's 8000-byte limit (about 115 heads) drop the heads and
+carry `"truncated":true`; then just fetch. Details in
+[DESIGN.md](docs/DESIGN.md#change-notifications).
+
+A no-op merge still rewrites the row. When re-sends are common, skip them:
+
+```sql
+UPDATE docs SET doc = merge(doc, $1) WHERE id = $2 AND NOT automerge_contains(doc, $1);
+```
+
+This is safe with concurrent writers in READ COMMITTED: a writer that had
+to wait for another's row lock re-checks the whole `WHERE` against the
+committed row (EvalPlanQual), so it skips the row if the other writer
+already stored the same changes and merges into the new version otherwise.
+For bare changes (`$1` bytea) the check usually needs no load of the
+document; for a full save (`$1::automerge`) it costs one extra load when
+there is something new.
+
 ### SQL API
 
 | | |
@@ -65,6 +112,8 @@ CREATE INDEX ON docs USING gin ((doc::jsonb));
 | `merge_agg(automerge)` | Aggregate merge of all non-null inputs. |
 | `automerge_heads(automerge) → text[]` | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
 | `automerge_contains(a, b) → bool` | Whether `a` already has every change of `b`. |
+| `automerge_contains(doc, changes bytea) → bool` | Whether `merge(doc, changes)` would add nothing (every change in the save or change chunks is already in `doc`). Usually decided without loading the document. |
+| `automerge_notify('channel', 'key_col' [, ...])` | `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW` trigger: `NOTIFY channel` with the row key and the new/previous heads of `automerge` columns whose heads changed. |
 | `automerge_changes(doc, since_heads text[] DEFAULT '{}')` | `SETOF automerge_change (hash, actor, seq, start_op, op_count, time, message, deps, change bytea)`: every change not reachable from `since_heads` (all by default), dependencies first. Rebuilds change bytes (costly on big documents). |
 | `automerge_changes_meta(doc, since_heads DEFAULT '{}')` | The same rows without `change` (`SETOF automerge_change_meta`); needs only the change graph. |
 | `automerge_changes_bytes(doc, since_heads DEFAULT '{}') → bytea` | Those changes as concatenated change chunks (`save_after(since_heads)`); `merge(replica, ...)` or `loadIncremental` applies them. |
@@ -119,6 +168,11 @@ Gotchas:
   instead fails with `22023` for an unknown hash. Malformed hashes (not 64
   hex digits) are `22P02` everywhere.
 - `time` is Automerge's commit time in Unix seconds, NULL when unset.
+- `automerge_notify()` checks its arguments when it fires, not at
+  `CREATE TRIGGER`: a wrong key column or a BEFORE / statement-level
+  trigger fails the first write. Its channel is used verbatim, like
+  `pg_notify`, while `LISTEN` lower-cases unquoted names: use a lower-case
+  channel. On a partitioned table, `table` is the partition.
 - `automerge_changes`, `automerge_changes_bytes` and `automerge_get_change`
   rebuild change bytes from the document (on a 3 MB document, all changes
   took 5 s against 2.8 s for `automerge_changes_meta`); prefer
@@ -131,7 +185,8 @@ Tooling runs through [mise](https://mise.jdx.dev):
 
 ```sh
 mise run pgrx-init   # once: build the Postgres pgrx develops against
-mise run test        # core unit tests + #[pg_test] tests + the concurrency test
+mise run test        # core unit tests + #[pg_test] tests + the concurrency and notify tests
 mise run regress     # pg_regress examples in tests/pg_regress
 mise run concurrency # only: two real psql sessions merging into one row, pg_dump round trip
+mise run notify      # only: a real LISTEN session receiving automerge_notify() payloads
 ```

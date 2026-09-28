@@ -56,6 +56,18 @@ SELECT merge(''::bytea::automerge, :'bob_changes'::bytea);
 -- An untyped literal resolves to merge(automerge, automerge), which needs a
 -- complete document: cast change chunks to bytea.
 SELECT merge(doc, :'bob_changes') FROM docs WHERE id = 4;
+-- A no-op merge still writes a new row version (and fires triggers). To
+-- skip it, check first: automerge_contains(doc, bytea) says whether the
+-- document already has every change in the bytes (usually without loading
+-- it: new changes build on the current heads, re-sent ones are the heads).
+SELECT automerge_contains(doc, :'bob_changes'::bytea) AS has_bob_changes,
+       automerge_contains(:'base'::automerge, :'bob_changes'::bytea) AS base_has_them
+FROM docs WHERE id = 4;
+PREPARE persist_new(int, bytea) AS
+    UPDATE docs SET doc = merge(doc, $2) WHERE id = $1 AND NOT automerge_contains(doc, $2)
+    RETURNING id;
+EXECUTE persist_new(4, :'bob_changes');  -- nothing new: no row updated
+DEALLOCATE persist_new;
 DEALLOCATE persist;
 DELETE FROM docs WHERE id = 4;
 
@@ -162,5 +174,25 @@ END $$;
 
 -- No jsonb -> automerge cast (it would fabricate history).
 SELECT '{}'::jsonb::automerge;
+
+-- Change notifications: an AFTER ROW trigger that sends
+--   NOTIFY docs_changed, '{"table":"public.docs","op":"UPDATE","key":{"id":1},
+--     "columns":{"doc":{"heads":[...],"prev_heads":[...]}}}'
+-- when a row is inserted or deleted, or its automerge heads change. A
+-- backend that ran LISTEN docs_changed fetches what it lacks with
+-- automerge_changes_bytes(doc, <its heads>). No-op merges do not notify.
+CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
+    FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id');
+UPDATE docs SET doc = merge(doc, :'bob'::automerge) WHERE id = 3;
+-- The trigger arguments are checked when it fires.
+CREATE TRIGGER docs_bad BEFORE UPDATE ON docs
+    FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id');
+UPDATE docs SET doc = doc WHERE id = 3;
+DROP TRIGGER docs_bad ON docs;
+CREATE TRIGGER docs_bad AFTER UPDATE ON docs
+    FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'uuid');
+UPDATE docs SET doc = doc WHERE id = 3;
+DROP TRIGGER docs_bad ON docs;
+SELECT automerge_notify();
 
 DROP TABLE docs;

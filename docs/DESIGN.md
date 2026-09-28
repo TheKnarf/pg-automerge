@@ -14,6 +14,9 @@ In scope:
 - Read-only history: listing a document's changes, fetching change bytes
   (e.g. everything since a replica's heads), and the state as of earlier
   heads (see "History").
+- Change notifications: a trigger that tells listening backends (`LISTEN`)
+  which rows' documents changed and their new heads (see "Change
+  notifications").
 
 Out of scope (by decision):
 
@@ -130,7 +133,9 @@ All are `IMMUTABLE STRICT PARALLEL SAFE` unless noted.
     that neither the document nor the input contains: <hash>`; at most five
     hashes, then "and N more"). Nothing orphaned is ever stored.
   - Empty `changes`, or nothing new (heads unchanged): returns `a` unchanged,
-    no re-save.
+    no re-save. When `changes` is bare change chunks that are all heads of
+    `a` (a re-send of the latest changes), this is seen from the chunks'
+    hashes without loading anything (see `automerge_contains(a, bytea)`).
   - Malformed input, including decoder panics, is `22P02`. As in
     normalization, a changed result is loaded back once and must keep its
     heads, so a value that loads but whose save does not is never stored.
@@ -146,7 +151,9 @@ All are `IMMUTABLE STRICT PARALLEL SAFE` unless noted.
 
 Adding `merge(automerge, bytea)` / `automerge || bytea` keeps every form
 unambiguous (verified per expression in the `merge_overloads_resolve_unambiguously`
-pg_test, through the view dependencies and result type):
+and `contains_bytea_overload` pg_tests, through the view dependencies and
+result type). `automerge_contains(automerge, bytea)` follows the same
+rules:
 
 | Expression | Resolves to |
 |---|---|
@@ -155,6 +162,8 @@ pg_test, through the view dependencies and result type):
 | `merge(doc, '\x..')`, `doc \|\| '\x..'` (untyped literal) | `(automerge, automerge)` |
 | `merge(doc, NULL)`, untyped parameter (`PREPARE p AS ... merge(doc, $1)`) | `(automerge, automerge)` |
 | `doc::jsonb \|\| '{..}'` | `jsonb \|\| jsonb` |
+| `automerge_contains(doc, doc)`, `automerge_contains(doc, '\x..')`, `automerge_contains(doc, NULL)` | `(automerge, automerge)` |
+| `automerge_contains(doc, $1::bytea)`, typed bytea parameter `$1` | `(automerge, bytea)` |
 
 An untyped literal is assumed to have the type of the other, known argument
 (function resolution step 4.f; for operators, the exact-match check with the
@@ -186,6 +195,32 @@ matches nothing (bytea → automerge is not implicit).
   `heads(a) ⊊ heads(b)` (false: a head of `b` missing from `a`'s heads has
   no successor in `b`, so it cannot be an ancestor of a head of `a`);
   otherwise `a` is loaded and `b` never is.
+- `automerge_contains(a automerge, changes bytea) → bool`: whether `a`
+  already has every change in `changes` (the same inputs as
+  `merge(automerge, bytea)`), i.e. whether `merge(a, changes)` returns `a`
+  unchanged. Empty `changes` is contained. Changes whose dependencies are
+  in neither `a` nor `changes` are not in `a`: `false` (where `merge`
+  raises `22P02`). Malformed bytes are `22P02` when they have to be loaded.
+  - No-load path, when `changes` is only uncompressed change chunks: each
+    chunk's hash is `sha256(type ‖ uleb128 length ‖ data)` (its checksum
+    is the first 4 bytes, and must match) and its data starts with its
+    dependency hashes (`header::change_chunks`). `a` is a complete
+    document, so a chunk whose hash is a head of `a` is in `a`, and a chunk
+    with a dependency that is a head of `a` (or a chunk of the input
+    already known to be missing) is not in `a`: a head has no successor in
+    `a`. Any change known missing gives `false`, all known present `true`.
+    That decides the two cases a backend produces: new changes made on top
+    of the heads it last saw (false), and a re-send of the changes that
+    made the current heads (true).
+  - Otherwise (older changes, full saves, compressed chunks) `a ++
+    changes` is loaded once (no save) and the heads compared, which is the
+    no-op check of `merge(automerge, bytea)`.
+  - On the no-load path only the framing, checksums and dependency lists
+    are read, so `false` does not promise that `merge` accepts the input.
+  - A property test compares it with a direct lookup of every change in
+    the loaded document over generated histories and arbitrary slices of
+    their change lists, and checks that `merge` agrees (a no-op exactly
+    when contained).
 
 ### Heads fast path
 
@@ -360,6 +395,147 @@ size of the document's history, 3 MB above) until the scan ends; in
 declared result type (looked up by the function's OID), so they do not
 depend on `search_path`.
 
+## Change notifications
+
+Backends keep their in-memory replicas in sync by listening for changes
+other backends persisted, then fetching only what they lack:
+
+```sql
+CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
+    FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id' [, more key columns]);
+```
+
+`automerge_notify()` runs `NOTIFY <channel>` (`Async_Notify`, what
+`pg_notify` calls) with a compact JSON payload:
+
+```json
+{"table":"public.docs","op":"UPDATE","key":{"id":1},
+ "columns":{"doc":{"heads":["79df.."],"prev_heads":["891e.."]}}}
+```
+
+- `table`: schema-qualified, each part quoted as needed
+  (`public."Odd Name"`). For a partitioned table this is the partition
+  holding the row (row triggers run on the partitions).
+- `op`: `INSERT`, `UPDATE` or `DELETE`.
+- `key`: the key columns named in the trigger arguments, in that order,
+  each as `to_json(value)` (numbers stay numbers, uuids and text are
+  strings, NULL is `null`); from the new row, or the old row for DELETE.
+  `old_key`: the old row's key, only for an UPDATE that changed it.
+- `columns`: every column of type `automerge` (or a domain over it):
+  INSERT lists all with `heads`, DELETE all with `prev_heads`, UPDATE only
+  those whose heads changed, with both. Heads are sorted hex hashes as in
+  `automerge_heads`; `null` for a NULL value (`[]` is the empty document).
+- `truncated: true`: see below.
+
+When it fires: INSERT and DELETE always notify. An UPDATE notifies only if
+the heads of some `automerge` column changed, or the key did (a listener
+tracks rows by key). No-op merges (`merge` returning the stored value),
+`SET doc = doc`, and updates of other columns do not notify. Change is
+decided by heads, never by bytes: `merge(a, b)` and `merge(b, a)` may
+differ in bytes with the same heads. Cost: an unchanged value whose raw
+datum is identical (same inline bytes or same TOAST pointer, e.g. an
+update of another column) is skipped without reading it; otherwise both
+heads are read from a prefix of the stored values as in `automerge_heads`
+(4 kB, only the TOAST chunks covering it), never a full load. An UPDATE
+that changed no heads and whose key columns are raw-identical returns
+before building any JSON. Measured on 20,000 small rows (release build):
+`UPDATE t SET n = n + 1` 451 ms without the trigger, 746 ms with it (no
+notifications); merging a new change into every row 7.2 s without, 7.8 s
+with (20,000 notifications); re-sending that change 709 ms with a plain
+`merge` (a no-op rewrite of every row, no notifications) and 46 ms with
+the `WHERE NOT automerge_contains` pattern below.
+
+Delivery is Postgres' `NOTIFY`: sent at commit (nothing for a rolled-back
+transaction), in commit order, only to sessions connected and listening at
+the time; notifications with identical channel and payload within one
+transaction are collapsed. So a listener must treat notifications as hints:
+
+1. On connect (and reconnect), `LISTEN docs_changed` first, then resync
+   every replica it holds: `SELECT automerge_changes_bytes(doc,
+   $replica_heads) FROM docs WHERE id = $1` and apply the result.
+2. On a notification for a row it holds: if the payload's `heads` are all
+   in its replica already (e.g. it wrote them), skip; otherwise fetch
+   `automerge_changes_bytes(doc, $replica_heads)` for that key. The row
+   may have moved on since the notification; that just returns more.
+   `automerge_changes_bytes` with heads the row already has returns
+   nothing without loading the document, so fetching on every
+   notification (and on `truncated` ones) is cheap when there is nothing
+   new.
+3. DELETE: drop the replica. `old_key`: re-key it.
+
+Payload size: `NOTIFY` rejects payloads of 8000 bytes or more
+(`NOTIFY_PAYLOAD_MAX_LENGTH`); at 67 bytes per hash that is about 115 heads,
+counting `heads` and `prev_heads` of all columns. The trigger
+never fails a write because of that: it renders the full payload, and if
+it has more than 7999 bytes drops, in this order, until it fits: the heads
+(`"columns":{"doc":{}}`, column names kept), the `columns` object, the
+`key`/`old_key`. Any dropped part adds `"truncated":true`; listeners then
+fetch by key (or resync the table when the key is gone too, which needs a
+key of several kB). Tested with a 150-head document.
+
+Argument checks, when the trigger fires (Postgres does not validate
+trigger arguments at `CREATE TRIGGER`): not `AFTER` or not `FOR EACH ROW` →
+`39P01` (trigger protocol violated); fewer than two arguments, an empty
+channel or one of 64 bytes or more, a key column listed twice or of type
+`automerge` → `22023`; an unknown key column → `42703`; calling
+`automerge_notify()` outside a trigger → `0A000`. These errors fail the
+write, as trigger errors do. The channel is used verbatim, like
+`pg_notify`: `LISTEN` folds unquoted names to lower case, so use a
+lower-case channel (or `LISTEN "Name"`). The `automerge` type is looked up
+in the function's own schema, so the trigger does not depend on
+`search_path`.
+
+Labels: `VOLATILE`, not `STRICT`, `PARALLEL UNSAFE` (the defaults; it sends
+notifications and triggers never run in parallel workers).
+
+Why a C (Rust) trigger and not PL/pgSQL: PL/pgSQL would have to find the
+`automerge` columns in the catalog and read each through dynamic SQL
+(`EXECUTE format('SELECT automerge_heads($1.%I)', col) USING NEW`) per row;
+its `to_jsonb(NEW)` would convert every document to jsonb (a full load
+each). The Rust trigger reads the raw datums (so an unchanged TOAST pointer
+costs nothing and heads come from a prefix), builds the payload in
+`pg_automerge_core::notify` (plain Rust, unit-tested including the size
+limit and escaping) and gets the key values' JSON from Postgres' own
+`to_json` machinery (`json_categorize_type` / `datum_to_json`, exported by
+the server though not in pgrx's bindings). It is written like pgrx's
+`#[pg_trigger]` expansion (V1 info record, guarded entry point, SQL in an
+`extension_sql!` block) so that a call outside a trigger is a clean error.
+
+### Skipping no-op writes
+
+A no-op `UPDATE docs SET doc = merge(doc, $1)` still writes a new row
+version (and a new copy of a TOASTed document, plus WAL) and fires
+triggers (`automerge_notify` stays silent, since the heads are unchanged).
+To skip it:
+
+```sql
+UPDATE docs SET doc = merge(doc, $1) WHERE id = $2 AND NOT automerge_contains(doc, $1);
+```
+
+`$1` is the same bytea parameter in both places (`automerge_contains(automerge,
+bytea)`; for a full save cast to `automerge` in both). Under concurrency this
+stays correct in READ COMMITTED: the row qualifies against the statement's
+snapshot; if a concurrent transaction updated it, the UPDATE waits for its
+row lock, and once that transaction commits Postgres re-evaluates the whole
+`WHERE` clause (EvalPlanQual) and the `SET` expression against the newly
+committed row version. If that version already contains the changes, the
+row is skipped (UPDATE 0, nothing lost: the changes are there); otherwise
+`merge` applies them to that version. If the row fails the check against
+the snapshot, it is skipped without waiting: history only grows under
+`merge`, so a later version contains the changes too. That argument
+assumes every writer merges; a plain `SET doc = ...` that replaces history
+breaks it (and loses updates anyway). Tested with two blocking sessions in
+`tests/concurrency.sh` (same changes: B updates no row; different changes:
+B merges into A's version). REPEATABLE READ / SERIALIZABLE raise a
+serialization error instead, as for any concurrent update.
+
+UPDATE 0 means "row missing or nothing new"; check the row's existence
+separately if the difference matters. Cost: for bare changes the check
+usually needs no load (new changes built on the current heads, and
+re-sends of the latest changes, are decided from the chunk hashes); for a
+full save it loads the stored document, so a real change then costs one
+more load than the plain `merge`.
+
 ## jsonb mapping
 
 The root is always a map, so it maps to a jsonb object. For a map key with
@@ -415,6 +591,11 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   there). Persisting a full save with `merge(doc, $save::automerge)` costs
   the same two loads on the server (normalizing the input and loading the
   newer side) plus the upload.
+- `automerge_contains(doc, changes bytea)` and the no-op check of
+  `merge(doc, changes bytea)` need no load for re-sent latest changes and
+  (for `automerge_contains`) new changes on top of the current heads.
+- `automerge_notify()` reads at most a prefix of each changed `automerge`
+  value per row, never loads a document.
 - A per-backend cache of loaded docs and converted jsonb is future work.
 
 ## Implementation notes (pgrx)
@@ -447,8 +628,10 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   don't check for interrupts, so cancel/`statement_timeout` wait for the call
   to return. Only `merge_agg_trans` checks between inputs.
 - Code layout: all Automerge logic (normalize, merge, merge_changes, heads
-  and the header parser, contains, the history functions in `history.rs`,
-  the jsonb mapping, hex/base64/ISO 8601 encoders) is plain Rust in
+  and the header parser, the change-chunk splitter, contains and
+  contains_changes, the history functions in `history.rs`, the notification
+  payload builder in `notify.rs`, the jsonb mapping, hex/base64/ISO 8601
+  encoders) is plain Rust in
   `crates/pg_automerge_core` with `#[test]`s; `src/lib.rs` is pgrx glue. The
   I/O functions are declared by hand inside the `CREATE TYPE` block
   (`#[pg_extern(sql = false)]`), and the Rust type `AutomergeDatum` maps to SQL
@@ -456,7 +639,8 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   function after the type.
 - Tests: `#[pg_test]` for SQL behaviour, plain `#[test]` for the pure
   conversion logic (edge cases in `crates/pg_automerge_core/tests/`:
-  `edge_cases.rs`, `merge_changes.rs` for `merge(automerge, bytea)`,
+  `edge_cases.rs`, `merge_changes.rs` for `merge(automerge, bytea)` and
+  `automerge_contains(automerge, bytea)`,
   `heads_fast_path.rs` for the header parser property test, `history.rs`
   for the history functions, checked against Automerge (`fork_at`,
   `get_changes`) and a dependency-graph walk; `common/` holds the shared
@@ -465,8 +649,13 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   (`mise run concurrency`, also the last step of `mise run test`) runs two real psql sessions against one row to
   check the EvalPlanQual claim above, the upsert path and REPEATABLE READ,
   two sessions persisting only incremental changes with
-  `merge(doc, $1::bytea)` (plus the orphaned-changes rejection), and a
-  pg_dump/restore round trip. Build test documents in Rust with
+  `merge(doc, $1::bytea)` (plus the orphaned-changes rejection), the
+  `WHERE NOT automerge_contains(doc, $1)` pattern under EvalPlanQual, and a
+  pg_dump/restore round trip. `tests/notify.sh` (`mise run notify`, also
+  part of `mise run test`) checks `automerge_notify()` with a real `LISTEN`
+  session: pg_tests run inside one transaction that is rolled back, so
+  NOTIFY never delivers there (the pg_tests instead read what the trigger
+  sent from a test-only per-backend list). Build test documents in Rust with
   `automerge::AutoCommit` and pass them in as `bytea`.
 - `mise run regress` passes `--resetdb`: a reused regress database would
   keep the extension objects of an earlier build, so new functions would be

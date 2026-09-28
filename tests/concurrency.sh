@@ -14,7 +14,11 @@
 #
 # Scenario 6 persists only incremental changes (bare change chunks) with
 # merge(doc, $1::bytea), and checks that changes with missing dependencies
-# are rejected without touching the row.
+# are rejected without touching the row. Scenarios 7 and 8 check the
+# "UPDATE .. WHERE NOT automerge_contains(doc, $1)" pattern: after waiting
+# for the lock, B's WHERE clause is re-evaluated against A's committed row
+# (EvalPlanQual), so B skips the row if A already wrote the same changes
+# and merges into A's version otherwise.
 #
 # Also checks: that the harness detects a lost update (plain overwrite
 # control), the INSERT .. ON CONFLICT DO UPDATE upsert for existing and new
@@ -101,8 +105,8 @@ sql -v base="$BASE" <<'SQL'
 CREATE EXTENSION pg_automerge;
 CREATE TABLE docs (id int PRIMARY KEY, doc automerge NOT NULL);
 CREATE TABLE release (x int);
--- Rows 1..6 start from the shared base; row 4 (new-row upsert) does not exist.
-INSERT INTO docs SELECT i, :'base'::bytea FROM generate_series(1, 6) i WHERE i <> 4;
+-- Rows 1..8 start from the shared base; row 4 (new-row upsert) does not exist.
+INSERT INTO docs SELECT i, :'base'::bytea FROM generate_series(1, 8) i WHERE i <> 4;
 SQL
 
 # ---------------------------------------------------------------------------
@@ -253,6 +257,29 @@ SQL
 )"; then fail "orphaned incremental changes were accepted"; fi
 grep -q "missing 1 dependency" <<<"$out" || fail "unexpected error for orphaned changes: $out"
 assert_row 4 "doc::jsonb" "{}"
+
+# 7. Update only when not contained, both sessions sending the same
+#    changes: B's WHERE is rechecked against A's committed version, which
+#    already contains them, so B updates no row (and writes no row version).
+CONTAINS_UPDATE="WITH u AS (UPDATE docs SET doc = merge(doc, :'%s'::bytea)
+                  WHERE id = %s AND NOT automerge_contains(doc, :'%s'::bytea) RETURNING 1)
+                  SELECT 'updated ' || count(*) FROM u"
+# shellcheck disable=SC2059
+A_DOC="$INC_A" B_DOC="$INC_A" run_pair "UPDATE ... WHERE NOT automerge_contains(doc, \$1) (same changes)" \
+    "$(printf "$CONTAINS_UPDATE" a 7 a)" "$(printf "$CONTAINS_UPDATE" b 7 b)"
+[[ $B_STATUS == 0 ]] || fail "session B: $B_OUT"
+[[ "$B_OUT" == "updated 0" ]] || fail "session B should skip the row, got: $B_OUT"
+assert_row 7 "doc->>'inc_a'" true
+assert_row 7 "cardinality(automerge_heads(doc))" 1
+
+# 8. The same with different changes: the recheck finds B's changes missing
+#    from A's version, so B merges them into it.
+# shellcheck disable=SC2059
+A_DOC="$INC_A" B_DOC="$INC_B" run_pair "UPDATE ... WHERE NOT automerge_contains(doc, \$1) (different changes)" \
+    "$(printf "$CONTAINS_UPDATE" a 8 a)" "$(printf "$CONTAINS_UPDATE" b 8 b)"
+[[ $B_STATUS == 0 ]] || fail "session B: $B_OUT"
+[[ "$B_OUT" == "updated 1" ]] || fail "session B should update the row, got: $B_OUT"
+assert_both 8 inc_a inc_b
 
 # ---------------------------------------------------------------------------
 # pg_dump round trip

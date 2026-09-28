@@ -18,11 +18,12 @@ description = "Download and build the Postgres version pgrx develops against (~/
 run = "cargo pgrx init --pg{{env.PG_VERSION}} download"
 
 [tasks.test]
-description = "Run core unit tests, #[pg_test] tests in a pgrx-managed Postgres, then the two-session concurrency test"
+description = "Run core unit tests, #[pg_test] tests in a pgrx-managed Postgres, then the two-session concurrency and LISTEN/NOTIFY tests"
 run = [
   "cargo test -p pg_automerge_core",
   "cargo pgrx test pg{{env.PG_VERSION}}",
   "bash tests/concurrency.sh",
+  "bash tests/notify.sh",
 ]
 
 [tasks.regress]
@@ -34,6 +35,10 @@ run = "cargo pgrx regress pg{{env.PG_VERSION}} --resetdb"
 [tasks.run]
 description = "Install the extension and open psql against a pgrx-managed Postgres"
 run = "cargo pgrx run pg{{env.PG_VERSION}}"
+
+[tasks.notify]
+description = "A real LISTEN session receiving automerge_notify() notifications (installs + starts the pgrx Postgres)"
+run = "bash tests/notify.sh"
 
 [tasks.concurrency]
 description = "Two concurrent psql sessions merging into one row (installs + starts the pgrx Postgres)"

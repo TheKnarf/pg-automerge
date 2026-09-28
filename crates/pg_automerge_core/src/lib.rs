@@ -17,6 +17,7 @@ pub mod encoding;
 pub mod header;
 pub mod history;
 pub mod json;
+pub mod notify;
 
 pub use automerge;
 pub use serde_json;
@@ -336,8 +337,17 @@ pub fn merge_changes(a: &[u8], changes: &[u8]) -> Result<Option<Vec<u8>>, Error>
     guard_input(|| merge_changes_unguarded(a, changes))
 }
 
-fn merge_changes_unguarded(a: &[u8], changes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-    let heads_a = stored_heads_unguarded(a)?;
+/// Result of loading `a ++ changes`.
+enum Applied {
+    /// Nothing new: the heads are those of `a`.
+    Unchanged,
+    /// Changes whose dependencies are in neither input (sorted).
+    MissingDeps(Vec<ChangeHash>),
+    /// New changes were applied; the document and its sorted heads.
+    Changed(Box<Automerge>, Vec<ChangeHash>),
+}
+
+fn apply_changes(a: &[u8], heads_a: &[ChangeHash], changes: &[u8]) -> Result<Applied, Error> {
     // `a` is a document chunk, so loading `a ++ changes` is exactly
     // "load_incremental(changes) onto a", except that it is strict: a chunk
     // that fails to parse, or has a bad checksum, fails the whole load
@@ -350,29 +360,50 @@ fn merge_changes_unguarded(a: &[u8], changes: &[u8]) -> Result<Option<Vec<u8>>, 
     let doc = Automerge::load(&combined)
         .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
     drop(combined);
-    ensure_complete(&doc).map_err(|mut missing| {
+    if let Err(mut missing) = ensure_complete(&doc) {
         missing.sort();
-        const SHOWN: usize = 5;
-        let shown: Vec<String> = missing.iter().take(SHOWN).map(|h| h.to_string()).collect();
-        let more = if missing.len() > SHOWN {
-            format!(" and {} more", missing.len() - SHOWN)
-        } else {
-            String::new()
-        };
-        let what = if missing.len() == 1 { "dependency" } else { "dependencies" };
-        Error::InvalidInput(format!(
-            "invalid automerge changes: missing {} {what} that neither the document nor the input contains: {}{more}",
-            missing.len(),
-            shown.join(", ")
-        ))
-    })?;
+        return Ok(Applied::MissingDeps(missing));
+    }
     let mut heads = doc.get_heads();
     heads.sort();
-    let mut sorted_a = heads_a;
+    let mut sorted_a = heads_a.to_vec();
     sorted_a.sort();
     if heads == sorted_a {
+        Ok(Applied::Unchanged)
+    } else {
+        Ok(Applied::Changed(Box::new(doc), heads))
+    }
+}
+
+fn merge_changes_unguarded(a: &[u8], changes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    let heads_a = stored_heads_unguarded(a)?;
+    // Re-sent changes that are exactly `a`'s heads: nothing to load.
+    if contains_changes_by_heads(&heads_a, changes) == Some(true) {
         return Ok(None);
     }
+    let (doc, heads) = match apply_changes(a, &heads_a, changes)? {
+        Applied::Unchanged => return Ok(None),
+        Applied::Changed(doc, heads) => (doc, heads),
+        Applied::MissingDeps(missing) => {
+            const SHOWN: usize = 5;
+            let shown: Vec<String> = missing.iter().take(SHOWN).map(|h| h.to_string()).collect();
+            let more = if missing.len() > SHOWN {
+                format!(" and {} more", missing.len() - SHOWN)
+            } else {
+                String::new()
+            };
+            let what = if missing.len() == 1 {
+                "dependency"
+            } else {
+                "dependencies"
+            };
+            return Err(Error::InvalidInput(format!(
+                "invalid automerge changes: missing {} {what} that neither the document nor the input contains: {}{more}",
+                missing.len(),
+                shown.join(", ")
+            )));
+        }
+    };
     let saved = doc.save_nocompress();
     // Same safeguard as `normalize`: malformed but checksummed input can
     // load into a document whose save does not load back.
@@ -387,6 +418,78 @@ fn merge_changes_unguarded(a: &[u8], changes: &[u8]) -> Result<Option<Vec<u8>>, 
         ));
     }
     Ok(Some(saved))
+}
+
+/// Decide `contains_changes(a, changes)` from `a`'s heads and the framing
+/// of `changes` alone, without loading anything; `None` if that is not
+/// possible.
+///
+/// Only when `changes` is bare, uncompressed change chunks (see
+/// [`header::change_chunks`]). A stored document is complete (it has every
+/// ancestor of its changes), so for each change `c` of the input:
+///
+/// - `hash(c)` is a head of `a`: `a` has `c`.
+/// - some dependency of `c` is a head of `a`, or a change of the input
+///   already known to be missing from `a`: `a` does not have `c` (a head
+///   has no successor in `a`, and a missing change has no successor in
+///   `a` either).
+/// - otherwise unknown.
+///
+/// Any change known to be missing gives `Some(false)`; all known present
+/// gives `Some(true)` (also for empty input); otherwise `None`. The common
+/// cases are both decided: a re-send of the changes that made the current
+/// heads (true), and new changes made on top of the current heads (false).
+/// Only framing, checksums and dependency lists are checked here, so
+/// `false` does not promise that `merge(a, changes)` will accept the input.
+pub fn contains_changes_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Option<bool> {
+    let chunks = header::change_chunks(changes)?;
+    let mut missing: Vec<ChangeHash> = Vec::new();
+    let mut unknown = false;
+    for chunk in &chunks {
+        if heads_a.contains(&chunk.hash) {
+            continue;
+        }
+        if chunk
+            .deps
+            .iter()
+            .any(|d| heads_a.contains(d) || missing.contains(d))
+        {
+            missing.push(chunk.hash);
+        } else {
+            unknown = true;
+        }
+    }
+    if !missing.is_empty() {
+        Some(false)
+    } else if unknown {
+        None
+    } else {
+        Some(true)
+    }
+}
+
+/// Whether the stored value `a` already has every change in `changes`
+/// (external bytes, as for [`merge_changes`]), i.e. whether
+/// `merge(a, changes)` would return `a` unchanged.
+///
+/// Decided by [`contains_changes_by_heads`] when possible, otherwise by
+/// loading `a ++ changes` (one load, no save). Changes whose dependencies
+/// are in neither input are not in `a`: `false`, where `merge` raises an
+/// error. Malformed input on the loading path is [`Error::InvalidInput`].
+pub fn contains_changes(a: &[u8], changes: &[u8]) -> Result<bool, Error> {
+    if changes.is_empty() {
+        return Ok(true);
+    }
+    guard_input(|| {
+        let heads_a = stored_heads_unguarded(a)?;
+        if let Some(answer) = contains_changes_by_heads(&heads_a, changes) {
+            return Ok(answer);
+        }
+        Ok(matches!(
+            apply_changes(a, &heads_a, changes)?,
+            Applied::Unchanged
+        ))
+    })
 }
 
 /// Current heads as sorted lowercase hex change hashes.
