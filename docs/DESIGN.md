@@ -640,7 +640,7 @@ expected.
 
 ### Implementation
 
-- Object: `ExpandedAutomerge` (`src/lib.rs`), the standard
+- Object: `ExpandedAutomerge` (`src/expanded.rs`), the standard
   `ExpandedObjectHeader` followed by a pointer to a Rust
   `pg_automerge_core::loaded::LoadedDoc` (the `Automerge` document, its
   sorted heads, and its stored bytes once computed). It lives in its own

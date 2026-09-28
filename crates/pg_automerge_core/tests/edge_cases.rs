@@ -1,6 +1,6 @@
 //! Adversarial / edge-case tests for the core logic: odd documents, odd
 //! scalar values, odd input encodings and corrupted bytes. The SQL-level
-//! counterparts live in the `#[pg_test]`s in src/lib.rs.
+//! counterparts live in the `#[pg_test]`s in src/tests/.
 
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, ChangeHash, ObjType, ROOT, ReadDoc, ScalarValue};
