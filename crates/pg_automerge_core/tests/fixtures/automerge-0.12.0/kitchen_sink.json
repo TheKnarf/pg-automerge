@@ -1,0 +1,129 @@
+{
+  "bool": true,
+  "bytes": "AAH+/w==",
+  "counter": 13,
+  "f64": 0.1,
+  "int": -42,
+  "items": [
+    {
+      "id": 1,
+      "title": "item 1"
+    },
+    {
+      "id": 2,
+      "title": "item 2"
+    },
+    {
+      "id": 3,
+      "title": "item 3"
+    },
+    {
+      "id": 4,
+      "title": "item 4"
+    },
+    {
+      "id": 5,
+      "title": "item 5"
+    },
+    {
+      "id": 6,
+      "title": "item 6"
+    },
+    {
+      "id": 7,
+      "title": "item 7"
+    },
+    {
+      "id": 8,
+      "title": "item 8"
+    },
+    {
+      "id": 9,
+      "title": "item 9"
+    },
+    {
+      "id": 10,
+      "title": "item 10"
+    },
+    {
+      "id": 11,
+      "title": "item 11"
+    },
+    {
+      "id": 12,
+      "title": "item 12"
+    },
+    {
+      "id": 13,
+      "title": "item 13"
+    },
+    {
+      "id": 14,
+      "title": "item 14"
+    },
+    {
+      "id": 15,
+      "title": "item 15"
+    },
+    {
+      "id": 16,
+      "title": "item 16"
+    },
+    {
+      "id": 17,
+      "title": "item 17"
+    },
+    {
+      "id": 18,
+      "title": "item 18"
+    },
+    {
+      "id": 19,
+      "title": "item 19"
+    },
+    {
+      "id": 20,
+      "title": "item 20"
+    },
+    {
+      "id": 21,
+      "title": "item 21"
+    },
+    {
+      "id": 22,
+      "title": "item 22"
+    },
+    {
+      "id": 23,
+      "title": "item 23"
+    },
+    {
+      "id": 24,
+      "title": "item 24"
+    },
+    {
+      "id": 25,
+      "title": "item 25"
+    },
+    {
+      "id": 26,
+      "title": "item 26"
+    },
+    {
+      "id": 27,
+      "title": "item 27"
+    },
+    {
+      "id": 28,
+      "title": "item 28"
+    },
+    {
+      "id": 29,
+      "title": "item 29"
+    }
+  ],
+  "str": "theirs",
+  "text": "Hello, 😀",
+  "ts": "2024-01-02T03:04:05.678Z",
+  "uint": 18446744073709551615
+}

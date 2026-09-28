@@ -22,8 +22,8 @@
 #
 # Also checks: that the harness detects a lost update (plain overwrite
 # control), the INSERT .. ON CONFLICT DO UPDATE upsert for existing and new
-# rows, REPEATABLE READ raising a serialization failure, and a pg_dump ->
-# psql restore round trip preserving bytes and heads.
+# rows, and REPEATABLE READ raising a serialization failure. (Dump and
+# restore: tests/dump.sh.)
 #
 # Exits non-zero on the first failure. Stops the server on exit if this script
 # started it, and drops its scratch databases.
@@ -34,8 +34,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 DB=pg_automerge_concurrency
-DB_RESTORE=pg_automerge_concurrency_restore
-DROP_DBS=("$DB" "$DB_RESTORE")
+DROP_DBS=("$DB")
 BG_PIDS=()
 
 on_exit() {
@@ -233,18 +232,3 @@ A_DOC="$INC_A" B_DOC="$INC_B" run_pair "UPDATE ... WHERE NOT automerge_contains(
 [[ $B_STATUS == 0 ]] || fail "session B: $B_OUT"
 [[ "$B_OUT" == "updated 1" ]] || fail "session B should update the row, got: $B_OUT"
 assert_both 8 inc_a inc_b
-
-# ---------------------------------------------------------------------------
-# pg_dump round trip
-# ---------------------------------------------------------------------------
-
-log "pg_dump -> psql restore round trip"
-sql_on postgres -c "DROP DATABASE IF EXISTS $DB_RESTORE WITH (FORCE)" -c "CREATE DATABASE $DB_RESTORE"
-"$BINDIR/pg_dump" -h localhost -p "$PORT" -d "$DB" >"$WORK/dump.sql"
-grep -q "CREATE EXTENSION IF NOT EXISTS pg_automerge" "$WORK/dump.sql" || fail "dump lacks CREATE EXTENSION"
-sql_on "$DB_RESTORE" -f "$WORK/dump.sql" >/dev/null
-fingerprint="SELECT string_agg(id || ':' || md5(doc::bytea) || ':' || automerge_heads(doc)::text
-                               || ':' || md5(doc::jsonb::text), ',' ORDER BY id) FROM docs"
-before="$(sql -c "$fingerprint")"
-after="$(sql_on "$DB_RESTORE" -c "$fingerprint")"
-[[ -n "$before" && "$before" == "$after" ]] || fail "restore differs: $before <> $after"
