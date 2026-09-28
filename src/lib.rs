@@ -244,6 +244,11 @@ fn merge_agg_trans(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> Internal {
     let Some(value) = value else { return state };
+    // Each input can take a while to load and merge, and none of that work
+    // checks for interrupts; check between inputs so a cancel or
+    // statement_timeout takes effect mid-aggregate. No Rust state is
+    // borrowed yet, so unwinding out of here is harmless.
+    pg_sys::check_for_interrupts!();
     // SAFETY: the state is only ever created below, as a MergeAccumulator.
     let acc = match unsafe { state.get_mut::<MergeAccumulator>() } {
         Some(acc) => acc,
@@ -271,7 +276,9 @@ fn merge_agg_trans(
 fn merge_agg_final(state: Internal) -> Option<AutomergeDatum> {
     // SAFETY: the state is only ever created by merge_agg_trans.
     let acc = unsafe { state.get::<MergeAccumulator>() }?;
-    acc.finish().map(|bytes| AutomergeDatum(bytes.into_owned()))
+    acc.finish()
+        .or_raise()
+        .map(|bytes| AutomergeDatum(bytes.into_owned()))
 }
 
 extension_sql!(
@@ -280,6 +287,12 @@ CREATE AGGREGATE merge_agg(automerge) (
     SFUNC = merge_agg_trans,
     STYPE = internal,
     FINALFUNC = merge_agg_final,
+    -- The state is a fully loaded document in the Rust heap, invisible to
+    -- Postgres memory accounting and not spillable by HashAgg (no
+    -- serialfunc). Declare a size that is realistic for non-trivial
+    -- documents (the default estimate for internal is ~8kB) so the planner
+    -- prefers sorted grouping over large per-group hash tables.
+    SSPACE = 1048576,
     PARALLEL = SAFE
 );
 "#,
@@ -1116,6 +1129,112 @@ mod tests {
                 "{hex}: {result}"
             );
         }
+    }
+
+    #[pg_test]
+    fn comparison_operators_compare_jsonb_not_history() {
+        // Documented in README/DESIGN: there is no automerge equality, so
+        // `=` resolves through the implicit cast to jsonb equality of the
+        // current state. Same content, different histories: equal as jsonb,
+        // different heads.
+        let mut a = AutoCommit::new().with_actor(actor(1));
+        let mut b = AutoCommit::new().with_actor(actor(2));
+        a.put(ROOT, "x", 1i64).unwrap();
+        b.put(ROOT, "x", 1i64).unwrap();
+        let args = [a.save().into(), b.save().into()];
+        assert!(one::<bool>("SELECT $1::automerge = $2::automerge", &args));
+        assert!(!one::<bool>(
+            "SELECT automerge_heads($1::automerge) = automerge_heads($2::automerge)",
+            &args
+        ));
+        assert_eq!(
+            sql_error("SELECT DISTINCT '\\x'::automerge"),
+            "42883: could not identify an equality operator for type automerge"
+        );
+        // merge is commutative in heads and jsonb.
+        let mut c = a.fork().with_actor(actor(3));
+        c.put(ROOT, "y", 2i64).unwrap();
+        a.put(ROOT, "z", 3i64).unwrap();
+        let args = [a.save().into(), c.save().into()];
+        assert!(one::<bool>(
+            "SELECT automerge_heads(merge($1::automerge, $2::automerge)) = automerge_heads(merge($2::automerge, $1::automerge)) \
+               AND merge($1::automerge, $2::automerge)::jsonb = merge($2::automerge, $1::automerge)::jsonb",
+            &args
+        ));
+    }
+
+    #[pg_test]
+    fn merge_agg_declares_realistic_state_size() {
+        // The Rust-heap state is not spillable; a realistic aggtransspace
+        // keeps the planner from assuming ~8kB per HashAgg group.
+        let space: i32 = one(
+            "SELECT aggtransspace FROM pg_aggregate WHERE aggfnoid = 'merge_agg'::regproc",
+            &[],
+        );
+        assert_eq!(space, 1_048_576);
+    }
+
+    #[pg_test]
+    fn checksummed_garbage_is_a_clean_error() {
+        // Mutations of a chunk body with the checksum recomputed get past
+        // Automerge's integrity check into its column decoders, which panic
+        // on some malformed data. That must still be 22P02, not XX000.
+        let mut doc = AutoCommit::new().with_actor(actor(1));
+        doc.put(ROOT, "s", "hello").unwrap();
+        doc.put(ROOT, "n", -5i64).unwrap();
+        let l = doc.put_object(ROOT, "l", ObjType::List).unwrap();
+        doc.insert(&l, 0, 1.5f64).unwrap();
+        let t = doc.put_object(ROOT, "t", ObjType::Text).unwrap();
+        doc.splice_text(&t, 0, 0, "text").unwrap();
+        let save = doc.save_nocompress();
+        // One uncompressed document chunk: magic (4), checksum (4), type (1),
+        // uleb128 length, data.
+        let (typ, data) = {
+            let (mut len, mut n) = (0usize, 0);
+            while save[9 + n] & 0x80 != 0 {
+                len |= ((save[9 + n] & 0x7f) as usize) << (7 * n);
+                n += 1;
+            }
+            len |= (save[9 + n] as usize) << (7 * n);
+            (save[8], save[10 + n..10 + n + len].to_vec())
+        };
+        // The chunk with a valid checksum for `data`, computed in SQL:
+        // sha256(type || uleb len || data)[..4].
+        let check = "SELECT pg_temp.sql_error(format('SELECT %L::bytea::automerge::jsonb', \
+                     '\\x856f4a83'::bytea || substr(sha256($1), 1, 4) || $1))";
+        sql_error("SELECT 1"); // creates pg_temp.sql_error
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut decoder_panics = 0;
+        for _ in 0..1500 {
+            let mut data = data.clone();
+            for _ in 0..1 + rand() % 2 {
+                let i = (rand() % data.len() as u64) as usize;
+                data[i] = rand() as u8;
+            }
+            let mut chunk = vec![typ];
+            let mut len = data.len();
+            while len >= 0x80 {
+                chunk.push((len as u8 & 0x7f) | 0x80);
+                len >>= 7;
+            }
+            chunk.push(len as u8);
+            chunk.extend(&data);
+            let result: String = one(check, &[chunk.into()]);
+            assert!(
+                result == "no error" || result.starts_with("22P02: invalid automerge document"),
+                "{result}"
+            );
+            if result.contains("malformed data") {
+                decoder_panics += 1;
+            }
+        }
+        assert!(decoder_panics > 0, "no decoder panic provoked");
     }
 
     #[pg_test]

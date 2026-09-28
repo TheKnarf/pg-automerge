@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use automerge::{Automerge, AutomergeError, ChangeHash, ReadDoc};
 
@@ -36,6 +37,53 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Run `f`, converting a panic inside it into an error built by `on_panic`
+/// from the panic message.
+///
+/// The automerge crate's decoder is not panic-free: a chunk whose checksum
+/// is valid but whose column data is malformed can hit `unwrap`s, index
+/// panics and assertions inside `Automerge::load` (and, for a document that
+/// did load, possibly later operations on it). pgrx would turn such a panic
+/// into an XX000 ERROR anyway, but corrupt client input must be a 22P02
+/// "invalid automerge document" error, so every public entry point runs its
+/// Automerge calls through this.
+///
+/// `AssertUnwindSafe` is fine: nothing captured outlives a panic in a usable
+/// state that anyone observes. In Postgres the resulting ERROR aborts the
+/// statement, which discards e.g. a half-updated `merge_agg` state.
+///
+/// In a backend, pgrx's panic hook only records the location (no log line),
+/// so a caught panic is silent apart from the returned error.
+fn guard<T>(
+    f: impl FnOnce() -> Result<T, Error>,
+    on_panic: impl FnOnce(&str) -> Error,
+) -> Result<T, Error> {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        Err(on_panic(msg))
+    })
+}
+
+/// `guard` for operations on external input.
+fn guard_input<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    guard(f, |msg| {
+        Error::InvalidInput(format!(
+            "invalid automerge document: malformed data ({msg})"
+        ))
+    })
+}
+
+/// `guard` for operations on stored (already validated) values.
+fn guard_stored<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    guard(f, |msg| {
+        Error::Internal(format!("automerge failed on a stored value: {msg}"))
+    })
+}
+
 /// Load bytes arriving from outside (text input, binary recv, `bytea` cast).
 ///
 /// Accepts anything `Automerge::load` accepts: a document chunk, change
@@ -43,6 +91,10 @@ impl std::error::Error for Error {}
 /// missing dependencies, so a stored value never carries orphaned changes.
 /// Empty input is the empty document.
 pub fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
+    guard_input(|| load_external_unguarded(bytes))
+}
+
+fn load_external_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
     let doc = Automerge::load(bytes).map_err(|e| match e {
         AutomergeError::MissingDeps => Error::InvalidInput(
             "invalid automerge document: changes are missing dependencies".into(),
@@ -60,13 +112,42 @@ pub fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
 }
 
 /// Validate and normalize external bytes into stored bytes.
+///
+/// The save is guarded too: a document that loaded from malformed (but
+/// checksummed) input could still trip an assertion when re-encoded.
+/// Unless the input already was the canonical encoding, the result is loaded
+/// back and must have the same heads. Malformed input with valid checksums
+/// can load "successfully" into a document whose re-save does not load
+/// (seen in fuzzing: "mismatching heads"); storing that would make the value
+/// unreadable forever, so it is rejected here as invalid input instead. This
+/// costs a second load on writes of non-canonical (e.g. compressed) saves.
 pub fn normalize(bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(load_external(bytes)?.save_nocompress())
+    guard_input(|| {
+        let doc = load_external_unguarded(bytes)?;
+        let saved = doc.save_nocompress();
+        if saved != bytes {
+            let reloaded = Automerge::load(&saved).map_err(|e| {
+                Error::InvalidInput(format!(
+                    "invalid automerge document: does not survive a save and load ({e})"
+                ))
+            })?;
+            if reloaded.get_heads() != doc.get_heads() {
+                return Err(Error::InvalidInput(
+                    "invalid automerge document: heads change after a save and load".into(),
+                ));
+            }
+        }
+        Ok(saved)
+    })
 }
 
 /// Load already-stored bytes. These were validated on the way in, so failure
 /// here means on-disk corruption (or a bug) and is reported as internal.
 pub fn load_stored(bytes: &[u8]) -> Result<Automerge, Error> {
+    guard_stored(|| load_stored_unguarded(bytes))
+}
+
+fn load_stored_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
     Automerge::load(bytes)
         .map_err(|e| Error::Internal(format!("corrupt stored automerge value: {e}")))
 }
@@ -110,13 +191,20 @@ impl Merged {
 }
 
 /// CRDT merge of two stored values.
+///
+/// Commutative in state (heads and jsonb), not byte for byte: when neither
+/// input contains the other, the re-saved bytes depend on argument order.
 pub fn merge(a: &[u8], b: &[u8]) -> Result<Merged, Error> {
     // Byte-identical stored values are the same document.
     if a == b {
         return Ok(Merged::Left);
     }
-    let mut doc_a = load_stored(a)?;
-    let mut doc_b = load_stored(b)?;
+    guard_stored(|| merge_unguarded(a, b))
+}
+
+fn merge_unguarded(a: &[u8], b: &[u8]) -> Result<Merged, Error> {
+    let mut doc_a = load_stored_unguarded(a)?;
+    let mut doc_b = load_stored_unguarded(b)?;
     if has_all(&doc_a, &doc_b.get_heads()) {
         return Ok(Merged::Left);
     }
@@ -142,13 +230,15 @@ fn merge_into(target: &mut Automerge, other: &mut Automerge) -> Result<(), Error
 
 /// Current heads as sorted lowercase hex change hashes.
 pub fn heads(bytes: &[u8]) -> Result<Vec<String>, Error> {
-    let mut heads: Vec<String> = load_stored(bytes)?
-        .get_heads()
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    heads.sort();
-    Ok(heads)
+    guard_stored(|| {
+        let mut heads: Vec<String> = load_stored_unguarded(bytes)?
+            .get_heads()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        heads.sort();
+        Ok(heads)
+    })
 }
 
 /// Whether every change of `b` is already in `a` (so `merge(a, b)` is `a`).
@@ -156,14 +246,16 @@ pub fn contains(a: &[u8], b: &[u8]) -> Result<bool, Error> {
     if a == b {
         return Ok(true);
     }
-    let doc_a = load_stored(a)?;
-    let doc_b = load_stored(b)?;
-    Ok(has_all(&doc_a, &doc_b.get_heads()))
+    guard_stored(|| {
+        let doc_a = load_stored_unguarded(a)?;
+        let doc_b = load_stored_unguarded(b)?;
+        Ok(has_all(&doc_a, &doc_b.get_heads()))
+    })
 }
 
 /// Stored bytes to JSON.
 pub fn to_json(bytes: &[u8]) -> Result<serde_json::Value, Error> {
-    json::doc_to_json(&load_stored(bytes)?)
+    guard_stored(|| json::doc_to_json(&load_stored_unguarded(bytes)?))
 }
 
 /// Running state of the `merge_agg` aggregate. Each input is loaded once and
@@ -182,15 +274,19 @@ impl MergeAccumulator {
     }
 
     pub fn add(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        guard_stored(|| self.add_unguarded(bytes))
+    }
+
+    fn add_unguarded(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let Some(doc) = self.doc.as_mut() else {
-            self.doc = Some(load_stored(bytes)?);
+            self.doc = Some(load_stored_unguarded(bytes)?);
             self.unchanged_first = Some(bytes.to_vec());
             return Ok(());
         };
         if self.unchanged_first.as_deref() == Some(bytes) {
             return Ok(());
         }
-        let mut other = load_stored(bytes)?;
+        let mut other = load_stored_unguarded(bytes)?;
         if has_all(doc, &other.get_heads()) {
             return Ok(());
         }
@@ -200,11 +296,11 @@ impl MergeAccumulator {
     }
 
     /// The merged stored bytes, or `None` if nothing was added.
-    pub fn finish(&self) -> Option<Cow<'_, [u8]>> {
+    pub fn finish(&self) -> Result<Option<Cow<'_, [u8]>>, Error> {
         match (&self.unchanged_first, &self.doc) {
-            (Some(bytes), _) => Some(Cow::Borrowed(bytes)),
-            (None, Some(doc)) => Some(Cow::Owned(doc.save_nocompress())),
-            (None, None) => None,
+            (Some(bytes), _) => Ok(Some(Cow::Borrowed(bytes))),
+            (None, Some(doc)) => guard_stored(|| Ok(Some(Cow::Owned(doc.save_nocompress())))),
+            (None, None) => Ok(None),
         }
     }
 }
@@ -320,13 +416,13 @@ mod tests {
     fn accumulator() {
         let (base, a, b) = forked();
         let mut acc = MergeAccumulator::new();
-        assert!(acc.finish().is_none());
+        assert!(acc.finish().unwrap().is_none());
         acc.add(&base).unwrap();
         acc.add(&base).unwrap();
-        assert_eq!(acc.finish().unwrap().as_ref(), base.as_slice());
+        assert_eq!(acc.finish().unwrap().unwrap().as_ref(), base.as_slice());
         acc.add(&a).unwrap();
         acc.add(&b).unwrap();
-        let merged = acc.finish().unwrap().into_owned();
+        let merged = acc.finish().unwrap().unwrap().into_owned();
         let expected = merge(&a, &b).unwrap().into_bytes(&a, &b).into_owned();
         assert_eq!(heads(&merged).unwrap(), heads(&expected).unwrap());
         assert_eq!(to_json(&merged).unwrap(), to_json(&expected).unwrap());

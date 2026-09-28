@@ -113,13 +113,25 @@ All are `IMMUTABLE STRICT PARALLEL SAFE` unless noted.
   NULL when there are none. The state is an in-memory document (`internal`),
   so each input is loaded once and the result saved once. There is no
   combine function, so it never runs as a parallel partial aggregate.
+  The loaded document lives in the Rust heap, outside memory-context
+  accounting, and without a serialfunc HashAgg cannot spill it; the
+  aggregate declares `SSPACE = 1048576` so the planner's per-group estimate
+  is realistic and it prefers sorted grouping. `merge_agg_trans` runs
+  `CHECK_FOR_INTERRUPTS` before each input.
 - `automerge_to_jsonb(automerge) → jsonb`: the cast function.
 - `automerge_heads(automerge) → text[]`: current heads as sorted lowercase hex
   change hashes.
 - `automerge_contains(a automerge, b automerge) → bool`: whether every change
   in `b` is already in `a`, meaning `merge(a, b)` would be a no-op.
 
-No equality or btree opclass in v1.
+No equality or btree opclass in v1. Note that `=`, `<>`, `<` etc. on two
+`automerge` values still resolve, via the implicit cast, to jsonb
+comparisons of the current state (not history); history equality is
+`automerge_heads(a) = automerge_heads(b)`.
+
+`merge` is commutative in state only: when neither input contains the other
+the re-saved bytes depend on argument order, so `doc::bytea` is not an
+identity; `automerge_heads` is.
 
 ## jsonb mapping
 
@@ -175,6 +187,18 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
 - Errors: never panic across FFI. Map Automerge errors to `ereport(ERROR)`
   with SQLSTATE `22P02` (invalid_text_representation) for bad input (text,
   binary recv and bytea alike) and `XX000` otherwise.
+  The automerge decoder is not panic-free: input whose chunk checksums are
+  valid but whose column data is malformed can panic inside
+  `Automerge::load` (found by fuzzing with recomputed checksums). The core
+  crate therefore runs every Automerge call under `catch_unwind` and maps a
+  panic to `22P02` for external input and `XX000` for stored values. For the
+  same reason `normalize` re-loads its output (when it differs from the
+  input) and requires identical heads, since fuzzing also found malformed
+  input that loads but whose re-save does not; storing it would leave an
+  unreadable value.
+- Interrupts: single Automerge calls (load, merge, save, jsonb conversion)
+  don't check for interrupts, so cancel/`statement_timeout` wait for the call
+  to return. Only `merge_agg_trans` checks between inputs.
 - Code layout: all Automerge logic (normalize, merge, heads, contains, the
   jsonb mapping, hex/base64/ISO 8601 encoders) is plain Rust in
   `crates/pg_automerge_core` with `#[test]`s; `src/lib.rs` is pgrx glue. The
@@ -185,7 +209,7 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
 - Tests: `#[pg_test]` for SQL behaviour, plain `#[test]` for the pure
   conversion logic (edge cases in `crates/pg_automerge_core/tests/`), and
   `tests/pg_regress` for user-facing examples. `tests/concurrency.sh`
-  (`mise run concurrency`) runs two real psql sessions against one row to
+  (`mise run concurrency`, also the last step of `mise run test`) runs two real psql sessions against one row to
   check the EvalPlanQual claim above, the upsert path and REPEATABLE READ,
   plus a pg_dump/restore round trip. Build test documents in Rust with
   `automerge::AutoCommit` and pass them in as `bytea`.

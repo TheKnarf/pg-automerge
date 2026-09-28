@@ -7,3 +7,8 @@ description = "Postgres-independent Automerge logic for the pg_automerge extensi
 [dependencies]
 automerge.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Recomputes chunk checksums in the structure-aware fuzz test
+# (already in the lock file through automerge).
+sha2 = "0.11"

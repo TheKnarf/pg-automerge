@@ -58,7 +58,7 @@ fn empty_document_forms_are_equivalent() {
     let mut acc = MergeAccumulator::new();
     acc.add(&empty).unwrap();
     acc.add(&empty).unwrap();
-    assert_eq!(to_json(&acc.finish().unwrap()).unwrap(), json!({}));
+    assert_eq!(to_json(&acc.finish().unwrap().unwrap()).unwrap(), json!({}));
 }
 
 #[test]
@@ -523,7 +523,7 @@ fn accumulator_order_independent_with_ancestors_and_unrelated() {
         for &i in order {
             acc.add(&inputs[i]).unwrap();
         }
-        let out = acc.finish().unwrap().into_owned();
+        let out = acc.finish().unwrap().unwrap().into_owned();
         results.push((heads(&out).unwrap(), to_json(&out).unwrap()));
     });
     assert_eq!(results.len(), 24);
@@ -614,4 +614,166 @@ fn corrupted_stored_bytes_are_internal_errors() {
     assert!(matches!(heads(&bad), Err(Error::Internal(_))));
     assert!(matches!(merge(&good, &bad), Err(Error::Internal(_))));
     assert!(matches!(contains(&bad, &good), Err(Error::Internal(_))));
+}
+
+// ---------------------------------------------------------------------------
+// Structure-aware corruption: valid checksums, malformed chunk bodies
+// ---------------------------------------------------------------------------
+
+/// Every chunk starts with magic (4), checksum (4), type (1), uleb128 data
+/// length, then the data. The checksum is the first 4 bytes of
+/// sha256(type || uleb len || data).
+const MAGIC: [u8; 4] = [0x85, 0x6f, 0x4a, 0x83];
+
+fn uleb(mut n: usize, out: &mut Vec<u8>) {
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn read_uleb(bytes: &[u8]) -> (usize, usize) {
+    let (mut n, mut shift) = (0usize, 0);
+    for (i, b) in bytes.iter().enumerate() {
+        n |= ((b & 0x7f) as usize) << shift;
+        if b & 0x80 == 0 {
+            return (n, i + 1);
+        }
+        shift += 7;
+    }
+    panic!("unterminated uleb128");
+}
+
+/// Split concatenated chunks into (type, data).
+fn split_chunks(mut bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut chunks = Vec::new();
+    while !bytes.is_empty() {
+        assert_eq!(bytes[..4], MAGIC);
+        let typ = bytes[8];
+        let (len, n) = read_uleb(&bytes[9..]);
+        let start = 9 + n;
+        chunks.push((typ, bytes[start..start + len].to_vec()));
+        bytes = &bytes[start + len..];
+    }
+    chunks
+}
+
+/// Encode a chunk with a correct checksum for whatever `data` is.
+fn write_chunk(typ: u8, data: &[u8], out: &mut Vec<u8>) {
+    use sha2::{Digest, Sha256};
+    let mut header = vec![typ];
+    uleb(data.len(), &mut header);
+    let hash = Sha256::new()
+        .chain_update(&header)
+        .chain_update(data)
+        .finalize();
+    out.extend(MAGIC);
+    out.extend(&hash[..4]);
+    out.extend(header);
+    out.extend(data);
+}
+
+/// Deterministic xorshift64 so failures reproduce.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+thread_local!(static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// Run `f` with the default panic message silenced on this thread (the
+/// decoder panics we provoke on purpose are caught inside `f`), keeping it
+/// for assertion failures and every other test.
+fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !QUIET.with(|q| q.get()) {
+                default(info);
+            }
+        }));
+    });
+    QUIET.with(|q| q.set(true));
+    let result = f();
+    QUIET.with(|q| q.set(false));
+    result
+}
+
+#[test]
+fn checksummed_corruption_is_rejected_cleanly() {
+    // Mutations that keep the checksum valid get past Automerge's integrity
+    // check into its column decoders, which panic on some malformed data.
+    // `normalize` must turn those panics into InvalidInput, and whatever it
+    // accepts must be a fully usable stored value.
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let (mut decoder_panics, mut accepted) = (0, 0);
+    let saves: Vec<Vec<u8>> = sample_saves()
+        .into_iter()
+        .map(|s| normalize(&s).unwrap()) // uncompressed document chunk
+        .chain(sample_saves().into_iter().skip(2)) // doc chunk + change chunk
+        .collect();
+    for save in &saves {
+        let chunks = split_chunks(save);
+        for _ in 0..4000 {
+            let mut chunks = chunks.clone();
+            let which = rng.below(chunks.len());
+            let (_, data) = &mut chunks[which];
+            for _ in 0..1 + rng.below(3) {
+                if data.is_empty() {
+                    data.push(rng.next() as u8);
+                }
+                let i = rng.below(data.len());
+                match rng.below(4) {
+                    0 => data[i] ^= 1 << rng.below(8),
+                    1 => data[i] = rng.next() as u8,
+                    2 => {
+                        data.remove(i);
+                    }
+                    _ => data.insert(i, rng.next() as u8),
+                }
+            }
+            let mut bytes = Vec::new();
+            for (typ, data) in &chunks {
+                write_chunk(*typ, data, &mut bytes);
+            }
+            match quietly(|| std::panic::catch_unwind(|| normalize(&bytes))) {
+                Err(_) => panic!("normalize panicked on {bytes:02x?}"),
+                Ok(Err(Error::InvalidInput(m))) => {
+                    if m.contains("malformed data") {
+                        decoder_panics += 1;
+                    }
+                }
+                Ok(Err(e)) => panic!("unexpected error kind for {bytes:02x?}: {e:?}"),
+                Ok(Ok(stored)) => {
+                    accepted += 1;
+                    let json = quietly(|| to_json(&stored));
+                    assert!(json.is_ok(), "{json:?} for {bytes:02x?}");
+                    let heads = quietly(|| heads(&stored));
+                    assert!(heads.is_ok(), "{heads:?} for {bytes:02x?}");
+                    let again = quietly(|| normalize(&stored));
+                    assert_eq!(again.as_ref(), Ok(&stored), "{bytes:02x?}");
+                }
+            }
+        }
+    }
+    // The test only means something if it reached the decoder's panics.
+    assert!(
+        decoder_panics > 0,
+        "no decoder panic provoked ({accepted} accepted)"
+    );
 }

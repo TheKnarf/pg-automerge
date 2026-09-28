@@ -1187,6 +1187,7 @@ version = "0.0.0"
 dependencies = [
  "automerge",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

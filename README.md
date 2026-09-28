@@ -49,7 +49,7 @@ CREATE INDEX ON docs USING gin ((doc::jsonb));
 | `bytea → automerge` | Assignment cast (validates). |
 | `automerge → bytea` | Explicit cast: the stored Automerge bytes. |
 | `automerge → jsonb` | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
-| `merge(a, b)`, `a \|\| b` | CRDT merge. Commutative and idempotent; returns an input unchanged if it already contains the other. |
+| `merge(a, b)`, `a \|\| b` | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other. |
 | `merge_agg(automerge)` | Aggregate merge of all non-null inputs. |
 | `automerge_heads(automerge) → text[]` | Current heads, sorted hex change hashes. |
 | `automerge_contains(a, b) → bool` | Whether `a` already has every change of `b`. |
@@ -65,8 +65,28 @@ Gotchas:
   `$1::automerge` (function arguments only use implicit casts).
 - `doc || '{"a": 1}'` means `merge`, not jsonb concatenation; write
   `doc::jsonb || '{"a": 1}'`.
-- There is no equality or btree opclass, so no `DISTINCT`/`GROUP BY` on
-  `automerge` columns; compare `automerge_heads(...)` or `doc::jsonb` instead.
+- There is no `automerge` equality or btree opclass, so no
+  `DISTINCT`/`GROUP BY` on `automerge` columns. But `a = b`, `a <> b`, `<`
+  etc. do *not* fail: through the implicit cast they become **jsonb**
+  comparisons of the current state. Two documents with different histories
+  but the same content compare equal. For "same document/history" compare
+  `automerge_heads(a) = automerge_heads(b)` (or `automerge_contains` both
+  ways).
+- `merge(a, b)` and `merge(b, a)` have the same heads and jsonb but can differ
+  in bytes when neither contains the other. Don't dedupe or cache on
+  `doc::bytea` / `md5(doc::bytea)`; use `automerge_heads(doc)`.
+- `merge_agg` keeps a fully loaded document per group in backend memory
+  outside Postgres' memory accounting; HashAgg cannot spill it, and
+  `work_mem`/`hash_mem_multiplier` do not limit it. The aggregate declares a
+  1 MB state size so the planner favours sorted grouping, but for a grouped
+  `merge_agg` over many large documents check `EXPLAIN` and use
+  `SET enable_hashagg = off` if needed.
+- Loading, merging and converting a single document runs without interrupt
+  checks, so a cancel or `statement_timeout` takes effect only once that call
+  returns (for `merge_agg`, at the next input row). With documents of tens of
+  MB a single call can take a noticeable time.
+- Malformed input is always SQLSTATE `22P02` (`invalid automerge document`),
+  including input that passes Automerge's checksums but panics its decoder.
 
 ## Development
 
@@ -74,7 +94,7 @@ Tooling runs through [mise](https://mise.jdx.dev):
 
 ```sh
 mise run pgrx-init   # once: build the Postgres pgrx develops against
-mise run test        # core unit tests + #[pg_test] tests
+mise run test        # core unit tests + #[pg_test] tests + the concurrency test
 mise run regress     # pg_regress examples in tests/pg_regress
-mise run concurrency # two real psql sessions merging into one row, pg_dump round trip
+mise run concurrency # only: two real psql sessions merging into one row, pg_dump round trip
 ```

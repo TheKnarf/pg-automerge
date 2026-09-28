@@ -18,10 +18,11 @@ description = "Download and build the Postgres version pgrx develops against (~/
 run = "cargo pgrx init --pg{{env.PG_VERSION}} download"
 
 [tasks.test]
-description = "Run core unit tests, then #[pg_test] and unit tests in a pgrx-managed Postgres"
+description = "Run core unit tests, #[pg_test] tests in a pgrx-managed Postgres, then the two-session concurrency test"
 run = [
   "cargo test -p pg_automerge_core",
   "cargo pgrx test pg{{env.PG_VERSION}}",
+  "bash tests/concurrency.sh",
 ]
 
 [tasks.regress]
