@@ -331,3 +331,49 @@ fn no_op_merges_keep_the_stored_toast_value() {
     Spi::run_with_args("UPDATE tv SET doc = merge(doc, $1::bytea)", &[newer.into()]).unwrap();
     assert_ne!(chunk_id(), stored_id);
 }
+
+#[pg_test]
+fn merge_agg_loads_only_what_it_merges() {
+    let (_, _, newer_stored) = loads_fixture();
+    Spi::run("INSERT INTO ld SELECT 2, b::automerge FROM ld_in WHERE name = 'newer'").unwrap();
+    Spi::run("INSERT INTO ld SELECT 3, b::automerge FROM ld_in WHERE name = 'concurrent'")
+        .unwrap();
+    let agg = |filter: &str, order: &str| {
+        format!(
+            "SELECT automerge_heads(merge_agg(doc ORDER BY id {order})) FROM ld WHERE {filter}"
+        )
+    };
+    // One row, or the same row twice: nothing is loaded.
+    assert_eq!(loads_of(&agg("id = 1", "")), 0);
+    assert_eq!(
+        loads_of("SELECT automerge_heads(merge_agg(doc)) FROM (SELECT doc FROM ld WHERE id = 1 \
+                  UNION ALL SELECT doc FROM ld WHERE id = 1) s"),
+        0
+    );
+    // A version and a newer one, in either order: only the newer one is
+    // loaded, and it is the result as stored (no save).
+    for order in ["", "DESC"] {
+        assert_eq!(loads_of(&agg("id IN (1, 2)", order)), 1, "{order}");
+        let same: bool = one(
+            &format!("SELECT merge_agg(doc ORDER BY id {order})::bytea = $1 FROM ld WHERE id IN (1, 2)"),
+            &[newer_stored.clone().into()],
+        );
+        assert!(same, "{order}");
+    }
+    // Plus a concurrent version: two loads (one per document merged), and
+    // the older one is never loaded, whatever the order.
+    for order in ["", "DESC"] {
+        assert_eq!(loads_of(&agg("true", order)), 2, "{order}");
+    }
+    let merged: bool = one(
+        "SELECT (SELECT merge_agg(doc ORDER BY id)::jsonb FROM ld) \
+            = (SELECT merge_agg(doc ORDER BY id DESC)::jsonb FROM ld) \
+            AND (SELECT merge_agg(doc)::jsonb ? 'other' FROM ld)",
+        &[],
+    );
+    assert!(merged);
+    // NULLs and the empty aggregate are unchanged.
+    let none: Option<Vec<u8>> =
+        Spi::get_one("SELECT merge_agg(doc)::bytea FROM ld WHERE false").unwrap();
+    assert!(none.is_none());
+}

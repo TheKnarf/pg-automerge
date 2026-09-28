@@ -12,6 +12,8 @@
 #   W4  INSERT .. ON CONFLICT DO UPDATE SET doc = merge(docs.doc, excluded.doc)
 #   W5  W1 again after W1 (the changes are already there: a no-op)
 #   W6  W3 with the save as a text parameter (extended protocol, \bind)
+#   A1  merge_agg over one row
+#   A2  merge_agg over the row and a newer version of it (stored rows)
 #
 # "newer" is the base document loaded from its save, one change by another
 # actor, saved compressed (Automerge.save()); "changes" is save_after(base
@@ -71,6 +73,9 @@ case_ W5 "UPDATE docs SET doc = merge(doc, $CHANGES) WHERE name = :'d';" \
     "UPDATE docs SET doc = merge(doc, $CHANGES) WHERE name = :'d';"
 case_ W6 "SELECT '\\x' || encode(save, 'hex') AS newer_hex FROM bench_newer WHERE name = :'d' \\gset" \
     "UPDATE docs SET doc = merge(doc, \$1::automerge) WHERE name = :'d' \\bind :newer_hex \\g"
+case_ A1 "" "SELECT cardinality(automerge_heads(merge_agg(doc))) FROM docs WHERE name = :'d';"
+case_ A2 "INSERT INTO docs VALUES (:'d' || 'n', $NEWER);" \
+    "SELECT cardinality(automerge_heads(merge_agg(doc ORDER BY name))) FROM docs WHERE name IN (:'d', :'d' || 'n');"
 
 # One psql session per case and document: REPS transactions, each timing
 # only the case's statement. Prints the times (ms), one per line.

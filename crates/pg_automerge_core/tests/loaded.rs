@@ -351,3 +351,140 @@ fn unverified_documents_pass_the_check_on_accumulation() {
         pg_automerge_core::Accumulated::Stored(_) => panic!("expected a new document"),
     }
 }
+
+/// Versions of one document: `v[i]` has `i + 1` changes (a linear
+/// history), plus `fork`, a concurrent change on top of `v[1]`.
+fn versions() -> (Vec<Vec<u8>>, Vec<u8>) {
+    let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
+    let mut v = Vec::new();
+    for i in 0..4i64 {
+        doc.put(ROOT, "n", i).unwrap();
+        doc.put(ROOT, format!("k{i}"), i).unwrap();
+        doc.commit();
+        v.push(normalize(&doc.save()).unwrap());
+    }
+    let mut fork = AutoCommit::load(&v[1])
+        .unwrap()
+        .with_actor(ActorId::from([2u8; 16]));
+    fork.put(ROOT, "fork", true).unwrap();
+    fork.commit();
+    (v, normalize(&fork.save()).unwrap())
+}
+
+/// Loads taken by accumulating `inputs`, and the result.
+fn accumulate(inputs: &[&[u8]]) -> (usize, Vec<u8>) {
+    let before = pg_automerge_core::test_hooks::loads();
+    let mut acc = MergeAccumulator::new();
+    for input in inputs {
+        acc.add(input).unwrap();
+    }
+    let loads = pg_automerge_core::test_hooks::loads() - before;
+    (loads, acc.finish().unwrap().unwrap().into_owned())
+}
+
+#[test]
+fn accumulator_loads_only_what_a_merge_needs() {
+    let (v, fork) = versions();
+    // One input, or identical inputs: nothing loaded, the input is the
+    // result.
+    assert_eq!(accumulate(&[&v[3]]), (0, v[3].clone()));
+    assert_eq!(accumulate(&[&v[3], &v[3], &v[3]]), (0, v[3].clone()));
+    // A linear history in either order: one load (of the newest, which
+    // contains the others; older inputs are decided by their heads), and
+    // the newest input's bytes are the result (no save).
+    assert_eq!(accumulate(&[&v[0], &v[1], &v[2], &v[3]]).1, v[3]);
+    assert_eq!(accumulate(&[&v[3], &v[2], &v[1], &v[0]]), (1, v[3].clone()));
+    assert_eq!(accumulate(&[&v[1], &v[3]]), (1, v[3].clone()));
+    assert_eq!(accumulate(&[&v[3], &v[1]]), (1, v[3].clone()));
+    // Oldest first: each newer input is loaded (it may add something) and
+    // replaces the state; still no merge and no save.
+    assert_eq!(accumulate(&[&v[0], &v[1], &v[2], &v[3]]).0, 3);
+    // Concurrent versions: both loaded and merged, once.
+    let (loads, merged) = accumulate(&[&v[3], &fork]);
+    assert_eq!(loads, 2);
+    let (loads_rev, merged_rev) = accumulate(&[&fork, &v[3], &v[2], &v[0]]);
+    assert_eq!(loads_rev, 2);
+    for m in [&merged, &merged_rev] {
+        let doc = Automerge::load(m).unwrap();
+        assert!(doc.get(ROOT, "fork").unwrap().is_some());
+        assert!(doc.get(ROOT, "k3").unwrap().is_some());
+    }
+    assert_eq!(
+        common::heads(&merged).unwrap(),
+        common::heads(&merged_rev).unwrap()
+    );
+    // A merged state that a later input contains is replaced by it.
+    let all = merge(&v[3], &fork)
+        .unwrap()
+        .into_bytes(&v[3], &fork)
+        .into_owned();
+    assert_eq!(accumulate(&[&v[3], &fork, &all]).1, all);
+}
+
+#[test]
+fn accumulator_has_heads_matches_adding() {
+    let (v, fork) = versions();
+    let heads = |b: &[u8]| {
+        let mut h = Automerge::load(b).unwrap().get_heads();
+        h.sort();
+        h
+    };
+    let mut acc = MergeAccumulator::new();
+    assert!(!acc.has_heads(&[]).unwrap(), "empty state has nothing");
+    acc.add(&v[2]).unwrap();
+    // Pending (not loaded): decided by the heads alone, conservatively.
+    assert!(acc.has_heads(&heads(&v[2])).unwrap());
+    assert!(!acc.has_heads(&heads(&v[3])).unwrap());
+    assert!(!acc.has_heads(&heads(&fork)).unwrap());
+    acc.add(&v[3]).unwrap();
+    // Loaded: by the history.
+    for old in &v {
+        assert!(acc.has_heads(&heads(old)).unwrap());
+    }
+    assert!(!acc.has_heads(&heads(&fork)).unwrap());
+    acc.add(&fork).unwrap();
+    assert!(acc.has_heads(&heads(&fork)).unwrap());
+    assert!(acc.has_heads(&heads(&v[3])).unwrap());
+}
+
+#[test]
+fn accumulator_result_is_order_independent_in_state() {
+    // Every order of a few replica sets gives the same heads and JSON, and
+    // the same as merging pairwise.
+    for seed in 1..=12u64 {
+        let replicas = random_replicas(seed);
+        let n = replicas.len().min(5);
+        let inputs: Vec<&[u8]> = replicas[..n].iter().map(Vec::as_slice).collect();
+        let mut reference = inputs[0].to_vec();
+        for r in &inputs[1..] {
+            reference = merge(&reference, r)
+                .unwrap()
+                .into_bytes(&reference, r)
+                .into_owned();
+        }
+        let want = (
+            common::heads(&reference).unwrap(),
+            common::to_json(&reference).unwrap(),
+        );
+        let mut rng = Rng(seed | 1);
+        for _ in 0..8 {
+            let mut order = inputs.clone();
+            for i in (1..order.len()).rev() {
+                order.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            let (_, out) = accumulate(&order);
+            assert_eq!(
+                (common::heads(&out).unwrap(), common::to_json(&out).unwrap()),
+                want,
+                "seed {seed}"
+            );
+            // Stored results load back to the same heads (a real save).
+            let mut h = Automerge::load(&out).unwrap().get_heads();
+            h.sort();
+            assert_eq!(
+                h.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                want.0
+            );
+        }
+    }
+}

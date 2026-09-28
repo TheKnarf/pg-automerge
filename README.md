@@ -191,7 +191,7 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `automerge → jsonb` | I S P | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
 | `merge(a, b)`, `a \|\| b` | I S P | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. |
 | `merge(doc, changes bytea)`, `doc \|\| changes` | I S P | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them in the DETAIL). |
-| `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. |
+| `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. Loads a document only to merge it: a single row, or a version plus older ones, costs no load or one. |
 | `automerge_heads(automerge) → text[]` | I S P | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
 | `automerge_contains(a, b) → bool` | I S P | Whether `a` already has every change of `b`. |
 | `automerge_contains(doc, changes bytea) → bool` | I S P | Whether `merge(doc, changes)` would add nothing (every change in the save or change chunks is already in `doc`). Usually decided without loading the document. |
@@ -274,7 +274,8 @@ Details in
   in bytes when neither contains the other. Don't dedupe or cache on
   `doc::bytea` / `md5(doc::bytea)`; use `automerge_heads(doc)`.
 - **Memory outside Postgres' accounting.** `merge_agg` keeps a fully
-  loaded document per group in backend memory; HashAgg cannot spill it,
+  loaded document per group in backend memory (once a group needs a
+  merge; before that, the stored bytes); HashAgg cannot spill it,
   and `work_mem`/`hash_mem_multiplier` do not limit it. The aggregate
   declares a 1 MB state size so the planner favours sorted grouping, but
   for a grouped `merge_agg` over many large documents check `EXPLAIN` and

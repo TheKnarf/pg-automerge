@@ -551,17 +551,93 @@ pub fn heads_to_strings(heads: Vec<ChangeHash>) -> Vec<String> {
     heads
 }
 
-/// Running state of the `merge_agg` aggregate. Each input is loaded once and
-/// its missing changes applied; the result is saved once at the end.
+/// Running state of the `merge_agg` aggregate.
+///
+/// Documents are loaded only when a merge needs them, and the result is
+/// saved at most once:
+///
+/// - The first stored input is kept as bytes with its header heads, not
+///   loaded. A group of one row, or of rows that this value contains or is
+///   contained in by their heads (identical values, say), loads nothing.
+/// - When a later input cannot be decided by the heads, the larger of the
+///   two is loaded first (it usually contains the other, as a newer version
+///   of a document contains an older one), and only if it does not is the
+///   other loaded and merged into the first input's document.
+/// - Once a document is loaded, later inputs are checked against it by
+///   their (header) heads, so inputs that add nothing are never loaded. An
+///   input that is loaded and contains the whole state replaces it (no
+///   merge); otherwise its missing changes are applied.
+///
+/// While the state equals one input's stored value, that value is the
+/// result (no save). Like `merge`, the result is the same document state
+/// for any input order, not always the same bytes.
+///
+/// After an error the accumulator may hold a partial state; in Postgres
+/// the error aborts the statement, which discards it.
 #[derive(Default)]
 pub struct MergeAccumulator {
-    doc: Option<Automerge>,
-    /// Bytes of the first input while no later input has added anything, so
-    /// the common "all rows are the same or older" case needs no re-save.
-    unchanged_first: Option<Vec<u8>>,
-    /// Whether an input was a loaded document with unverified external
-    /// changes (see [`loaded::LoadedDoc`]); the result then is too.
-    unverified: bool,
+    state: AccState,
+}
+
+#[derive(Default)]
+enum AccState {
+    /// Nothing added yet.
+    #[default]
+    Empty,
+    /// One stored value, not loaded: its bytes and sorted header heads.
+    Pending {
+        bytes: Vec<u8>,
+        heads: Vec<ChangeHash>,
+    },
+    /// A loaded document (boxed: an `Automerge` is large).
+    Loaded {
+        doc: Box<Automerge>,
+        /// The stored bytes of the input the document was loaded from,
+        /// while nothing has been added to it.
+        stored: Option<Vec<u8>>,
+        /// Whether it holds unverified external changes (see
+        /// [`loaded::LoadedDoc`]); the result then does too.
+        unverified: bool,
+    },
+}
+
+impl AccState {
+    /// A copy of a loaded input as the whole state.
+    fn adopt(input: &loaded::LoadedDoc) -> Self {
+        AccState::Loaded {
+            doc: Box::new(input.doc().clone()),
+            stored: input.cached_stored().map(<[u8]>::to_vec),
+            unverified: input.is_unverified(),
+        }
+    }
+
+    /// A document loaded from the stored input `bytes`.
+    fn from_stored(doc: Automerge, bytes: Vec<u8>) -> Self {
+        AccState::Loaded {
+            doc: Box::new(doc),
+            stored: Some(bytes),
+            unverified: false,
+        }
+    }
+
+    /// A document built by merging.
+    fn merged(doc: Automerge, unverified: bool) -> Self {
+        AccState::Loaded {
+            doc: Box::new(doc),
+            stored: None,
+            unverified,
+        }
+    }
+
+    fn unverified(&self) -> bool {
+        matches!(
+            self,
+            AccState::Loaded {
+                unverified: true,
+                ..
+            }
+        )
+    }
 }
 
 /// Result of [`MergeAccumulator::finish_loaded`].
@@ -572,10 +648,36 @@ pub enum Accumulated<'a> {
     Loaded(Box<loaded::LoadedDoc>),
 }
 
+/// Sorted heads of a stored value (from its header when possible).
+fn sorted_stored_heads(bytes: &[u8]) -> Result<Vec<ChangeHash>, Error> {
+    let mut heads = stored_heads_unguarded(bytes)?;
+    heads.sort_unstable();
+    Ok(heads)
+}
+
 impl MergeAccumulator {
     /// An empty accumulator (nothing added yet).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether something was added and the state already has every change
+    /// of the history ending at `heads`, so adding a value with those heads
+    /// would change nothing. Lets a caller skip reading (detoasting) such a
+    /// value: only its heads are needed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] if Automerge fails reading the state
+    /// ([`Error::InvalidInput`] when it holds unverified external changes).
+    pub fn has_heads(&self, heads: &[ChangeHash]) -> Result<bool, Error> {
+        match &self.state {
+            AccState::Empty => Ok(false),
+            AccState::Pending { heads: have, .. } => Ok(is_subset(heads, have)),
+            AccState::Loaded {
+                doc, unverified, ..
+            } => guard_for(*unverified, || Ok(has_all(doc, heads))),
+        }
     }
 
     /// Add a stored value or a loaded document.
@@ -586,27 +688,86 @@ impl MergeAccumulator {
     /// ([`Error::InvalidInput`] instead when the input or the state holds
     /// unverified external changes).
     pub fn add_input(&mut self, input: loaded::Input<'_>) -> Result<(), Error> {
-        guard_for(input.unverified(), || self.add_unguarded(input))
+        let unverified = input.unverified() || self.state.unverified();
+        guard_for(unverified, || self.add_unguarded(input))
     }
 
     fn add_unguarded(&mut self, input: loaded::Input<'_>) -> Result<(), Error> {
-        let Some(doc) = self.doc.as_mut() else {
-            match input {
-                loaded::Input::Stored(bytes) => {
-                    self.doc = Some(load_stored_unguarded(bytes)?);
-                    self.unchanged_first = Some(bytes.to_vec());
+        use loaded::Input::{Loaded, Stored};
+        match (&mut self.state, input) {
+            (AccState::Empty, Stored(bytes)) => {
+                self.state = AccState::Pending {
+                    bytes: bytes.to_vec(),
+                    heads: sorted_stored_heads(bytes)?,
+                };
+            }
+            (AccState::Empty, Loaded(input)) => self.state = AccState::adopt(input),
+            (
+                AccState::Pending {
+                    bytes: first,
+                    heads: first_heads,
+                },
+                Stored(bytes),
+            ) => {
+                if first.as_slice() == bytes {
+                    return Ok(());
                 }
-                loaded::Input::Loaded(loaded) => {
-                    self.doc = Some(loaded.doc().clone());
-                    self.unchanged_first = loaded.cached_stored().map(<[u8]>::to_vec);
-                    self.unverified = loaded.is_unverified();
+                let heads = sorted_stored_heads(bytes)?;
+                if is_subset(&heads, first_heads) {
+                    return Ok(());
+                }
+                if is_subset(first_heads, &heads) {
+                    // The input contains the first value (see
+                    // `contains_by_heads`).
+                    self.state = AccState::Pending {
+                        bytes: bytes.to_vec(),
+                        heads,
+                    };
+                    return Ok(());
+                }
+                if bytes.len() > first.len() {
+                    let doc = load_stored_unguarded(bytes)?;
+                    if has_all(&doc, first_heads) {
+                        self.state = AccState::from_stored(doc, bytes.to_vec());
+                        return Ok(());
+                    }
+                    let mut target = load_stored_unguarded(first)?;
+                    loaded::merge_from(&mut target, &doc)?;
+                    self.state = AccState::merged(target, false);
+                } else {
+                    let mut target = load_stored_unguarded(first)?;
+                    if has_all(&target, &heads) {
+                        self.state = AccState::from_stored(target, std::mem::take(first));
+                        return Ok(());
+                    }
+                    loaded::merge_from(&mut target, &load_stored_unguarded(bytes)?)?;
+                    self.state = AccState::merged(target, false);
                 }
             }
-            return Ok(());
-        };
-        match input {
-            loaded::Input::Stored(bytes) => {
-                if self.unchanged_first.as_deref() == Some(bytes) {
+            (
+                AccState::Pending {
+                    bytes: first,
+                    heads: first_heads,
+                },
+                Loaded(input),
+            ) => {
+                if is_subset(input.heads(), first_heads) {
+                    return Ok(());
+                }
+                if has_all(input.doc(), first_heads) {
+                    self.state = AccState::adopt(input);
+                    return Ok(());
+                }
+                let mut target = load_stored_unguarded(first)?;
+                if has_all(&target, input.heads()) {
+                    self.state = AccState::from_stored(target, std::mem::take(first));
+                    return Ok(());
+                }
+                loaded::merge_from(&mut target, input.doc())?;
+                self.state = AccState::merged(target, input.is_unverified());
+            }
+            (AccState::Loaded { doc, stored, .. }, Stored(bytes)) => {
+                if stored.as_deref() == Some(bytes) {
                     return Ok(());
                 }
                 // Read the heads from the header first: an input that adds
@@ -614,35 +775,61 @@ impl MergeAccumulator {
                 if has_all(doc, &stored_heads_unguarded(bytes)?) {
                     return Ok(());
                 }
-                loaded::merge_from(doc, &load_stored_unguarded(bytes)?)?;
-            }
-            loaded::Input::Loaded(loaded) => {
-                if has_all(doc, loaded.heads()) {
+                let other = load_stored_unguarded(bytes)?;
+                if has_all(&other, &doc.get_heads()) {
+                    self.state = AccState::from_stored(other, bytes.to_vec());
                     return Ok(());
                 }
-                loaded::merge_from(doc, loaded.doc())?;
-                self.unverified |= loaded.is_unverified();
+                loaded::merge_from(doc, &other)?;
+                *stored = None;
+            }
+            (
+                AccState::Loaded {
+                    doc,
+                    stored,
+                    unverified,
+                },
+                Loaded(input),
+            ) => {
+                if has_all(doc, input.heads()) {
+                    return Ok(());
+                }
+                if has_all(input.doc(), &doc.get_heads()) {
+                    self.state = AccState::adopt(input);
+                    return Ok(());
+                }
+                loaded::merge_from(doc, input.doc())?;
+                *stored = None;
+                *unverified |= input.is_unverified();
             }
         }
-        self.unchanged_first = None;
         Ok(())
     }
 
-    /// The result without saving it: the first input's stored bytes when
-    /// nothing was added to it, otherwise a copy of the merged document
-    /// (the state stays usable, since a final function may run more than
+    /// The result without saving it: the stored bytes of the input the
+    /// state equals, if any, otherwise a copy of the merged document (the
+    /// state stays usable, since a final function may run more than
     /// once). `None` if nothing was added.
     ///
     /// # Errors
     ///
     /// [`Error::Internal`] if copying the merged document fails.
     pub fn finish_loaded(&self) -> Result<Option<Accumulated<'_>>, Error> {
-        match (&self.unchanged_first, &self.doc) {
-            (Some(bytes), _) => Ok(Some(Accumulated::Stored(bytes))),
-            (None, Some(doc)) => Ok(Some(Accumulated::Loaded(Box::new(
-                loaded::LoadedDoc::from_doc(doc.clone(), self.unverified)?,
-            )))),
-            (None, None) => Ok(None),
-        }
+        Ok(Some(match &self.state {
+            AccState::Empty => return Ok(None),
+            AccState::Pending { bytes, .. }
+            | AccState::Loaded {
+                stored: Some(bytes),
+                ..
+            } => Accumulated::Stored(bytes),
+            AccState::Loaded {
+                doc,
+                stored: None,
+                unverified,
+            } => Accumulated::Loaded(Box::new(loaded::LoadedDoc::from_doc(
+                Automerge::clone(doc),
+                *unverified,
+            )?)),
+        }))
     }
 }

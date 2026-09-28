@@ -397,11 +397,30 @@ enforces it).
   are the two `merge`s. There is no `bytea || automerge`, so the second has
   no commutator.
 - Aggregate `merge_agg(automerge) → automerge`: merges all non-null inputs;
-  NULL when there are none. The state is an in-memory document (`internal`),
-  so each input is loaded once and the result saved at most once. Inputs
-  after the first are checked against the loaded state by their header
-  heads, so inputs that add nothing are never loaded; expanded inputs are
-  used without a load. There is no combine function, so it never runs as a
+  NULL when there are none. The state (`internal`, a `MergeAccumulator`)
+  loads documents only when a merge needs them, each at most once, and
+  saves the result at most once:
+  - The first stored input is kept as bytes with its header heads, not
+    loaded. A group of one row, or of rows it contains or is contained in
+    by their heads (identical values, say), loads nothing, and that row is
+    the result as stored.
+  - When a later input cannot be decided by the heads (an older or newer
+    version of a linear history, a concurrent one), the larger of the two
+    is loaded first, since it usually contains the other, as a newer
+    version contains an older one. Only if it does not is the other one
+    loaded too and merged into the first input's document. A version and
+    a newer one cost one load in either order.
+  - Once a document is loaded, a later input is checked against it by its
+    heads, read from a prefix of the value (`AutomergeArg::heads`) before
+    it is detoasted, so an input that adds nothing is neither detoasted
+    nor loaded. An input that is loaded and contains the whole state
+    replaces it (no merge); otherwise its missing changes are applied.
+    Expanded inputs are used without a load.
+
+  While the state equals one input's stored value, that value is the
+  result: no save. Like `merge`, the result is the same state (heads and
+  jsonb) for any input order, but its bytes can depend on the order.
+  There is no combine function, so it never runs as a
   parallel partial aggregate. The loaded document lives in the Rust heap,
   outside memory-context accounting, and without a serialfunc HashAgg
   cannot spill it; the aggregate declares `SSPACE = 1048576` so the
@@ -525,8 +544,8 @@ expanded value is read in memory): they read the value's size with
 `toast_raw_datum_size` and fetch only a prefix (4 kB, grown as needed) with
 `pg_detoast_datum_slice`, which for an out-of-line value reads only the
 TOAST chunks covering it and for a compressed value decompresses only that
-far. `merge` and `merge_agg` use the fast path on the fully detoasted bytes
-for their no-op checks.
+far. `merge` and `merge_agg` also decide their no-op cases from such a
+prefix before they detoast a value (see [Merging](#merging)).
 
 Deciding containment for a linear history (newer contains older) still
 needs a load of the newer document: the headers only list heads, and
@@ -1083,7 +1102,8 @@ What costs a load, per call:
   `merge(doc, ''::bytea::automerge)` 1 ms (only a prefix of the 3 MB
   argument is detoasted);
   `merge` with a newer version of it, in either argument order, one load
-  (2.6 s), as is a `merge_agg` over both.
+  (2.6 s), as is a `merge_agg` over both. `merge_agg` over a single row
+  loads nothing (22 ms, reading the 3 MB value).
 - Writing a value: a full save, canonical (what `doc::bytea` or another
   stored value give) or compressed (`Automerge.save()`, when it inflates
   to the canonical encoding, which it does for saves by this Automerge
@@ -1308,7 +1328,7 @@ What costs a load, per call:
   `mise run test`) installs a release build and times the SQL workloads
   of [Performance](#performance) on three generated documents;
   `tests/bench_sql.sh` (`mise run bench-sql`) times the everyday paths
-  (reads, inserts, the merge and upsert forms of a write) one statement at
+  (reads, inserts, the merge and upsert forms of a write, `merge_agg`) one statement at
   a time through psql, writes in `BEGIN .. ROLLBACK`, median of three
   runs; `mise run bench-core` times the Rust primitives
   (`examples/bench_core.rs`).
@@ -1498,3 +1518,27 @@ about 47% in the load, 15% in Automerge's document iterator, 4% in the
 walk's own bookkeeping and about 7% in building the jsonb
 (`JsonbValueToJsonb` 2.4%, `int64_to_numeric` 1%), against about 15% for
 the `pushJsonbValue` path before.
+
+### `merge_agg` loads lazily (2026-09-29)
+
+`merge_agg` used to load its first input right away and merge every later
+input that its document lacked into it. Its state now keeps the first
+stored input as bytes, loads the larger of two inputs first when the heads
+cannot decide, and lets a loaded input that contains the whole state
+replace it (see [Merging](#merging)). It also skips inputs it already has
+by a prefix of their heads, before detoasting them. `mise run bench-sql`,
+release build, median of five runs, milliseconds:
+
+| Path | loads before → after | 877 kB before | after | 3.0 MB before | after |
+|---|---|---|---|---|---|
+| A1 `merge_agg` over one row | 1 → 0 | 170 | 8.5 | 2559 | 22 |
+| A2 `merge_agg` over the row and a newer version | 2 → 1 | 335 | 176 | 5061 | 2533 |
+
+A1 is now the detoast of the value and a copy of it into the result. In
+A2 the newer version is loaded, contains the older one and is the result
+as stored: no merge and no save. The other paths are unchanged. A
+profile of R1 on the 877 kB list puts about 77% of the time in Automerge
+and another 11% in glibc's `malloc`/`free`, mostly for Automerge's
+allocations; linking mimalloc as the Rust global allocator instead was
+tried with the core benchmark and rejected (the 877 kB load about 5%
+faster, the 3 MB text load about 6% slower).

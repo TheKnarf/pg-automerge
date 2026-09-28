@@ -184,6 +184,11 @@ fn merge_agg_trans(
             unsafe { state.get_mut::<MergeAccumulator>() }.expect("just initialized")
         }
     };
+    // An input the state already has (by its heads, read from a prefix of
+    // a flat value) is never detoasted, let alone loaded.
+    if acc.has_heads(&value.heads().or_raise()).or_raise() {
+        return state;
+    }
     value.with_input(|input| acc.add_input(input)).or_raise();
     state
 }
