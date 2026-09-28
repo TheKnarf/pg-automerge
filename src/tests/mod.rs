@@ -18,6 +18,7 @@ include!("merge.rs");
 include!("history.rs");
 include!("notify.rs");
 include!("expanded.rs");
+include!("hardening.rs");
 
 fn actor(n: u8) -> ActorId {
     ActorId::from([n; 16])
