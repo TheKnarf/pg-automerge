@@ -12,6 +12,10 @@
 # document written is a full save of a fork of one shared base document with
 # its own edit; the final jsonb must contain both sessions' edits.
 #
+# Scenario 6 persists only incremental changes (bare change chunks) with
+# merge(doc, $1::bytea), and checks that changes with missing dependencies
+# are rejected without touching the row.
+#
 # Also checks: that the harness detects a lost update (plain overwrite
 # control), the INSERT .. ON CONFLICT DO UPDATE upsert for existing and new
 # rows, REPEATABLE READ raising a serialization failure, and a pg_dump ->
@@ -97,8 +101,8 @@ sql -v base="$BASE" <<'SQL'
 CREATE EXTENSION pg_automerge;
 CREATE TABLE docs (id int PRIMARY KEY, doc automerge NOT NULL);
 CREATE TABLE release (x int);
--- Rows 1..5 start from the shared base; row 4 (new-row upsert) does not exist.
-INSERT INTO docs SELECT i, :'base'::bytea FROM generate_series(1, 5) i WHERE i <> 4;
+-- Rows 1..6 start from the shared base; row 4 (new-row upsert) does not exist.
+INSERT INTO docs SELECT i, :'base'::bytea FROM generate_series(1, 6) i WHERE i <> 4;
 SQL
 
 # ---------------------------------------------------------------------------
@@ -223,6 +227,32 @@ UPDATE docs SET doc = merge(doc, :'b'::bytea::automerge) WHERE id = 5;
 COMMIT;
 SQL
 assert_both 5 rr_a rr_b
+
+# 6. Incremental persistence: each session sends only its own changes (bare
+#    change chunks that depend on the base) as a typed bytea, merged with the
+#    merge(automerge, bytea) overload. B blocks, then applies its chunk on
+#    top of A's committed version.
+A_DOC="$INC_A" B_DOC="$INC_B" run_pair "UPDATE ... SET doc = merge(doc, \$1::bytea) (incremental changes only)" \
+    "UPDATE docs SET doc = merge(doc, :'a'::bytea) WHERE id = 6" \
+    "UPDATE docs SET doc = merge(doc, :'b'::bytea) WHERE id = 6"
+[[ $B_STATUS == 0 ]] || fail "session B: $B_OUT"
+assert_both 6 inc_a inc_b
+# The same chunks again are a no-op, byte for byte.
+before="$(sql -c "SELECT md5(doc::bytea) FROM docs WHERE id = 6")"
+sql -v a="$INC_A" -v b="$INC_B" <<'SQL'
+UPDATE docs SET doc = merge(doc, :'a'::bytea) WHERE id = 6;
+UPDATE docs SET doc = doc || :'b'::bytea WHERE id = 6;
+SQL
+assert_row 6 "md5(doc::bytea)" "$before"
+# Changes whose base the row lacks are rejected (22P02) and the row is kept.
+# Row 4 was created from NEW_A/NEW_B, not from the base.
+sql -c "UPDATE docs SET doc = ''::bytea WHERE id = 4"
+if out="$(sql -v a="$INC_A" 2>&1 <<'SQL'
+UPDATE docs SET doc = merge(doc, :'a'::bytea) WHERE id = 4;
+SQL
+)"; then fail "orphaned incremental changes were accepted"; fi
+grep -q "missing 1 dependency" <<<"$out" || fail "unexpected error for orphaned changes: $out"
+assert_row 4 "doc::jsonb" "{}"
 
 # ---------------------------------------------------------------------------
 # pg_dump round trip

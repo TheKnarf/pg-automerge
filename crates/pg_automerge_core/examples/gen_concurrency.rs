@@ -2,7 +2,9 @@
 //! assignments (`NAME='\x<hex>'`), for `eval` in the script.
 //!
 //! Every fixture is a full save of a fork of one common base document, as a
-//! backend would persist after syncing with a client. Each fork has its own
+//! backend would persist after syncing with a client, except `INC_*`: those
+//! are only the fork's own changes (`save_after(base heads)`), as a backend
+//! persisting incrementally with `merge(doc, $1::bytea)` sends them. Each fork has its own
 //! actor id and makes its own edit, so the correct final state contains all of
 //! them; a lost update shows up as a missing key.
 
@@ -24,7 +26,7 @@ fn main() {
     // One fork per concurrent writer. Each sets its own key and appends to
     // the shared list, so both edits of a pair touch the same object.
     for (i, name) in [
-        "A", "B", "UPSERT_A", "UPSERT_B", "NEW_A", "NEW_B", "RR_A", "RR_B",
+        "A", "B", "UPSERT_A", "UPSERT_B", "NEW_A", "NEW_B", "RR_A", "RR_B", "INC_A", "INC_B",
     ]
     .into_iter()
     .enumerate()
@@ -33,6 +35,11 @@ fn main() {
         let key = name.to_lowercase();
         fork.put(ROOT, key.as_str(), true).unwrap();
         fork.insert(&items, 1, format!("from {key}")).unwrap();
-        print(name, &mut fork);
+        if name.starts_with("INC_") {
+            let changes = fork.save_after(&base.get_heads());
+            println!("{name}='{}'", to_hex_literal(&changes));
+        } else {
+            print(name, &mut fork);
+        }
     }
 }

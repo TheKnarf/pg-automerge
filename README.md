@@ -22,7 +22,9 @@ CREATE TABLE docs (id uuid PRIMARY KEY, doc automerge NOT NULL);
 INSERT INTO docs (id, doc) VALUES ($1, $2)
 ON CONFLICT (id) DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc);
 
-UPDATE docs SET doc = merge(doc, $2::automerge) WHERE id = $1;
+-- Or persist incrementally: $2 is only the new changes (save_incremental()
+-- or save_after(heads)), bound as bytea, applied on top of the stored row.
+UPDATE docs SET doc = merge(doc, $2) WHERE id = $1;
 
 -- Read: automerge casts implicitly to jsonb.
 SELECT doc->>'title' FROM docs WHERE doc @> '{"status": "open"}';
@@ -50,8 +52,9 @@ CREATE INDEX ON docs USING gin ((doc::jsonb));
 | `automerge → bytea` | Explicit cast: the stored Automerge bytes. |
 | `automerge → jsonb` | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
 | `merge(a, b)`, `a \|\| b` | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other. |
+| `merge(doc, changes bytea)`, `doc \|\| changes` | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them). |
 | `merge_agg(automerge)` | Aggregate merge of all non-null inputs. |
-| `automerge_heads(automerge) → text[]` | Current heads, sorted hex change hashes. |
+| `automerge_heads(automerge) → text[]` | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
 | `automerge_contains(a, b) → bool` | Whether `a` already has every change of `b`. |
 
 jsonb mapping: maps/tables → objects, lists → arrays, text → strings,
@@ -61,8 +64,14 @@ concurrent values show Automerge's winner.
 
 Gotchas:
 
-- `merge(doc, $1)` with a parameter the driver types as `bytea` needs
-  `$1::automerge` (function arguments only use implicit casts).
+- `merge(doc, $1)` with a parameter the driver types as `bytea` uses
+  `merge(automerge, bytea)`, which accepts full saves and bare change
+  chunks. An *untyped* literal or parameter (`merge(doc, '\x..')`) resolves
+  to `merge(automerge, automerge)` and must be a complete document; write
+  `'\x..'::bytea` for change chunks.
+- Incremental changes need an existing row: in
+  `INSERT .. VALUES ($1, $2) ON CONFLICT ..` the value is cast to
+  `automerge` on its own first, and bare changes are not a document.
 - `doc || '{"a": 1}'` means `merge`, not jsonb concatenation; write
   `doc::jsonb || '{"a": 1}'`.
 - There is no `automerge` equality or btree opclass, so no

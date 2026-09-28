@@ -5,6 +5,8 @@
 
 use std::ffi::{CStr, CString};
 
+use pg_automerge_core::automerge::ChangeHash;
+use pg_automerge_core::header::{self, HeadsPrefix};
 use pg_automerge_core::{self as am, Error, MergeAccumulator};
 use pgrx::callconv::{Arg, ArgAbi, BoxRet, FcInfo};
 use pgrx::datum::Datum;
@@ -78,6 +80,102 @@ unsafe impl SqlTranslatable for AutomergeDatum {
         Ok(SqlMappingRef::literal("automerge"));
     const RETURN_SQL: Result<ReturnsRef, ReturnsError> =
         Ok(ReturnsRef::One(SqlMappingRef::literal("automerge")));
+}
+
+/// An `automerge` argument that is *not* detoasted up front.
+///
+/// For functions that usually need only the heads, which sit in the first
+/// few hundred bytes of a stored value (see `pg_automerge_core::header`):
+/// [`LazyAutomerge::heads`] fetches just a prefix with
+/// `pg_detoast_datum_slice`, which for an out-of-line value reads only the
+/// TOAST chunks covering it (and for a compressed one decompresses only that
+/// far). The datum is only valid for the current call; this type is only
+/// ever a function argument and never stored.
+pub struct LazyAutomerge(pg_sys::Datum);
+
+impl FromDatum for LazyAutomerge {
+    unsafe fn from_polymorphic_datum(
+        datum: pg_sys::Datum,
+        is_null: bool,
+        _typoid: pg_sys::Oid,
+    ) -> Option<Self> {
+        (!is_null).then_some(Self(datum))
+    }
+}
+
+unsafe impl<'fcx> ArgAbi<'fcx> for LazyAutomerge {
+    unsafe fn unbox_arg_unchecked(arg: Arg<'_, 'fcx>) -> Self {
+        let index = arg.index();
+        unsafe { arg.unbox_arg_using_from_datum() }
+            .unwrap_or_else(|| panic!("argument {index} must not be null"))
+    }
+}
+
+unsafe impl SqlTranslatable for LazyAutomerge {
+    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(LazyAutomerge);
+    const TYPE_ORIGIN: TypeOrigin = TypeOrigin::ThisExtension;
+    const ARGUMENT_SQL: Result<SqlMappingRef, ArgumentError> =
+        Ok(SqlMappingRef::literal("automerge"));
+    const RETURN_SQL: Result<ReturnsRef, ReturnsError> =
+        Ok(ReturnsRef::One(SqlMappingRef::literal("automerge")));
+}
+
+impl LazyAutomerge {
+    /// First prefix fetched; covers the heads of documents with dozens of
+    /// actors and heads.
+    const FIRST_PREFIX: usize = 4096;
+
+    /// Length of the stored bytes (without the varlena header), without
+    /// detoasting.
+    fn len(&self) -> usize {
+        // SAFETY: a non-null varlena datum of this call.
+        let raw = unsafe { pg_sys::toast_raw_datum_size(self.0) };
+        raw.saturating_sub(pg_sys::VARHDRSZ)
+    }
+
+    /// The first `n` stored bytes (fewer if the value is shorter).
+    fn prefix(&self, n: usize) -> Vec<u8> {
+        let count = i32::try_from(n).unwrap_or(i32::MAX);
+        // SAFETY: a non-null varlena datum of this call. The slice is a
+        // fresh palloc'd, 4-byte-header varlena, copied out and freed.
+        unsafe {
+            let datum = self.0.cast_mut_ptr::<pg_sys::varlena>();
+            let slice = pg_sys::pg_detoast_datum_slice(datum, 0, count);
+            let len = pgrx::varlena::varsize_any_exhdr(slice);
+            let data = pgrx::varlena::vardata_any(slice).cast::<u8>();
+            let bytes = std::slice::from_raw_parts(data, len).to_vec();
+            if slice != datum {
+                pg_sys::pfree(slice.cast());
+            }
+            bytes
+        }
+    }
+
+    /// All stored bytes (detoasted and copied, like [`AutomergeDatum`]).
+    fn bytes(&self) -> Vec<u8> {
+        // SAFETY: a non-null varlena datum of this call.
+        unsafe { Vec::<u8>::from_polymorphic_datum(self.0, false, pg_sys::InvalidOid) }
+            .expect("not null")
+    }
+
+    /// The heads, read from as short a prefix as possible; a full load only
+    /// if the value is not a single document chunk.
+    fn heads(&self) -> Result<Vec<ChangeHash>, Error> {
+        let total = self.len();
+        let mut want = total.min(Self::FIRST_PREFIX);
+        loop {
+            let prefix = self.prefix(want);
+            match header::heads_from_prefix(&prefix, total) {
+                HeadsPrefix::Found(heads) => return Ok(heads),
+                HeadsPrefix::NeedMore(n) if prefix.len() == want && want < total => {
+                    want = n.max(want.saturating_mul(2)).min(total);
+                }
+                HeadsPrefix::NeedMore(_) | HeadsPrefix::NotSingleDoc => {
+                    return am::stored_heads(&self.bytes());
+                }
+            }
+        }
+    }
 }
 
 /// Raise a core error as a Postgres ERROR (never returns).
@@ -175,7 +273,7 @@ COMMENT ON TYPE automerge IS
     'An Automerge CRDT document (uncompressed save format). Implicitly castable to jsonb.';
 "#,
     name = "automerge_type",
-    creates = [Type(AutomergeDatum)],
+    creates = [Type(AutomergeDatum), Type(LazyAutomerge)],
 );
 
 // ---------------------------------------------------------------------------
@@ -222,6 +320,18 @@ fn merge(a: AutomergeDatum, b: AutomergeDatum) -> AutomergeDatum {
     }
 }
 
+/// `merge(automerge, bytea)`: apply an Automerge save or bare change chunks
+/// (`save_incremental()` / `save_after()` output, possibly concatenated) on
+/// top of the stored document. Returns `a` unchanged when nothing is new.
+/// Changes with missing dependencies are rejected (22P02), naming them.
+#[pg_extern(immutable, strict, parallel_safe, name = "merge")]
+fn merge_bytea(a: AutomergeDatum, changes: &[u8]) -> AutomergeDatum {
+    match am::merge_changes(a.bytes(), changes).or_raise() {
+        None => a,
+        Some(bytes) => AutomergeDatum(bytes),
+    }
+}
+
 extension_sql!(
     r#"
 CREATE OPERATOR || (
@@ -230,9 +340,15 @@ CREATE OPERATOR || (
     FUNCTION = merge,
     COMMUTATOR = ||
 );
+-- No commutator: there is no bytea || automerge.
+CREATE OPERATOR || (
+    LEFTARG = automerge,
+    RIGHTARG = bytea,
+    FUNCTION = merge
+);
 "#,
     name = "automerge_merge_operator",
-    requires = ["automerge_type", merge],
+    requires = ["automerge_type", merge, merge_bytea],
 );
 
 /// Transition function of `merge_agg`. The state is a [`MergeAccumulator`]
@@ -304,16 +420,25 @@ CREATE AGGREGATE merge_agg(automerge) (
 // Introspection
 // ---------------------------------------------------------------------------
 
-/// Current heads as sorted lowercase hex change hashes.
+/// Current heads as sorted lowercase hex change hashes. Read from the
+/// start of the stored value; the document is not loaded.
 #[pg_extern(immutable, strict, parallel_safe)]
-fn automerge_heads(doc: AutomergeDatum) -> Vec<String> {
-    am::heads(doc.bytes()).or_raise()
+fn automerge_heads(doc: LazyAutomerge) -> Vec<String> {
+    am::heads_to_strings(doc.heads().or_raise())
 }
 
 /// Whether every change of `b` is already in `a`, i.e. `merge(a, b)` is a no-op.
+///
+/// Decided from the two values' heads when possible (no load, and only a
+/// prefix of each is detoasted); otherwise `a` is loaded, `b` never is.
 #[pg_extern(immutable, strict, parallel_safe)]
-fn automerge_contains(a: AutomergeDatum, b: AutomergeDatum) -> bool {
-    am::contains(a.bytes(), b.bytes()).or_raise()
+fn automerge_contains(a: LazyAutomerge, b: LazyAutomerge) -> bool {
+    let heads_b = b.heads().or_raise();
+    let heads_a = a.heads().or_raise();
+    match am::contains_by_heads(&heads_a, &heads_b) {
+        Some(answer) => answer,
+        None => am::contains_loaded(&a.bytes(), &heads_b).or_raise(),
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -737,9 +862,13 @@ mod tests {
     }
 
     fn explain(sql: &str) -> String {
+        explain_with("COSTS OFF", sql)
+    }
+
+    fn explain_with(options: &str, sql: &str) -> String {
         Spi::connect(|client| {
             client
-                .select(&format!("EXPLAIN (COSTS OFF) {sql}"), None, &[])
+                .select(&format!("EXPLAIN ({options}) {sql}"), None, &[])
                 .unwrap()
                 .map(|row| row.get::<String>(1).unwrap().unwrap_or_default())
                 .collect::<Vec<_>>()
@@ -1278,6 +1407,300 @@ mod tests {
             &args,
         );
         assert!(symmetric);
+    }
+
+    // -----------------------------------------------------------------------
+    // merge(automerge, bytea) and the heads fast path
+    // -----------------------------------------------------------------------
+
+    /// The extension functions and operators a one-column view over `expr`
+    /// depends on, as `regprocedure` / `regoperator` text, sorted, followed
+    /// by `=> <result type>`. This is what the parser resolved `expr` to.
+    /// (Built-in objects are pinned and have no pg_depend entries, so e.g.
+    /// jsonb's `||` shows up only through the result type.)
+    fn resolved(expr: &str) -> Vec<String> {
+        Spi::run("DROP VIEW IF EXISTS resolve_v").unwrap();
+        Spi::run(&format!(
+            "CREATE TEMP VIEW resolve_v AS SELECT {expr} AS x FROM resolve_t"
+        ))
+        .unwrap();
+        let mut deps: Vec<String> = one(
+            "SELECT coalesce(array_agg(x ORDER BY x), '{}') FROM ( \
+               SELECT coalesce(p.oid::regprocedure::text, o.oid::regoperator::text) AS x \
+             FROM pg_depend d JOIN pg_rewrite r ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid \
+             LEFT JOIN pg_proc p ON d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid \
+             LEFT JOIN pg_operator o ON d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid \
+             WHERE r.ev_class = 'resolve_v'::regclass AND (p.oid IS NOT NULL OR o.oid IS NOT NULL)) s",
+            &[],
+        );
+        let typ: String = one(
+            "SELECT atttypid::regtype::text FROM pg_attribute \
+             WHERE attrelid = 'resolve_v'::regclass AND attname = 'x'",
+            &[],
+        );
+        deps.push(format!("=> {typ}"));
+        deps
+    }
+
+    #[pg_test]
+    fn merge_overloads_resolve_unambiguously() {
+        Spi::run("CREATE TEMP TABLE resolve_t (d automerge, b bytea)").unwrap();
+        let mm = "merge(automerge,automerge)";
+        let mb = "merge(automerge,bytea)";
+        let op_mm = "||(automerge,automerge)";
+        let op_mb = "||(automerge,bytea)";
+        let am = "=> automerge";
+        for (expr, expected) in [
+            ("d || d", vec![op_mm, am]),
+            ("d || b", vec![op_mb, am]),
+            ("d || '\\x'::bytea", vec![op_mb, am]),
+            // An untyped literal takes the other operand's type.
+            ("d || '\\x'", vec![op_mm, am]),
+            // jsonb || jsonb (built in, so only the cast is listed).
+            (
+                "d::jsonb || '{\"a\": 1}'",
+                vec!["automerge_to_jsonb(automerge)", "=> jsonb"],
+            ),
+            ("merge(d, d)", vec![mm, am]),
+            ("merge(d, b)", vec![mb, am]),
+            ("merge(d, '\\x'::bytea)", vec![mb, am]),
+            // Unknown literal / NULL: both candidates accept it, and it is
+            // assumed to have the known argument's type (automerge).
+            ("merge(d, '\\x')", vec![mm, am]),
+            ("merge(d, NULL)", vec![mm, am]),
+        ] {
+            assert_eq!(resolved(expr), expected, "{expr}");
+        }
+        // A typed bytea parameter (what drivers send) picks the bytea
+        // overload without a cast; an untyped one is inferred as automerge.
+        Spi::run("PREPARE typed_p(bytea) AS SELECT merge(d, $1), d || $1 FROM resolve_t").unwrap();
+        Spi::run("PREPARE untyped_p AS SELECT merge(d, $1) FROM resolve_t").unwrap();
+        let types: String = one(
+            "SELECT string_agg(name || '=' || parameter_types::text, ' ' ORDER BY name) \
+             FROM pg_prepared_statements WHERE name IN ('typed_p', 'untyped_p')",
+            &[],
+        );
+        assert_eq!(types, "typed_p={bytea} untyped_p={automerge}");
+        let plan = explain_with("VERBOSE, COSTS OFF", "EXECUTE typed_p('\\x')");
+        assert!(plan.contains("merge(d, '\\x'::bytea)"), "{plan}");
+        assert!(plan.contains("(d || '\\x'::bytea)"), "{plan}");
+        Spi::run("DEALLOCATE typed_p; DEALLOCATE untyped_p").unwrap();
+        // Labels are truthful and match merge(automerge, automerge).
+        let labels: String = one(
+            "SELECT string_agg(p.oid::regprocedure || ':' || provolatile::text || proisstrict::text || proparallel::text, ' ' ORDER BY p.oid::regprocedure::text) \
+             FROM pg_proc p WHERE proname = 'merge'",
+            &[],
+        );
+        assert_eq!(
+            labels,
+            "merge(automerge,automerge):itrues merge(automerge,bytea):itrues"
+        );
+    }
+
+    #[pg_test]
+    fn merge_bytea_persists_incremental_changes() {
+        let mut doc = AutoCommit::new().with_actor(actor(1));
+        doc.put(ROOT, "n", 0i64).unwrap();
+        Spi::run("CREATE TEMP TABLE inc (id int PRIMARY KEY, doc automerge NOT NULL)").unwrap();
+        Spi::run_with_args("INSERT INTO inc VALUES (1, $1)", &[doc.save().into()]).unwrap();
+        doc.save_incremental();
+
+        // One chunk per update, bound as a typed bytea parameter (Vec<u8>),
+        // no cast in the SQL.
+        let update = "UPDATE inc SET doc = merge(doc, $1) WHERE id = 1";
+        for i in 1..=3i64 {
+            doc.put(ROOT, "n", i).unwrap();
+            doc.put(ROOT, format!("k{i}"), i).unwrap();
+            Spi::run_with_args(update, &[doc.save_incremental().into()]).unwrap();
+        }
+        // Several chunks concatenated, through a PREPAREd statement with a
+        // bytea parameter, and through the operator.
+        Spi::run("PREPARE persist(bytea) AS UPDATE inc SET doc = merge(doc, $1) WHERE id = 1")
+            .unwrap();
+        let mut chunks = Vec::new();
+        for i in 4..=5i64 {
+            doc.put(ROOT, "n", i).unwrap();
+            doc.commit();
+            chunks.extend(doc.save_incremental());
+        }
+        let hex = pg_automerge_core::encoding::to_hex_literal(&chunks);
+        Spi::run(&format!("EXECUTE persist('{hex}')")).unwrap();
+        Spi::run("DEALLOCATE persist").unwrap();
+        doc.put(ROOT, "via", "operator").unwrap();
+        Spi::run_with_args(
+            "UPDATE inc SET doc = doc || $1 WHERE id = 1",
+            &[doc.save_incremental().into()],
+        )
+        .unwrap();
+
+        // The stored value is exactly the normalized full document.
+        let stored_bytes: Vec<u8> = one("SELECT doc::bytea FROM inc", &[]);
+        assert_eq!(stored_bytes, doc.document().save_nocompress());
+        let json: JsonB = one("SELECT doc::jsonb FROM inc", &[]);
+        assert_eq!(
+            json.0,
+            json!({ "n": 5, "k1": 1, "k2": 2, "k3": 3, "via": "operator" })
+        );
+
+        // No-ops return the input bytes: empty, already-applied chunks, the
+        // full save, NULL is NULL.
+        let full = doc.save();
+        let noop: bool = one(
+            "SELECT merge(doc, ''::bytea)::bytea = doc::bytea \
+                AND merge(doc, $1)::bytea = doc::bytea \
+                AND (doc || $1)::bytea = doc::bytea \
+                AND merge(doc, NULL::bytea) IS NULL FROM inc",
+            &[full.into()],
+        );
+        assert!(noop);
+        // A full save of a concurrent fork merges like merge(a, b).
+        let mut fork = doc.fork().with_actor(actor(2));
+        fork.put(ROOT, "fork", true).unwrap();
+        let fork_save = fork.save();
+        let same: bool = one(
+            "SELECT automerge_heads(merge(doc, $1)) = automerge_heads(merge(doc, $1::automerge)) \
+                AND merge(doc, $1)::jsonb = merge(doc, $1::automerge)::jsonb FROM inc",
+            &[fork_save.into()],
+        );
+        assert!(same);
+    }
+
+    #[pg_test]
+    fn merge_bytea_rejects_bad_input() {
+        let mut doc = AutoCommit::new().with_actor(actor(1));
+        doc.put(ROOT, "x", 1i64).unwrap();
+        let base = doc.save();
+        let base_hex = pg_automerge_core::encoding::to_hex_literal(&base);
+        doc.put(ROOT, "y", 2i64).unwrap();
+        let skipped = doc.get_heads()[0].to_string();
+        doc.save_incremental();
+        doc.put(ROOT, "z", 3i64).unwrap();
+        let orphan = pg_automerge_core::encoding::to_hex_literal(&doc.save_incremental());
+
+        let err = sql_error(&format!(
+            "SELECT merge('{base_hex}'::bytea::automerge, '{orphan}'::bytea)"
+        ));
+        assert_eq!(
+            err,
+            format!(
+                "22P02: invalid automerge changes: missing 1 dependency that neither the document nor the input contains: {skipped}"
+            )
+        );
+        for bad in ["\\x0102", "\\x856f4a83", "\\xdeadbeefdeadbeefdeadbeef"] {
+            let err = sql_error(&format!(
+                "SELECT merge('{base_hex}'::bytea::automerge, '{bad}'::bytea)"
+            ));
+            assert!(
+                err.starts_with("22P02: invalid automerge changes: "),
+                "{bad}: {err}"
+            );
+        }
+        // A good chunk followed by garbage fails as a whole.
+        let err = sql_error(&format!(
+            "SELECT merge('\\x'::automerge, '{base_hex}'::bytea || '\\x00'::bytea)"
+        ));
+        assert!(err.starts_with("22P02: "), "{err}");
+        // An orphan passed as a literal without ::bytea resolves to the
+        // automerge overload and is rejected by the automerge input function.
+        let err = sql_error(&format!(
+            "SELECT merge('{base_hex}'::bytea::automerge, '{orphan}')"
+        ));
+        assert_eq!(
+            err,
+            "22P02: invalid automerge document: changes are missing dependencies"
+        );
+    }
+
+    #[pg_test]
+    fn heads_fast_path_matches_rust_for_every_storage_form() {
+        Spi::run("CREATE TEMP TABLE hf (id int PRIMARY KEY, doc automerge NOT NULL, heads text[])")
+            .unwrap();
+        // Tiny (inline, short varlena header), compressible (inline
+        // compressed), large compressible (external compressed), large
+        // incompressible (external uncompressed), many heads, empty.
+        let mut cases: Vec<AutoCommit> = Vec::new();
+        // Distinct actors throughout: the pairwise merges below would fail
+        // on two histories claiming the same (actor, seq).
+        let mut tiny = AutoCommit::new().with_actor(actor(11));
+        tiny.put(ROOT, "x", 1i64).unwrap();
+        cases.push(tiny);
+        for (n, len) in [(12, 6_000usize), (13, 400_000)] {
+            let mut d = AutoCommit::new().with_actor(actor(n));
+            d.put(ROOT, "pad", "abcdefgh".repeat(len / 8)).unwrap();
+            cases.push(d);
+        }
+        // 150 concurrent forks of one base: 150 heads, 150 actors.
+        let mut base = AutoCommit::new().with_actor(actor(14));
+        base.put(ROOT, "base", true).unwrap();
+        let mut wide = base.fork().with_actor(actor(15));
+        for i in 0..150u8 {
+            let mut id = [0xee; 16];
+            id[0] = i;
+            let mut f = base.fork().with_actor(ActorId::from(id));
+            f.put(ROOT, format!("k{i}"), i64::from(i)).unwrap();
+            wide.merge(&mut f).unwrap();
+        }
+        cases.push(wide);
+        cases.push(AutoCommit::new());
+        for (i, mut d) in cases.into_iter().enumerate() {
+            let mut expected: Vec<String> = d.get_heads().iter().map(ToString::to_string).collect();
+            expected.sort();
+            Spi::run_with_args(
+                "INSERT INTO hf VALUES ($1, $2, $3)",
+                &[(i as i32).into(), d.save().into(), expected.into()],
+            )
+            .unwrap();
+        }
+        Spi::run_with_args(
+            "INSERT INTO hf VALUES (100, $1, $2)",
+            &[
+                large_doc().save().into(),
+                {
+                    let mut h: Vec<String> = large_doc()
+                        .get_heads()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                    h.sort();
+                    h
+                }
+                .into(),
+            ],
+        )
+        .unwrap();
+        let bad: i64 = one(
+            "SELECT count(*) FROM hf WHERE automerge_heads(doc) IS DISTINCT FROM heads",
+            &[],
+        );
+        assert_eq!(bad, 0);
+        // The storage forms above really occur.
+        let forms: String = one(
+            "SELECT string_agg(DISTINCT CASE \
+                 WHEN pg_column_size(doc) < octet_length(doc::bytea) THEN 'compressed' \
+                 ELSE 'plain' END, ',') FROM hf",
+            &[],
+        );
+        assert_eq!(forms, "compressed,plain");
+        let n_heads: i32 = one(
+            "SELECT cardinality(automerge_heads(doc)) FROM hf WHERE id = 3",
+            &[],
+        );
+        assert_eq!(n_heads, 150);
+        // contains agrees with the definition (a merge would be a no-op),
+        // over all pairs, using heads-only and loading decisions.
+        let disagree: i64 = one(
+            "SELECT count(*) FROM hf a, hf b \
+             WHERE automerge_contains(a.doc, b.doc) \
+                   IS DISTINCT FROM (automerge_heads(merge(a.doc, b.doc)) = automerge_heads(a.doc))",
+            &[],
+        );
+        assert_eq!(disagree, 0);
+        let true_pairs: i64 = one(
+            "SELECT count(*) FROM hf a, hf b WHERE automerge_contains(a.doc, b.doc)",
+            &[],
+        );
+        // Everything contains itself (6) and the empty document (5 more).
+        assert_eq!(true_pairs, 11);
     }
 }
 

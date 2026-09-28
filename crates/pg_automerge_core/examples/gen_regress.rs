@@ -28,6 +28,8 @@ fn main() {
     let eggs = bob.insert_object(&items, 1, ObjType::Map).unwrap();
     bob.put(&eggs, "name", "eggs").unwrap();
     bob.put(&eggs, "done", false).unwrap();
+    // Only bob's own changes: what a backend persisting incrementally sends.
+    let bob_changes = bob.save_after(&base.get_heads());
 
     let mut types = AutoCommit::new().with_actor(ActorId::from([0x02u8; 16]));
     types.put(ROOT, "str", "hello").unwrap();
@@ -53,6 +55,7 @@ fn main() {
     println!("\\set base '\\{}'", hex(&mut base));
     println!("\\set alice '\\{}'", hex(&mut alice));
     println!("\\set bob '\\{}'", hex(&mut bob));
+    println!("\\set bob_changes '\\{}'", to_hex_literal(&bob_changes));
     println!("\\set types '\\{}'", hex(&mut types));
     // A compressed, incremental save (document chunk + a trailing change).
     let mut inc = base.fork().with_actor(ActorId::from([0x03u8; 16]));
