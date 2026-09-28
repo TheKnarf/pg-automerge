@@ -8,62 +8,32 @@
 # Installs a release build into the pgrx-managed pg18 and uses database
 # pg_automerge_bench. Not part of `mise run test` (it takes minutes).
 #
-# Env: PGRX_PG_PORT (default 28818), PG_CONFIG (default: pgrx's pg18),
-# BENCH_DOCS (default "text3mb items20k items2k"), BENCH_REPS (default 3),
-# BENCH_CASES (a grep -E pattern selecting cases, default all),
-# BENCH_REUSE=1 (keep the database and fixtures of a previous run).
+# Env: see tests/lib.sh; also BENCH_DOCS (default "text3mb items20k
+# items2k"), BENCH_REPS (default 3), BENCH_CASES (a grep -E pattern
+# selecting cases, default all), BENCH_REUSE=1 (keep the database and
+# fixtures of a previous run).
 
-set -euo pipefail
+# shellcheck source=tests/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
-
-PG_CONFIG="${PG_CONFIG:-$(sed -n 's/^pg18 *= *"\(.*\)"/\1/p' "${PGRX_HOME:-$HOME/.pgrx}/config.toml")}"
-[[ -x "$PG_CONFIG" ]] || { echo "pg_config for pg18 not found (run mise run pgrx-init)" >&2; exit 1; }
-BINDIR="$("$PG_CONFIG" --bindir)"
-PORT="${PGRX_PG_PORT:-28818}"
 DB=pg_automerge_bench
 DOCS="${BENCH_DOCS:-text3mb items20k items2k}"
 REPS="${BENCH_REPS:-3}"
 CASE_FILTER="${BENCH_CASES:-.}"
-WORK="$(mktemp -d)"
-STARTED_SERVER=0
 
+# Progress goes to stderr: stdout is the results table.
 log() { printf '==> %s\n' "$*" >&2; }
-sql_on() {
-    local db="$1"; shift
-    PGOPTIONS="-c client_min_messages=warning" "$BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 -h localhost -p "$PORT" -d "$db" "$@"
-}
-sql() { sql_on "$DB" "$@"; }
-
-cleanup() {
-    local status=$?
-    if [[ $STARTED_SERVER == 1 ]]; then
-        log "stopping Postgres"
-        cargo pgrx stop pg18 >/dev/null 2>&1 || true
-    fi
-    rm -rf "$WORK"
-    exit "$status"
-}
-trap cleanup EXIT
 
 log "generating fixtures"
 cargo run --release -q -p pg_automerge_core --example gen_bench >"$WORK/fixtures.sql"
 
-log "installing extension (release build)"
-cargo pgrx install --release --pg-config "$PG_CONFIG" >"$WORK/install.log" 2>&1 \
-    || { cat "$WORK/install.log" >&2; exit 1; }
-
-if ! "$BINDIR/pg_isready" -q -h localhost -p "$PORT"; then
-    log "starting Postgres on port $PORT"
-    cargo pgrx start pg18 >/dev/null
-    STARTED_SERVER=1
-fi
+install_extension --release
+start_server
 
 if [[ "${BENCH_REUSE:-0}" == 1 ]] && [[ "$(sql_on postgres -c "SELECT count(*) FROM pg_database WHERE datname = '$DB'")" == 1 ]]; then
     log "reusing database $DB"
 else
-    sql_on postgres -c "DROP DATABASE IF EXISTS $DB WITH (FORCE)" -c "CREATE DATABASE $DB"
+    create_db
     sql -c "CREATE EXTENSION pg_automerge"
     log "loading fixtures"
     sql -f "$WORK/fixtures.sql" >/dev/null

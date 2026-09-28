@@ -16,6 +16,7 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
+#[cfg(feature = "test-hooks")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use automerge::{Automerge, Change, ChangeHash};
@@ -27,9 +28,12 @@ use crate::{
 };
 
 /// Number of [`LoadedDoc`]s alive in this process (for leak tests).
+#[cfg(feature = "test-hooks")]
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
-/// How many [`LoadedDoc`]s exist right now in this process.
+/// How many [`LoadedDoc`]s exist right now in this process (only with the
+/// `test-hooks` feature, which the extension's pg_tests enable).
+#[cfg(feature = "test-hooks")]
 pub fn live_count() -> usize {
     LIVE.load(Ordering::Relaxed)
 }
@@ -50,6 +54,7 @@ pub struct LoadedDoc {
     unverified: bool,
 }
 
+#[cfg(feature = "test-hooks")]
 impl Drop for LoadedDoc {
     fn drop(&mut self) {
         LIVE.fetch_sub(1, Ordering::Relaxed);
@@ -64,6 +69,7 @@ impl LoadedDoc {
         if let Some(bytes) = stored {
             let _ = cell.set(bytes);
         }
+        #[cfg(feature = "test-hooks")]
         LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             doc,

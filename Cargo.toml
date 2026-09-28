@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 [features]
 default = ["pg18"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
-pg_test = []
+pg_test = ["pg_automerge_core/test-hooks"]
 
 [dependencies]
 pgrx = "=0.19.3"

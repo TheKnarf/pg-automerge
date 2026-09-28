@@ -1,3 +1,3 @@
--- this setup file is run immediately after the regression database is (re)created
--- the file is optional but you likely want to create the extension
+-- Run by `mise run regress` (cargo pgrx regress --resetdb) right after the
+-- regression database is created: install the extension being tested.
 CREATE EXTENSION pg_automerge;

@@ -19,18 +19,24 @@ run = "cargo pgrx init --pg{{env.PG_VERSION}} download"
 
 [tasks.test]
 description = "Run core unit tests, #[pg_test] tests in a pgrx-managed Postgres, then the two-session concurrency and LISTEN/NOTIFY tests"
+# The extension is installed once (a dev build without the pg_test
+# instrumentation) for both multi-session scripts.
 run = [
   "cargo test -p pg_automerge_core",
   "cargo pgrx test pg{{env.PG_VERSION}}",
-  "bash tests/concurrency.sh",
-  "bash tests/notify.sh",
+  "bash -c 'source tests/lib.sh && install_extension'",
+  "PG_AUTOMERGE_INSTALLED=1 bash tests/concurrency.sh",
+  "PG_AUTOMERGE_INSTALLED=1 bash tests/notify.sh",
 ]
 
 [tasks.regress]
-description = "Run pg_regress tests in tests/pg_regress"
+description = "Check the regress fixtures against their generator, then run pg_regress tests in tests/pg_regress"
 # --resetdb: recreate the regress database so setup.sql installs the
 # current extension SQL (a reused database keeps the old objects).
-run = "cargo pgrx regress pg{{env.PG_VERSION}} --resetdb"
+run = [
+  "bash tests/check_regress_fixtures.sh",
+  "cargo pgrx regress pg{{env.PG_VERSION}} --resetdb",
+]
 
 [tasks.run]
 description = "Install the extension and open psql against a pgrx-managed Postgres"

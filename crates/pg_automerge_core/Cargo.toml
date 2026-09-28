@@ -4,6 +4,10 @@ version = "0.0.0"
 edition = "2024"
 description = "Postgres-independent Automerge logic for the pg_automerge extension"
 
+[features]
+# Instrumentation for the extension's tests: loaded::live_count().
+test-hooks = []
+
 [dependencies]
 automerge.workspace = true
 serde_json.workspace = true

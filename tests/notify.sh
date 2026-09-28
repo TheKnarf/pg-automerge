@@ -22,61 +22,25 @@
 # row, a key flipping back and forth) all arriving, distinct by seq;
 # a 150-head document degrading to "truncated" without failing the write.
 #
-# Env: PGRX_PG_PORT (default 28818), PG_CONFIG (default: pgrx's pg18).
+# Env: see tests/lib.sh.
 
-set -euo pipefail
+# shellcheck source=tests/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
-
-PG_CONFIG="${PG_CONFIG:-$(sed -n 's/^pg18 *= *"\(.*\)"/\1/p' "${PGRX_HOME:-$HOME/.pgrx}/config.toml")}"
-[[ -x "$PG_CONFIG" ]] || { echo "pg_config for pg18 not found (run mise run pgrx-init)" >&2; exit 1; }
-BINDIR="$("$PG_CONFIG" --bindir)"
-PORT="${PGRX_PG_PORT:-28818}"
 DB=pg_automerge_notify
+DROP_DBS=("$DB")
 CHANNEL=docs_changed
-WORK="$(mktemp -d)"
-STARTED_SERVER=0
 LISTENER_PID=
 
-log() { printf '==> %s\n' "$*"; }
-fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
-
-sql_on() {
-    local db="$1"; shift
-    PGOPTIONS="-c client_min_messages=warning" "$BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 -h localhost -p "$PORT" -d "$db" "$@"
-}
-sql() { sql_on "$DB" "$@"; }
-
-cleanup() {
-    local status=$?
+on_exit() {
     exec 3>&- 2>/dev/null || true
     [[ -n "$LISTENER_PID" ]] && kill "$LISTENER_PID" 2>/dev/null || true
     wait 2>/dev/null || true
-    if [[ $STARTED_SERVER == 1 ]] || "$BINDIR/pg_isready" -q -h localhost -p "$PORT"; then
-        sql_on postgres -c "DROP DATABASE IF EXISTS $DB WITH (FORCE)" >/dev/null 2>&1 || true
-    fi
-    if [[ $STARTED_SERVER == 1 ]]; then
-        log "stopping Postgres"
-        cargo pgrx stop pg18 >/dev/null 2>&1 || true
-    fi
-    if [[ $status != 0 && -f "$WORK/listener.out" ]]; then
+    if [[ $1 != 0 && -f "$WORK/listener.out" ]]; then
         echo "--- listener output:" >&2
         cat "$WORK/listener.out" >&2
     fi
-    rm -rf "$WORK"
-    if [[ $status == 0 ]]; then log "all notify checks passed"; else echo "notify test FAILED" >&2; fi
-    exit "$status"
-}
-trap cleanup EXIT
-
-wait_for() {
-    local what="$1" query="$2"
-    for _ in $(seq 1 500); do
-        [[ "$(sql -c "$query")" == t ]] && return 0
-        sleep 0.02
-    done
-    fail "timed out waiting for: $what"
+    if [[ $1 == 0 ]]; then log "all notify checks passed"; else echo "notify test FAILED" >&2; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -86,17 +50,9 @@ wait_for() {
 log "generating fixture documents"
 eval "$(cargo run -q -p pg_automerge_core --example gen_concurrency)"
 
-log "installing extension"
-cargo pgrx install --pg-config "$PG_CONFIG" >"$WORK/install.log" 2>&1 \
-    || { cat "$WORK/install.log" >&2; fail "cargo pgrx install"; }
-
-if ! "$BINDIR/pg_isready" -q -h localhost -p "$PORT"; then
-    log "starting Postgres on port $PORT"
-    cargo pgrx start pg18 >/dev/null
-    STARTED_SERVER=1
-fi
-
-sql_on postgres -c "DROP DATABASE IF EXISTS $DB WITH (FORCE)" -c "CREATE DATABASE $DB"
+install_extension
+start_server
+create_db
 sql <<SQL
 CREATE EXTENSION pg_automerge;
 CREATE TABLE docs (id int PRIMARY KEY, doc automerge NOT NULL, title text);
