@@ -1,8 +1,13 @@
 [package]
 name = "pg_automerge_core"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.98"
 description = "Postgres-independent Automerge logic for the pg_automerge extension"
+readme = "../../README.md"
+keywords = ["automerge", "crdt", "postgres"]
+categories = ["database"]
+publish = false
 
 [features]
 # Instrumentation for the extension's tests: loaded::live_count().

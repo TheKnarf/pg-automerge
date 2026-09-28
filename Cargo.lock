@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "pg_automerge"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pg_automerge_core",
  "pgrx",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "pg_automerge_core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "automerge",
  "serde_json",

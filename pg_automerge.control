@@ -1,4 +1,4 @@
-comment = 'Automerge CRDT documents as a native Postgres type'
+comment = 'Automerge CRDT documents: jsonb queries, merges, history and change notifications'
 default_version = '@CARGO_VERSION@'
 module_pathname = 'pg_automerge'
 relocatable = false
