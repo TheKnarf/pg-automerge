@@ -1597,7 +1597,7 @@ mod tests {
     use pg_automerge_core::automerge::{ActorId, AutoCommit, ObjType, ROOT};
     use pgrx::prelude::*;
     use pgrx::{JsonB, datum::DatumWithOid};
-    use serde_json::json;
+    use pg_automerge_core::serde_json::{self, json};
 
     fn actor(n: u8) -> ActorId {
         ActorId::from([n; 16])
@@ -4264,17 +4264,16 @@ mod tests {
     }
 }
 
-/// This module is required by `cargo pgrx test` invocations.
-/// It must be visible at the root of your extension crate.
+/// Hooks of the `cargo pgrx test` framework (it calls these by path, so the
+/// module must sit at the crate root).
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {
-        // perform one-off initialization when the pg_test framework starts
-    }
+    /// One-off setup before the test Postgres starts: nothing needed.
+    pub fn setup(_options: Vec<&str>) {}
 
+    /// Extra postgresql.conf settings for the test Postgres: none.
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // return any postgresql.conf settings that are required for your tests
         vec![]
     }
 }
