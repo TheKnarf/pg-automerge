@@ -4,7 +4,7 @@
 //! A payload is compact JSON:
 //!
 //! ```json
-//! {"table":"public.docs","op":"UPDATE","key":{"id":1},
+//! {"table":"public.docs","op":"UPDATE","seq":7,"key":{"id":1},
 //!  "columns":{"doc":{"heads":["ab.."],"prev_heads":["cd.."]}}}
 //! ```
 //!
@@ -12,6 +12,9 @@
 //! trigger must never fail a write because of that, so [`Event::payload`]
 //! drops parts until the payload fits and then adds `"truncated":true`:
 //! first the heads (column names stay), then the column list, then the key.
+//! `seq` is always kept: it makes every payload distinct, since `NOTIFY`
+//! silently drops a notification whose channel and payload equal an earlier
+//! one of the same transaction.
 
 use std::fmt::Write as _;
 
@@ -58,6 +61,11 @@ pub struct Event {
     /// Schema-qualified, quoted as needed (`quote_qualified_identifier`).
     pub table: String,
     pub op: Op,
+    /// Per-backend event number, increasing with every notification the
+    /// backend sends. Kept in every rendered form so that two events of one
+    /// transaction never have identical payloads (which `NOTIFY` would
+    /// collapse into one).
+    pub seq: u64,
     /// Key column name and JSON value text, in trigger argument order (new
     /// row for INSERT/UPDATE, old row for DELETE).
     pub key: Vec<(String, String)>,
@@ -115,7 +123,7 @@ impl Event {
         let mut out = String::with_capacity(256);
         out.push_str("{\"table\":");
         push_str(&mut out, &self.table);
-        let _ = write!(out, ",\"op\":\"{}\"", self.op.as_str());
+        let _ = write!(out, ",\"op\":\"{}\",\"seq\":{}", self.op.as_str(), self.seq);
         if detail < Detail::NoKey {
             out.push_str(",\"key\":");
             push_key(&mut out, &self.key);
@@ -160,7 +168,7 @@ impl Event {
     /// form, or with the heads left out, then also the column list, then
     /// also the key (each with `"truncated":true`). If even the last form
     /// is too long (a `max_len` below a few hundred bytes), only
-    /// `{"op":..,"truncated":true}`.
+    /// `{"op":..,"seq":..,"truncated":true}`.
     pub fn payload(&self, max_len: usize) -> String {
         for detail in [
             Detail::Full,
@@ -173,7 +181,11 @@ impl Event {
                 return out;
             }
         }
-        format!("{{\"op\":\"{}\",\"truncated\":true}}", self.op.as_str())
+        format!(
+            "{{\"op\":\"{}\",\"seq\":{},\"truncated\":true}}",
+            self.op.as_str(),
+            self.seq
+        )
     }
 }
 
@@ -190,6 +202,7 @@ mod tests {
         Event {
             table: "public.docs".into(),
             op: Op::Update,
+            seq: 7,
             key: vec![
                 ("id".into(), "42".into()),
                 ("tenant".into(), "\"a\\\"b\"".into()),
@@ -222,6 +235,7 @@ mod tests {
             json!({
                 "table": "public.docs",
                 "op": "UPDATE",
+                "seq": 7,
                 "key": {"id": 42, "tenant": "a\"b"},
                 "columns": {
                     "doc": {"heads": [hash(0), hash(1)], "prev_heads": [hash(999)]},
@@ -267,6 +281,7 @@ mod tests {
             json!({
                 "table": "public.docs",
                 "op": "UPDATE",
+                "seq": 7,
                 "key": {"id": 42, "tenant": "a\"b"},
                 "columns": {"doc": {}, "we\"ird": {}},
                 "truncated": true,
@@ -294,7 +309,7 @@ mod tests {
         let v = parse(&e.payload(MAX_PAYLOAD));
         assert_eq!(
             v,
-            json!({"table": "public.docs", "op": "UPDATE", "truncated": true})
+            json!({"table": "public.docs", "op": "UPDATE", "seq": 7, "truncated": true})
         );
         // Many columns but a small key: the key stays.
         let mut e = event(1);
@@ -317,9 +332,35 @@ mod tests {
             let v = parse(&p);
             assert_eq!(v["op"], "UPDATE");
             if p.len() > max {
-                assert_eq!(v, json!({"op": "UPDATE", "truncated": true}));
+                assert_eq!(v, json!({"op": "UPDATE", "seq": 7, "truncated": true}));
             }
         }
+    }
+
+    #[test]
+    fn seq_distinguishes_otherwise_identical_events() {
+        // NOTIFY drops a notification whose payload equals an earlier one of
+        // the same transaction; INSERT, DELETE, INSERT of the same row must
+        // still give three distinct payloads, at every level of detail.
+        let mut e = event(1);
+        e.op = Op::Insert;
+        for max in [MAX_PAYLOAD, 300, 120, 60, 0] {
+            let a = Event {
+                seq: 1,
+                ..e.clone()
+            }
+            .payload(max);
+            let b = Event {
+                seq: 3,
+                ..e.clone()
+            }
+            .payload(max);
+            assert_ne!(a, b, "max {max}");
+            assert_eq!(parse(&a)["seq"], 1);
+            assert_eq!(parse(&b)["seq"], 3);
+        }
+        e.seq = u64::MAX;
+        assert_eq!(parse(&e.payload(MAX_PAYLOAD))["seq"], json!(u64::MAX));
     }
 
     #[test]

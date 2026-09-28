@@ -211,7 +211,7 @@ SELECT (:'base'::automerge || :'alice'::automerge || :'bob'::automerge)->>'title
 DROP FUNCTION apply_all(int, bytea[]);
 
 -- Change notifications: an AFTER ROW trigger that sends
---   NOTIFY docs_changed, '{"table":"public.docs","op":"UPDATE","key":{"id":1},
+--   NOTIFY docs_changed, '{"table":"public.docs","op":"UPDATE","seq":1,"key":{"id":1},
 --     "columns":{"doc":{"heads":[...],"prev_heads":[...]}}}'
 -- when a row is inserted or deleted, or its automerge heads change. A
 -- backend that ran LISTEN docs_changed fetches what it lacks with

@@ -1335,12 +1335,24 @@ fn notify_row(trigger: &pgrx::PgTrigger<'_>) {
     let payload = Event {
         table: table_name(),
         op,
+        seq: next_notify_seq(),
         key,
         old_key,
         columns,
     }
     .payload(am::notify::MAX_PAYLOAD);
     send_notification(channel, &payload);
+}
+
+/// Per-backend notification counter (each backend is its own process).
+/// Every payload carries a fresh number, so no two notifications of one
+/// transaction are identical: `Async_Notify` silently drops a notification
+/// whose channel and payload equal an earlier one of the same transaction,
+/// which would lose e.g. the second INSERT of INSERT, DELETE, INSERT.
+static NOTIFY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_notify_seq() -> u64 {
+    NOTIFY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 fn send_notification(channel: &str, payload: &str) {
@@ -3386,9 +3398,13 @@ mod tests {
     // automerge_notify()
     // -----------------------------------------------------------------------
 
-    /// Notifications sent so far in this backend (channel, parsed payload),
-    /// clearing the list.
+    /// Notifications sent so far in this backend (channel, parsed payload
+    /// without its `seq`), clearing the list. Checks that `seq` increases
+    /// strictly across all notifications of the backend.
     fn take_sent() -> Vec<(String, serde_json::Value)> {
+        thread_local! {
+            static LAST_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
         super::SENT_NOTIFICATIONS.with(|s| {
             s.borrow_mut()
                 .drain(..)
@@ -3398,10 +3414,67 @@ mod tests {
                         !payload.contains(": ") && !payload.contains(", "),
                         "not compact: {payload}"
                     );
-                    (channel, serde_json::from_str(&payload).unwrap())
+                    let mut v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                    let seq = v
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("seq")
+                        .and_then(|s| s.as_u64())
+                        .unwrap_or_else(|| panic!("no seq in {payload}"));
+                    assert!(seq > LAST_SEQ.get(), "seq {seq} after {}", LAST_SEQ.get());
+                    LAST_SEQ.set(seq);
+                    (channel, v)
                 })
                 .collect()
         })
+    }
+
+    #[pg_test]
+    fn notify_trigger_repeated_identical_events_are_distinct() {
+        // NOTIFY drops a notification whose channel and payload equal an
+        // earlier one of the same transaction: INSERT, DELETE, INSERT of
+        // the same row, or a key changing 1 -> 2 -> 1 -> 2, must still give
+        // distinct payloads (they differ in seq).
+        Spi::run(
+            "CREATE TABLE nr (id int PRIMARY KEY, doc automerge); \
+             CREATE TRIGGER nr_notify AFTER INSERT OR UPDATE OR DELETE ON nr \
+               FOR EACH ROW EXECUTE FUNCTION automerge_notify('nr', 'id')",
+        )
+        .unwrap();
+        take_sent();
+        Spi::run(
+            "INSERT INTO nr VALUES (1, '\\x'::bytea); DELETE FROM nr WHERE id = 1; \
+             INSERT INTO nr VALUES (1, '\\x'::bytea); \
+             UPDATE nr SET id = 2; UPDATE nr SET id = 1; UPDATE nr SET id = 2",
+        )
+        .unwrap();
+        let raw: Vec<String> =
+            super::SENT_NOTIFICATIONS.with(|s| s.borrow().iter().map(|(_, p)| p.clone()).collect());
+        assert_eq!(raw.len(), 6, "{raw:?}");
+        let distinct: std::collections::HashSet<_> = raw.iter().collect();
+        assert_eq!(distinct.len(), 6, "{raw:?}");
+        let ops: Vec<String> = take_sent()
+            .into_iter()
+            .map(|(_, v)| {
+                format!(
+                    "{}{}{}",
+                    v["op"],
+                    v["key"],
+                    v.get("old_key").map_or(String::new(), |k| k.to_string())
+                )
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                r#""INSERT"{"id":1}"#,
+                r#""DELETE"{"id":1}"#,
+                r#""INSERT"{"id":1}"#,
+                r#""UPDATE"{"id":2}{"id":1}"#,
+                r#""UPDATE"{"id":1}{"id":2}"#,
+                r#""UPDATE"{"id":2}{"id":1}"#,
+            ]
+        );
     }
 
     fn heads_json(sql: &str) -> serde_json::Value {

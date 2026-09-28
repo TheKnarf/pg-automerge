@@ -18,6 +18,8 @@
 # fetching exactly the new changes with automerge_changes_bytes(doc,
 # prev heads); no notification for no-op merges, updates of other columns,
 # the "WHERE NOT automerge_contains" pattern and rolled-back transactions;
+# identical events in one transaction (INSERT/DELETE/INSERT of the same
+# row, a key flipping back and forth) all arriving, distinct by seq;
 # a 150-head document degrading to "truncated" without failing the write.
 #
 # Env: PGRX_PG_PORT (default 28818), PG_CONFIG (default: pgrx's pg18).
@@ -215,13 +217,44 @@ expect_count 2 "transaction"
 check "${PAYLOADS[0]}" "p->>'op' || (p->'key')::text || jsonb_array_length(p->'columns'->'doc'->'heads')" 'UPDATE{"id": 1}2'
 check "${PAYLOADS[1]}" "p->>'op' || (p->'key')::text" 'INSERT{"id": 3}'
 
+log "identical events in one transaction are all delivered (payloads differ in seq)"
+# NOTIFY drops a notification whose payload equals an earlier one of the same
+# transaction; without seq the second INSERT (and the third UPDATE) would be
+# lost and a listener would end with the wrong state.
+sql -v base="$BASE" <<'SQL'
+BEGIN;
+INSERT INTO docs VALUES (10, :'base'::bytea);
+DELETE FROM docs WHERE id = 10;
+INSERT INTO docs VALUES (10, :'base'::bytea);
+UPDATE docs SET id = 11 WHERE id = 10;
+UPDATE docs SET id = 10 WHERE id = 11;
+UPDATE docs SET id = 11 WHERE id = 10;
+COMMIT;
+SQL
+expect_count 6 "repeated identical events"
+got=""
+for p in "${PAYLOADS[@]}"; do
+    got+="$(sql -v p="$p" <<'SQL'
+SELECT (p->>'op') || (p->'key')::text || coalesce((p->'old_key')::text, '')
+FROM (SELECT :'p'::jsonb AS p) s;
+SQL
+) "
+done
+[[ "$got" == 'INSERT{"id": 10} DELETE{"id": 10} INSERT{"id": 10} UPDATE{"id": 11}{"id": 10} UPDATE{"id": 10}{"id": 11} UPDATE{"id": 11}{"id": 10} ' ]] \
+    || fail "repeated identical events: got $got"
+# Replaying the events leaves the listener with row 11, which exists.
+[[ "$(sql -c "SELECT count(*) FROM docs WHERE id = 11")" == 1 ]] || fail "row 11 missing"
+check "${PAYLOADS[0]}" "(p->>'seq')::bigint < ('${PAYLOADS[2]}'::jsonb->>'seq')::bigint" t
+sql -c "DELETE FROM docs WHERE id = 11"
+expect_count 1 "cleanup delete"
+
 log "150 heads: the payload drops the heads, the write succeeds"
 sql -v many="$MANY" <<'SQL'
 INSERT INTO docs VALUES (2, :'many'::bytea);
 SQL
 expect_count 1 "many heads"
 p="${PAYLOADS[0]}"
-check "$p" "p" '{"op": "INSERT", "key": {"id": 2}, "table": "public.docs", "columns": {"doc": {}}, "truncated": true}'
+check "$p" "p - 'seq'" '{"op": "INSERT", "key": {"id": 2}, "table": "public.docs", "columns": {"doc": {}}, "truncated": true}'
 [[ ${#p} -lt 8000 ]] || fail "payload too long: ${#p}"
 [[ "$(sql -c "SELECT cardinality(automerge_heads(doc)) FROM docs WHERE id = 2")" == 150 ]] \
     || fail "row 2 not written"

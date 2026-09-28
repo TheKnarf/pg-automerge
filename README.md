@@ -64,7 +64,7 @@ CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
 
 LISTEN docs_changed;
 -- payloads look like
--- {"table":"public.docs","op":"UPDATE","key":{"id":"…"},
+-- {"table":"public.docs","op":"UPDATE","seq":17,"key":{"id":"…"},
 --  "columns":{"doc":{"heads":["79df…"],"prev_heads":["891e…"]}}}
 ```
 
@@ -82,7 +82,9 @@ Notifications are sent at commit and only to connected listeners, so after
 document you hold. INSERT and DELETE always notify; an UPDATE notifies only
 when a document's heads (or the key) change, so no-op merges are silent.
 Payloads over NOTIFY's 8000-byte limit (about 115 heads) drop the heads and
-carry `"truncated":true`; then just fetch. Details in
+carry `"truncated":true`; then just fetch. `seq` (a per-backend counter)
+keeps payloads distinct, since `NOTIFY` would otherwise collapse identical
+events of one transaction (e.g. INSERT, DELETE, INSERT of one row). Details in
 [DESIGN.md](docs/DESIGN.md#change-notifications).
 
 A no-op merge still rewrites the row. When re-sends are common, skip them:

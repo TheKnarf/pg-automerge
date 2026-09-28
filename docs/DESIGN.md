@@ -429,7 +429,7 @@ CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
 `pg_notify` calls) with a compact JSON payload:
 
 ```json
-{"table":"public.docs","op":"UPDATE","key":{"id":1},
+{"table":"public.docs","op":"UPDATE","seq":17,"key":{"id":1},
  "columns":{"doc":{"heads":["79df.."],"prev_heads":["891e.."]}}}
 ```
 
@@ -437,6 +437,18 @@ CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
   (`public."Odd Name"`). For a partitioned table this is the partition
   holding the row (row triggers run on the partitions).
 - `op`: `INSERT`, `UPDATE` or `DELETE`.
+- `seq`: a per-backend counter, incremented for every notification the
+  sending backend's trigger sends (all channels and tables; numbers of
+  rolled-back work are skipped, so there are gaps). It exists to make every
+  payload distinct: `NOTIFY` silently drops a notification whose channel
+  and payload equal an earlier one of the same transaction, which without
+  `seq` would lose events a listener needs, e.g. the second INSERT of
+  INSERT, DELETE, INSERT of the same row in one transaction (the listener
+  would drop a replica of a row that exists), or the third UPDATE of a key
+  changing 1 → 2 → 1 → 2. Within a transaction `seq` increases in firing
+  order. It is not a global order: another backend (or this one after a
+  reconnect, as a new process) counts separately, and the numbers are not
+  comparable across senders. Kept in every truncated form.
 - `key`: the key columns named in the trigger arguments, in that order,
   each as `to_json(value)` (numbers stay numbers, uuids and text are
   strings, NULL is `null`); from the new row, or the old row for DELETE.
@@ -468,7 +480,9 @@ the `WHERE NOT automerge_contains` pattern below.
 Delivery is Postgres' `NOTIFY`: sent at commit (nothing for a rolled-back
 transaction), in commit order, only to sessions connected and listening at
 the time; notifications with identical channel and payload within one
-transaction are collapsed. So a listener must treat notifications as hints:
+transaction are collapsed, which `seq` prevents for this trigger's
+notifications (so every row event of a committed transaction arrives, in
+the order it fired). Still, a listener must treat notifications as hints:
 
 1. On connect (and reconnect), `LISTEN docs_changed` first, then resync
    every replica it holds: `SELECT automerge_changes_bytes(doc,
@@ -481,7 +495,9 @@ transaction are collapsed. So a listener must treat notifications as hints:
    nothing without loading the document, so fetching on every
    notification (and on `truncated` ones) is cheap when there is nothing
    new.
-3. DELETE: drop the replica. `old_key`: re-key it.
+3. DELETE: drop the replica. `old_key`: re-key it. Apply events in the
+   order they arrive; a DELETE later followed by an INSERT of the same key
+   arrives as both.
 
 Payload size: `NOTIFY` rejects payloads of 8000 bytes or more
 (`NOTIFY_PAYLOAD_MAX_LENGTH`); at 67 bytes per hash that is about 115 heads,
