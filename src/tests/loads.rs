@@ -243,7 +243,7 @@ fn verify_writes_setting_switches_the_save_and_load_check() {
     doc.put(ROOT, "later", true).unwrap();
     doc.commit();
     let trailing = [save.as_slice(), &doc.save_after(&heads)].concat();
-    let later: bool = one::<JsonB>("SELECT $1::automerge::jsonb", &[trailing.into()]).0["later"]
+    let later: bool = one::<JsonB>("SELECT $1::automerge::jsonb", &[trailing.clone().into()]).0["later"]
         .as_bool()
         .unwrap();
     assert!(later);
@@ -261,6 +261,14 @@ fn verify_writes_setting_switches_the_save_and_load_check() {
     .unwrap();
     assert!(sql_error("SELECT doc::jsonb FROM ld WHERE id = 9").starts_with("XX000: "));
     Spi::run("RESET pg_automerge.verify_writes").unwrap();
+    // Back on: the same non-canonical input is checked (the hook fails it).
+    assert!(
+        sql_error(&format!(
+            "SELECT '{}'::automerge",
+            am::encoding::to_hex_literal(&trailing)
+        ))
+        .starts_with("22P02: invalid automerge document: does not survive a save and load (forced")
+    );
     assert!(
         sql_error(&format!(
             "SELECT '{}'::automerge",

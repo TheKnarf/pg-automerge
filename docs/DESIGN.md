@@ -201,8 +201,37 @@ value") until it is overwritten. With the check on, the write fails with
 `22P02` instead. Turn it off only for trusted writers (a backend sending
 what its own Automerge produced).
 
+Why `PGC_SUSET` and not `PGC_USERSET`: the check protects every reader of
+a table, not only the writer. A session that turned it off could store a
+value that makes every later read of that row fail, for all roles, until
+someone overwrites it; that is a denial of service against other users, so
+only a superuser (directly, through `ALTER ROLE/DATABASE .. SET`, or by
+`GRANT SET ON PARAMETER`) may decide which writers are trusted.
+`PGC_SIGHUP`/`PGC_POSTMASTER` would be needlessly coarse: the typical use
+is one trusted backend role alongside untrusted ones.
+
+What stays when it is off: panic guards around every Automerge call,
+Automerge's own parsing and checksum verification (`VerificationMode::Check`
+on load), the missing-dependencies check of change chunks, and the
+structural header parsing. Only the second load of the re-saved bytes is
+skipped.
+
+One setting covers both places the check runs: `normalize` (text input,
+binary receive, the `bytea` cast, for input that is not its own canonical
+or compressed encoding) and the deferred check of merge results. Both
+guard the same invariant against the same failure (a re-save that does not
+load), and the cost is the same load in both; a separate switch for one of
+them would leave the other path open to the very value the first one lets
+through (such bytes can be sent as a change chunk or as a save followed by
+changes alike), so splitting it would buy no safety and add a
+configuration trap. The default keeps both on.
+
 The setting only decides whether an extra check can reject input; it never
-changes a result's bytes, so the functions stay `IMMUTABLE`. The deferred
+changes a result's bytes, so the functions stay `IMMUTABLE`: for a given
+input, the result is either the one value or an error, and which one does
+not depend on anything but the input and this setting (like
+`statement_timeout` can turn a result into an error without making a
+function volatile). The deferred
 check of a merge result reads the setting when the value is flattened,
 not when `merge` runs. Only the extension's library defines it: set it
 after the library is loaded (any use of the type loads it) or in

@@ -16,7 +16,10 @@
 # (md5 of the stored bytes, heads, jsonb, generated column) and of the
 # views; the indexes are valid and used; the trigger fires (a LISTEN
 # session receives its notification). Also a binary COPY TO / FROM round
-# trip, and that COPY FROM rejects a corrupt value with 22P02.
+# trip, and that COPY FROM rejects a corrupt value with 22P02. The
+# custom-format restore runs with pg_automerge.verify_writes = off (set on
+# its database) and must give the same bytes; the dump does not mention
+# the setting.
 #
 # Env: see tests/lib.sh.
 
@@ -130,10 +133,16 @@ check_restored "$DB_PLAIN" "plain dump"
 
 log "custom-format pg_dump restored with pg_restore --exit-on-error"
 sql_on postgres -c "DROP DATABASE IF EXISTS $DB_CUSTOM WITH (FORCE)" -c "CREATE DATABASE $DB_CUSTOM"
+# Restored with pg_automerge.verify_writes off: the setting only decides
+# whether a check can reject input, so the restored bytes are the same.
+sql_on postgres -c "ALTER DATABASE $DB_CUSTOM SET pg_automerge.verify_writes = off"
 "$BINDIR/pg_dump" -h localhost -p "$PORT" -d "$DB" -Fc -f "$WORK/dump.custom"
 "$BINDIR/pg_restore" -h localhost -p "$PORT" -d "$DB_CUSTOM" --exit-on-error "$WORK/dump.custom" \
     || fail "pg_restore failed"
 check_restored "$DB_CUSTOM" "custom dump"
+[[ "$(sql_on "$DB_CUSTOM" -c "SELECT current_setting('pg_automerge.verify_writes')")" == off ]] \
+    || fail "custom dump: restore database should run with pg_automerge.verify_writes off"
+! grep -q verify_writes "$WORK/dump.sql" || fail "the dump mentions pg_automerge.verify_writes"
 
 log "binary COPY round trip"
 sql -c "\\copy app.docs (id, doc) TO '$WORK/docs.bin' (FORMAT binary)"

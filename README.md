@@ -214,6 +214,27 @@ UTC strings with milliseconds, bytes → base64 strings. Conflicting
 concurrent values show Automerge's winner. Details in
 [DESIGN.md](docs/DESIGN.md#jsonb-mapping).
 
+## Configuration
+
+| Setting | Default | Who can change it | Effect |
+|---|---|---|---|
+| `pg_automerge.verify_writes` | `on` | superusers, or roles granted `SET` on it (`GRANT SET ON PARAMETER pg_automerge.verify_writes TO writer`); also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Load back the normalized save of every value built from client bytes (text input, binary receive, the `bytea` cast, `merge(automerge, bytea)` results) before it is stored or sent |
+
+With `pg_automerge.verify_writes = off`, incremental writes
+(`merge(doc, $changes)`) cost one load instead of two, and input that is not
+already a canonical or compressed save skips its second load. Parsing,
+checksums, missing-dependency checks and panic guards still run. The risk:
+malformed input that loads, but whose re-save does not (so far seen only in
+fuzzing), is stored instead of rejected with `22P02`, and every later read
+of that row fails with `XX000` until it is overwritten. It is
+superuser-only because one writer turning it off could store a value that
+breaks reads for everyone. Turn it off only for trusted writers, e.g.
+`ALTER ROLE app_backend SET pg_automerge.verify_writes = off` for the role
+of a backend that sends what its own Automerge produced. It never changes
+a result's bytes, so functions stay `IMMUTABLE` and dumps are unaffected.
+Details in
+[DESIGN.md](docs/DESIGN.md#the-pg_automergeverify_writes-setting).
+
 ## Limitations and gotchas
 
 - **Each jsonb access is a load.** `SELECT doc->>'a', doc->>'b', doc->>'c'`
@@ -230,12 +251,8 @@ concurrent values show Automerge's winner. Details in
   differs) and every merged result of incremental changes is loaded,
   re-saved and loaded again to verify it; the upsert of a full save loads
   it twice (Postgres hands `EXCLUDED` over flat).
-- **`pg_automerge.verify_writes`** (default `on`, superuser-only) is that
-  verification load. `off` halves incremental writes
-  (`merge(doc, $changes)`: one load instead of two) but lets malformed
-  input that loads, but whose re-save does not, be stored and fail on every
-  later read (`XX000`); use it only for trusted writers. See
-  [DESIGN.md](docs/DESIGN.md#the-pg_automergeverify_writes-setting).
+- **`pg_automerge.verify_writes`** is that verification load; see
+  [Configuration](#configuration).
 - `merge(doc, $1)` with a parameter the driver types as `bytea` uses
   `merge(automerge, bytea)`, which accepts full saves and bare change
   chunks. An *untyped* literal or parameter (`merge(doc, '\x..')`) resolves
