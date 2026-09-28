@@ -71,6 +71,7 @@ jobs:
         run: |
           mise run bench-core | tee bench-core.txt
           BENCH_REPS=2 mise run bench-expanded | tee bench-expanded.txt
+          mise run bench-sql | tee bench-sql.txt
 
       - name: Upload benchmark tables
         if: github.event_name == 'schedule'

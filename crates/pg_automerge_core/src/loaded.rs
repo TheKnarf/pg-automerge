@@ -23,8 +23,9 @@ use automerge::{Automerge, Change, ChangeHash};
 
 use crate::{
     Applied, Error, apply_changes, contains_changes_by_heads, ensure_complete, guard_for,
-    guard_input, guard_stored, has_all, header, is_subset, load_stored_unguarded, reload_check,
-    stored_heads_unguarded,
+    guard_input, guard_stored, has_all, header, is_subset, load_bytes, load_stored_unguarded,
+    loads_as_saved, normalize_unguarded, reload_check, stored_heads_unguarded,
+    verification_enabled,
 };
 
 /// Number of [`LoadedDoc`]s alive in this process (for leak tests).
@@ -95,6 +96,35 @@ impl LoadedDoc {
         })
     }
 
+    /// Validate and normalize external bytes (text input, binary receive,
+    /// the `bytea` cast) exactly as [`crate::normalize`] does, keeping the
+    /// loaded document next to its stored bytes, so the value needs
+    /// neither a save to be stored nor a load to be read.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::normalize`].
+    pub fn from_external(bytes: &[u8]) -> Result<Self, Error> {
+        guard_input(|| {
+            let (doc, saved) = normalize_unguarded(bytes)?;
+            Ok(Self::new(doc, Some(saved), false))
+        })
+    }
+
+    /// A document just loaded from external bytes `input` on its own
+    /// (unguarded, like the load). Its save is computed right away: when
+    /// [`loads_as_saved`] proves that it loads back, the document is
+    /// verified and keeps the save as its stored bytes; otherwise it is
+    /// unverified (the check runs when the bytes are first needed).
+    fn from_loaded_input(doc: Automerge, input: &[u8]) -> Self {
+        let saved = doc.save_nocompress();
+        if loads_as_saved(input, &saved) {
+            Self::new(doc, Some(saved), false)
+        } else {
+            Self::new(doc, None, true)
+        }
+    }
+
     /// A document built in memory (its stored bytes are computed when
     /// needed). `unverified`: it contains external changes, see
     /// [`LoadedDoc::stored`].
@@ -130,7 +160,8 @@ impl LoadedDoc {
     /// a document with unverified external changes the save is loaded back
     /// once and must keep the heads, otherwise [`Error::InvalidInput`]: the
     /// safeguard of [`crate::normalize`], applied when the bytes are first
-    /// needed (to store or send the value) rather than at every merge.
+    /// needed (to store or send the value) rather than at every merge, and
+    /// only while [`crate::verification_enabled`].
     ///
     /// # Errors
     ///
@@ -143,7 +174,7 @@ impl LoadedDoc {
         }
         let bytes = guard_for(self.unverified, || {
             let saved = self.doc.save_nocompress();
-            if self.unverified {
+            if self.unverified && verification_enabled() {
                 reload_check(&saved, &self.heads, "invalid automerge changes")?;
             }
             Ok(saved)
@@ -335,13 +366,24 @@ pub(crate) fn merge_from(target: &mut Automerge, other: &Automerge) -> Result<()
 /// - Changes whose dependencies are neither in `a` nor in `changes`: an
 ///   error naming the missing hashes. Nothing orphaned is ever stored.
 ///
-/// Bare uncompressed change chunks (what `save_incremental()` /
-/// `save_after()` produce) are parsed one by one (every chunk must parse:
-/// strict, like `Automerge::load`) and applied to `a`'s document (loaded,
-/// or cloned when `a` is loaded already), the same steps a load of
-/// `a ++ changes` takes. Anything else (a save, compressed chunks) is
-/// loaded as `a ++ changes`. Either way the result is marked unverified:
-/// its stored bytes get the save-and-load check when first requested.
+/// Three paths, by the shape of `changes`:
+///
+/// - Bare uncompressed change chunks (what `save_incremental()` /
+///   `save_after()` produce) are parsed one by one (every chunk must parse:
+///   strict, like `Automerge::load`) and applied to `a`'s document
+///   (loaded, or cloned when `a` is loaded already), the same steps a load
+///   of `a ++ changes` takes.
+/// - A save (see `merge_save`) is treated like `merge(a, b)` of two
+///   documents: loaded on its own (strictly, and checked like
+///   [`crate::normalize`] input), so that when it contains `a`, as a
+///   newer save of the same document does, `a` is never loaded and the
+///   result is the save itself.
+/// - Anything else (compressed change chunks, a save whose trailing
+///   changes depend on `a`) is loaded as `a ++ changes`.
+///
+/// A result with changes from `changes` in it is marked unverified: its
+/// stored bytes get the save-and-load check when first requested (unless
+/// they are provably the input's own bytes, see [`crate::normalize`]).
 ///
 /// # Errors
 ///
@@ -357,44 +399,147 @@ pub fn merge_changes(a: Input<'_>, changes: &[u8]) -> Result<Option<LoadedDoc>, 
         if contains_changes_by_heads(&heads_a, changes) == Some(true) {
             return Ok(None);
         }
-        let doc = match header::change_chunks(changes) {
-            Some(chunks) => {
-                if let Input::Loaded(loaded) = a
-                    && chunks.iter().all(|c| has_change(loaded.doc(), &c.hash))
-                {
-                    return Ok(None);
-                }
-                let parsed = chunks
-                    .iter()
-                    .map(|c| {
-                        Change::try_from(&changes[c.range.clone()]).map_err(|e| {
-                            Error::InvalidInput(format!("invalid automerge changes: {e}"))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut doc = match a {
-                    Input::Stored(bytes) => load_stored_unguarded(bytes)?,
-                    Input::Loaded(loaded) => loaded.doc().clone(),
-                };
-                doc.apply_changes(parsed)
-                    .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
-                if let Err(mut missing) = ensure_complete(&doc) {
-                    missing.sort();
-                    return Err(Error::MissingDependencies(missing));
-                }
-                if is_subset(&doc.get_heads(), &heads_a) {
-                    return Ok(None);
-                }
-                doc
+        if let Some(chunks) = header::change_chunks(changes) {
+            return apply_change_chunks(a, &heads_a, changes, &chunks);
+        }
+        if header::starts_with_document(changes) {
+            match merge_save(a, &heads_a, changes)? {
+                SaveMerge::Unchanged => return Ok(None),
+                SaveMerge::New(doc) => return Ok(Some(*doc)),
+                SaveMerge::Concatenate => {}
             }
-            None => match apply_changes(&a.bytes_for_load(), &heads_a, changes)? {
-                Applied::Unchanged => return Ok(None),
-                Applied::MissingDeps(missing) => return Err(Error::MissingDependencies(missing)),
-                Applied::Changed(doc) => *doc,
-            },
-        };
-        Ok(Some(LoadedDoc::new(doc, None, true)))
+        }
+        match apply_changes(&a.bytes_for_load(), &heads_a, changes)? {
+            Applied::Unchanged => Ok(None),
+            Applied::MissingDeps(missing) => Err(Error::MissingDependencies(missing)),
+            Applied::Changed(doc) => Ok(Some(LoadedDoc::new(*doc, None, true))),
+        }
     })
+}
+
+/// [`merge_changes`] for bare change chunks (unguarded).
+fn apply_change_chunks(
+    a: Input<'_>,
+    heads_a: &[ChangeHash],
+    changes: &[u8],
+    chunks: &[header::ChangeChunk],
+) -> Result<Option<LoadedDoc>, Error> {
+    if let Input::Loaded(loaded) = a
+        && chunks.iter().all(|c| has_change(loaded.doc(), &c.hash))
+    {
+        return Ok(None);
+    }
+    let parsed = chunks
+        .iter()
+        .map(|c| {
+            Change::try_from(&changes[c.range.clone()])
+                .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut doc = match a {
+        Input::Stored(bytes) => load_stored_unguarded(bytes)?,
+        Input::Loaded(loaded) => loaded.doc().clone(),
+    };
+    doc.apply_changes(parsed)
+        .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
+    if let Err(mut missing) = ensure_complete(&doc) {
+        missing.sort();
+        return Err(Error::MissingDependencies(missing));
+    }
+    if is_subset(&doc.get_heads(), heads_a) {
+        return Ok(None);
+    }
+    Ok(Some(LoadedDoc::new(doc, None, true)))
+}
+
+/// Result of [`merge_save`].
+enum SaveMerge {
+    /// `a` already has everything.
+    Unchanged,
+    /// The result.
+    New(Box<LoadedDoc>),
+    /// The save's trailing changes depend on `a`: load `a ++ changes`.
+    Concatenate,
+}
+
+/// [`merge_changes`] for input starting with a document chunk (a save),
+/// like `merge(a, b)` of two documents, cheapest checks first (unguarded):
+///
+/// 1. Exactly one document chunk with a valid checksum whose header heads
+///    are all in `a` (heads of `a`, or changes of a loaded `a`): `a`
+///    unchanged, nothing loaded. This is what a load of `a ++ changes`
+///    decides from the same header (Automerge skips such a chunk).
+/// 2. If the header says the save has no more changes than a stored `a`
+///    (an older save, probably contained in `a`), `a` is loaded first and
+///    checked for those heads, again as that load would.
+/// 3. The input is loaded on its own, strictly; trailing change chunks
+///    whose dependencies are missing from it (they may be in `a`) send it
+///    to the concatenating path. If it contains `a` (by the heads, or by
+///    its history), it is the result: its save is its stored bytes, and
+///    needs no check when it is the input's own encoding (a canonical or
+///    compressed save, see [`crate::loads_as_saved`]).
+/// 4. Otherwise `a`'s document (loaded, or a clone) gets the input's
+///    missing changes.
+///
+/// So a newer full save of the document costs one load (of the save) and
+/// no check.
+fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<SaveMerge, Error> {
+    let chunk = header::document_chunk(changes);
+    if let Some(chunk) = &chunk {
+        if is_subset(&chunk.heads, heads_a) {
+            return Ok(SaveMerge::Unchanged);
+        }
+        if let Input::Loaded(loaded) = a
+            && has_all(loaded.doc(), &chunk.heads)
+        {
+            return Ok(SaveMerge::Unchanged);
+        }
+    }
+    let mut doc_a = None;
+    if let (Input::Stored(bytes), Some(chunk)) = (a, &chunk)
+        && let (Some(count), Some(count_a)) =
+            (chunk.change_count, header::change_count_from_bytes(bytes))
+        && count <= count_a
+    {
+        let doc = load_stored_unguarded(bytes)?;
+        if has_all(&doc, &chunk.heads) {
+            return Ok(SaveMerge::Unchanged);
+        }
+        doc_a = Some(doc);
+    }
+    let b = load_bytes(changes)
+        .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
+    if ensure_complete(&b).is_err() {
+        return Ok(SaveMerge::Concatenate);
+    }
+    let mut heads_b = b.get_heads();
+    heads_b.sort_unstable();
+    if is_subset(&heads_b, heads_a) {
+        return Ok(SaveMerge::Unchanged);
+    }
+    if is_subset(heads_a, &heads_b) || has_all(&b, heads_a) {
+        return Ok(SaveMerge::New(Box::new(LoadedDoc::from_loaded_input(
+            b, changes,
+        ))));
+    }
+    let mut target = match (doc_a, a) {
+        (Some(doc), _) => doc,
+        (None, Input::Stored(bytes)) => load_stored_unguarded(bytes)?,
+        (None, Input::Loaded(loaded)) => {
+            if has_all(loaded.doc(), &heads_b) {
+                return Ok(SaveMerge::Unchanged);
+            }
+            loaded.doc().clone()
+        }
+    };
+    if has_all(&target, &heads_b) {
+        return Ok(SaveMerge::Unchanged);
+    }
+    let added = target.get_changes_added(&b);
+    target
+        .apply_changes(added)
+        .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
+    Ok(SaveMerge::New(Box::new(LoadedDoc::new(target, None, true))))
 }
 
 fn has_change(doc: &Automerge, hash: &ChangeHash) -> bool {
@@ -407,9 +552,12 @@ fn has_change(doc: &Automerge, hash: &ChangeHash) -> bool {
 ///
 /// Decided by [`crate::contains_changes_by_heads`] when possible; for a
 /// loaded `a` and bare change chunks by a lookup of each chunk's hash (a
-/// change with that hash has exactly those bytes); otherwise by loading
-/// `a ++ changes` (one load, no save). Changes whose dependencies are in
-/// neither input are not in `a`: `false`, where `merge` raises an error.
+/// change with that hash has exactly those bytes); for a single document
+/// chunk (a save) by whether `a` has the heads in its header (loading a
+/// stored `a`, never the save: what a load of `a ++ changes` decides from
+/// the same header); otherwise by loading `a ++ changes` (one load, no
+/// save). Changes whose dependencies are in neither input are not in `a`:
+/// `false`, where `merge` raises an error.
 ///
 /// # Errors
 ///
@@ -426,6 +574,15 @@ pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
         }
         if let (Input::Loaded(loaded), Some(chunks)) = (a, header::change_chunks(changes)) {
             return Ok(chunks.iter().all(|c| has_change(loaded.doc(), &c.hash)));
+        }
+        // One document chunk (a save): whether `a` has its heads, as a
+        // load of `a ++ changes` decides it, without reading the save.
+        if let Some(chunk) = header::document_chunk(changes) {
+            return Ok(is_subset(&chunk.heads, &heads_a)
+                || match a {
+                    Input::Loaded(loaded) => has_all(loaded.doc(), &chunk.heads),
+                    Input::Stored(bytes) => has_all(&load_stored_unguarded(bytes)?, &chunk.heads),
+                });
         }
         Ok(matches!(
             apply_changes(&a.bytes_for_load(), &heads_a, changes)?,

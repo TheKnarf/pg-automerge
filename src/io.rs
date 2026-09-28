@@ -3,13 +3,14 @@
 
 use std::ffi::{CStr, CString};
 
-use pg_automerge_core::loaded;
+use pg_automerge_core::loaded::{self, LoadedDoc};
 use pg_automerge_core::{self as am, Error};
 use pgrx::Internal;
 use pgrx::prelude::*;
 
 use crate::datum::{AutomergeArg, AutomergeDatum, AutomergeValue, Detoasted};
 use crate::error::{OrRaise, raise};
+use crate::expanded::new_expanded;
 use crate::jsonb::{JsonbBuilder, JsonbDatum};
 
 // The I/O functions are declared by hand in the `automerge_type` block (they
@@ -104,10 +105,14 @@ COMMENT ON FUNCTION automerge_send(automerge) IS
 // Casts
 // ---------------------------------------------------------------------------
 
-/// `bytea -> automerge`: validates and normalizes.
+/// `bytea -> automerge`: validates and normalizes. The result is an
+/// expanded value holding the document just loaded next to its stored
+/// bytes (see "Expanded values"): storing it copies the bytes, and a
+/// function reading it (`merge(doc, $1::automerge)`, `excluded.doc` of an
+/// upsert) uses the document without loading it again.
 #[pg_extern(immutable, strict, parallel_safe)]
-fn automerge_from_bytea(bytes: &[u8]) -> AutomergeDatum {
-    AutomergeDatum::from_external(bytes)
+fn automerge_from_bytea(bytes: &[u8]) -> AutomergeValue {
+    AutomergeValue::Datum(new_expanded(LoadedDoc::from_external(bytes).or_raise()))
 }
 
 /// The current state of the document as jsonb (see the mapping in DESIGN.md).

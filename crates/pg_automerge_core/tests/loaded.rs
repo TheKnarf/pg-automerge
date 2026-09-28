@@ -6,15 +6,27 @@
 mod common;
 
 use automerge::transaction::Transactable;
-use automerge::{ActorId, AutoCommit, Automerge, ROOT};
+use automerge::{ActorId, AutoCommit, Automerge, ROOT, ReadDoc};
 use pg_automerge_core::loaded::{self, Input, LoadedDoc, MergeOutcome};
 use pg_automerge_core::{Error, MergeAccumulator, normalize};
 
 use common::{Merged, Rng, StoredAccumulator, merge, merge_changes, random_replicas};
 
-/// Reference for `merge(automerge, bytea)`: a strict load of `a ++ changes`,
-/// saved (None: heads unchanged).
+/// Reference for `merge(automerge, bytea)` (None: heads unchanged): a save
+/// that contains `a` is the result itself, normalized (as `merge` of two
+/// documents returns the one that contains the other); anything else is a
+/// strict load of `a ++ changes`, saved.
 fn reference_apply(a: &[u8], changes: &[u8]) -> Option<Vec<u8>> {
+    if pg_automerge_core::header::starts_with_document(changes) {
+        let save = Automerge::load(changes).unwrap();
+        let a_heads = Automerge::load(a).unwrap().get_heads();
+        if save.get_missing_deps(&a_heads).is_empty() {
+            let (mut h1, mut h2) = (save.get_heads(), a_heads);
+            h1.sort();
+            h2.sort();
+            return (h1 != h2).then(|| normalize(changes).unwrap());
+        }
+    }
     let mut combined = a.to_vec();
     combined.extend_from_slice(changes);
     let doc = Automerge::load(&combined).unwrap();
@@ -64,9 +76,10 @@ fn chains_of_change_sets_store_the_same_bytes_as_the_flat_path() {
             let end = (i + n).min(changes.len());
             // Mostly bare change chunks (the parse-and-apply path); every
             // fourth step a compressed full save of everything so far (the
-            // `a ++ changes` load path, starting from a fresh save of the
-            // loaded document).
-            let input = if step % 4 == 3 {
+            // save path: the result is the save, loaded once and verified
+            // by its own encoding).
+            let is_save = step % 4 == 3;
+            let input = if is_save {
                 Automerge::load(&changes[..end].concat()).unwrap().save()
             } else {
                 changes[i..end].concat()
@@ -81,6 +94,11 @@ fn chains_of_change_sets_store_the_same_bytes_as_the_flat_path() {
             // ...and so does the loaded document, step by step.
             match loaded::merge_changes(Input::Loaded(&doc), &input).unwrap() {
                 None => assert!(expected.is_none(), "seed {seed}: step {step}"),
+                Some(next) if is_save => {
+                    assert!(!next.is_unverified());
+                    assert_eq!(next.cached_stored(), expected.as_deref());
+                    doc = next;
+                }
                 Some(next) => {
                     assert!(next.is_unverified());
                     assert_eq!(next.cached_stored(), None);

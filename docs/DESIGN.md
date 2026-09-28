@@ -59,6 +59,11 @@ UPDATE docs SET doc = merge(doc, $2) WHERE id = $1;
 -- (The row must exist for incremental changes: an INSERT's VALUES are cast
 -- to automerge on their own, and bare changes are not a complete document.)
 
+-- The upsert costs two loads of a full save (the cast validates it, and
+-- EXCLUDED reaches merge flat, see "Expanded values"); when the row usually
+-- exists, UPDATE .. SET doc = merge(doc, $2) with the save as bytea costs
+-- one (see "Merging"), with an INSERT when it updated no row.
+
 -- read
 SELECT doc->>'title' FROM docs WHERE doc @> '{"status": "open"}';
 SELECT jsonb_path_query(doc, '$.items[*] ? (@.done == false)') FROM docs;
@@ -138,9 +143,11 @@ Data flow:
 - **Validated.** Input that does not load is rejected (`22P02`), and so is
   input whose changes have missing dependencies: no orphaned changes are
   stored.
-- **Nothing unloadable is stored.** The normalized result is loaded back
-  once and must have the same heads, unless that load provably reads the
-  bytes the first load already accepted:
+- **Nothing unloadable is stored** (while `pg_automerge.verify_writes` is
+  on, the default; see [The `pg_automerge.verify_writes`
+  setting](#the-pg_automergeverify_writes-setting)). The normalized result
+  is loaded back once and must have the same heads, unless that load
+  provably reads the bytes the first load already accepted:
   - the input already was the canonical encoding, or
   - the input is one document chunk with deflated columns (a compressed
     `save()`) and inflating it gives exactly the canonical encoding.
@@ -166,16 +173,47 @@ Data flow:
   changes, a document encoded by another implementation) pays the second
   load. The same check applies to results of `merge(automerge, bytea)`,
   when they are first flattened (see
-  [The deferred verification](#the-deferred-verification)).
+  [The deferred verification](#the-deferred-verification)); a full save
+  merged that way takes the same shortcut when it is the result.
 - **Immutable.** Nothing modifies a stored value in place: `merge` returns
   a new value, and an expanded value's document is only ever replaced as a
   whole, and only through a read-write pointer.
+
+### The `pg_automerge.verify_writes` setting
+
+A boolean, `on` by default, superuser-only (`PGC_SUSET`; `GRANT SET ON
+PARAMETER pg_automerge.verify_writes TO role` lets a role change it). It
+switches the save-and-load check of the invariant above: when `off`,
+values built from client bytes (text input, binary receive, the `bytea`
+cast, results of `merge(automerge, bytea)`) are normalized as always but
+their save is not loaded back. That removes one load from every write that
+needs the check: incremental changes (`merge(doc, $changes)`: 2 loads → 1),
+a save followed by change chunks, a save encoded by another
+implementation, a save merged with a document neither contains. Writes
+that take the shortcut (canonical bytes, a compressed save, a newer full
+save merged into its older version) cost the same either way.
+
+The risk it takes: input that passes Automerge's checksums and loads, but
+whose re-save does not load (so far seen only as fuzzed input with
+recomputed checksums; `tests/corpus/reload-b-*.bin`), is stored, and every
+later read of that value fails with `XX000` ("corrupt stored automerge
+value") until it is overwritten. With the check on, the write fails with
+`22P02` instead. Turn it off only for trusted writers (a backend sending
+what its own Automerge produced).
+
+The setting only decides whether an extra check can reject input; it never
+changes a result's bytes, so the functions stay `IMMUTABLE`. The deferred
+check of a merge result reads the setting when the value is flattened,
+not when `merge` runs. Only the extension's library defines it: set it
+after the library is loaded (any use of the type loads it) or in
+`postgresql.conf`/`ALTER ROLE .. SET`, where Postgres keeps the value until
+the library defines the setting.
 
 ### Casts
 
 | From → To | Context | Notes |
 |---|---|---|
-| `bytea → automerge` | assignment | validates + normalizes; lets drivers bind `bytea` params directly |
+| `bytea → automerge` | assignment | validates + normalizes; lets drivers bind `bytea` params directly; the result is an expanded value (the loaded document and its stored bytes, see [Expanded values](#expanded-values)) |
 | `automerge → bytea` | explicit | `WITHOUT FUNCTION` (same varlena layout); stored bytes, loadable by any Automerge implementation |
 | `automerge → jsonb` | **implicit** | so every jsonb operator/function applies to `automerge` directly |
 
@@ -264,15 +302,41 @@ enforces it).
   change chunks (`save_incremental()` / `save_after()` output, several may
   be concatenated) whose dependencies are in `a` or earlier in `changes`.
   - Strict, unlike `load_incremental`: a chunk that fails to parse or has
-    a bad checksum fails the whole call instead of being skipped. Bare
-    uncompressed change chunks (the usual input) are split and
+    a bad checksum fails the whole call instead of being skipped.
+  - Bare uncompressed change chunks (the usual input) are split and
     checksum-checked by `header::change_chunks`, each parsed with
     `Change::try_from` (the parser `Automerge::load` uses for change
     chunks) and applied to `a`'s document with `apply_changes`: the same
     steps as a load of `a ++ changes`, without re-loading `a` when it is
-    already loaded (an expanded value). Anything else (a save, compressed
-    chunks) is loaded as `a ++ changes` (for an expanded `a`, a fresh save
-    of it ++ `changes`).
+    already loaded (an expanded value).
+  - A save (input starting with a document chunk, compressed or not,
+    optionally followed by change chunks) is merged like
+    `merge(a, b::automerge)`, cheapest check first:
+    1. exactly one document chunk with a valid checksum whose header heads
+       are heads of `a` (or changes of an expanded `a`): `a` unchanged,
+       nothing loaded. A load of `a ++ changes` decides the same from the
+       same header: Automerge skips a document chunk whose heads it has.
+    2. When the headers say the save has no more changes than a stored `a`
+       (an older save), `a` is loaded first and checked for those heads,
+       again as that load would.
+    3. The save is loaded on its own (strictly, and complete: if trailing
+       change chunks depend on changes only `a` has, the input takes the
+       `a ++ changes` path below). If it contains `a` (by the heads, or its
+       history has `a`'s heads), it is the result: an expanded value whose
+       stored bytes are its `save_nocompress()`, which needs no
+       save-and-load check when it is the input's own encoding (canonical
+       bytes, or a compressed save that inflates to them: the shortcut of
+       normalization). So a newer full save of the stored document costs
+       one load, and the stored document is never loaded.
+    4. Otherwise `a` (loaded, or a clone of an expanded `a`) gets the
+       save's missing changes; the result is unverified.
+
+    The result of case 3 is the save's normalized bytes, as `merge(a, b)`
+    returns `b` when `b` contains `a`; the state is the same as a load of
+    `a ++ changes` would give, the change order in the bytes may differ.
+  - Anything else (compressed change chunks, a save whose trailing changes
+    depend on `a`) is loaded as `a ++ changes` (for an expanded `a`, a
+    fresh save of it ++ `changes`).
   - Changes whose dependencies are in neither `a` nor `changes` raise
     `22P02` (`invalid automerge changes: missing 1 dependency that neither
     the document nor the input contains`), with the hashes in the DETAIL
@@ -281,13 +345,16 @@ enforces it).
   - Empty `changes`, or nothing new (heads unchanged): returns `a` unchanged,
     no re-save. When `changes` is bare change chunks that are all heads of
     `a` (a re-send of the latest changes), this is seen from the chunks'
-    hashes without loading anything (see `automerge_contains(a, bytea)`).
+    hashes without loading anything (see `automerge_contains(a, bytea)`);
+    a re-sent save of `a`, from its header (case 1 above).
   - Malformed input, including decoder panics, is `22P02`. A changed result
-    is marked unverified: it gets the save-and-load check of normalization
-    when it is first flattened (see
+    is marked unverified (unless it is a save's own encoding, case 3
+    above): it gets the save-and-load check of normalization when it is
+    first flattened (see
     [The deferred verification](#the-deferred-verification)).
-  - A document chunk inside `changes` whose heads `a` already has is skipped
-    by Automerge after the checksum check, without decoding its columns.
+  - A document chunk after the first chunk of `changes` whose heads `a`
+    already has is skipped by Automerge after the checksum check, without
+    decoding its columns.
 - Operators `automerge || automerge` and `automerge || bytea` → `automerge`
   are the two `merge`s. There is no `bytea || automerge`, so the second has
   no commutator.
@@ -369,11 +436,16 @@ implicit).
     made the current heads (true).
   - For an expanded `a` and bare change chunks, each chunk's hash is looked
     up in the loaded document.
-  - Otherwise (older changes, full saves, compressed chunks) `a ++
-    changes` is loaded once (no save) and the heads compared, which is the
-    no-op check of `merge(automerge, bytea)`.
-  - On the no-load path only the framing, checksums and dependency lists
-    are read, so `false` does not promise that `merge` accepts the input.
+  - For exactly one document chunk (a save) with a valid checksum: whether
+    `a` has the heads its header lists, from `a`'s heads, or else from its
+    history (a stored `a` is loaded; the save never is). That is what the
+    no-op check of `merge(automerge, bytea)`, and a load of `a ++ changes`,
+    decide from the same header.
+  - Otherwise (older changes, a save plus change chunks, compressed chunks)
+    `a ++ changes` is loaded once (no save) and the heads compared.
+  - On the no-load and the header paths only the framing, checksums and
+    dependency lists or header heads are read, so `false` does not promise
+    that `merge` accepts the input.
 
 ### Heads fast path
 
@@ -690,10 +762,40 @@ Where it helps:
   expands only arrays by itself).
 - `merge_agg(...)::jsonb` skips the final save and re-load (the inputs
   still need a load each).
+- The `bytea → automerge` cast returns the document it loaded to validate
+  the input, with its stored bytes already computed: `merge(doc,
+  $1::automerge)` (or `merge(doc, (SELECT ..)::automerge)`) reads it in
+  memory, so a newer full save costs one load in total instead of two, and
+  storing the cast's value copies the bytes (no save).
 
-Where it does not: table columns always arrive flat, so
-`UPDATE docs SET doc = merge(doc, $1)` loads the stored value, applies,
-saves and verifies once (nothing to gain without a cross-statement cache).
+Where it does not:
+
+- Table columns always arrive flat, so
+  `UPDATE docs SET doc = merge(doc, $1)` loads the stored value, applies,
+  saves and verifies once (nothing to gain without a cross-statement cache).
+- `EXCLUDED` in `INSERT .. ON CONFLICT DO UPDATE` is flat: `ExecInsert`
+  materializes the proposed row (`ExecMaterializeSlot`, which flattens
+  expanded values) before it checks for the conflict, and nothing in a
+  type's control changes that. So the upsert of a full save costs two
+  loads (the cast's, and `merge` loading `EXCLUDED.doc`), where
+  `UPDATE .. SET doc = merge(doc, $save::bytea)` costs one.
+- Query parameters are flat in the plans drivers normally get: for an
+  unnamed statement (and the first five executions of a prepared one)
+  Postgres plans with the parameter values as constants, and folding
+  `$1::automerge` or a typed `automerge` parameter into a constant copies
+  it flat (`datumCopy`). So `merge(doc, $1::automerge)` costs two loads
+  there (one with a generic plan); `merge(doc, $1)` with a `bytea`
+  parameter costs one either way (see `merge(automerge, bytea)`).
+- The type's input and receive functions return flat values. Their
+  results are copied flat almost everywhere (parser constants are
+  detoasted, `COPY` stores them, parameters are folded as above), and an
+  expanded value would keep its loaded document, many times the size of
+  the bytes, alive until the calling memory context ends: for every
+  element of an `automerge[]` literal or binary array parameter, or of a
+  record, until the end of the statement. The `bytea` cast runs in an
+  expression's per-row context instead, which is reset for every row (a
+  pg_test checks that 400 rows of `INSERT .. SELECT` through the cast
+  leave no document behind, and that at most one is alive at a time).
 
 #### Implementation
 
@@ -757,9 +859,14 @@ saves and verifies once (nothing to gain without a cross-statement cache).
   and SQL function results flatten a read-only pointer).
 - `merge(automerge, bytea)` on an expanded document parses the change
   chunks (`Change::try_from`, the parser `Automerge::load` uses) and
-  applies them to a clone, so it needs no load; a save or compressed
+  applies them to a clone, so it needs no load; a save is loaded on its
+  own and merged like a document (see [Merging](#merging)); compressed
   chunks go through a strict load of a fresh save of the document plus
   the input.
+- Sources of expanded values: `merge` and `||` results, `merge_agg`
+  results, and the `bytea → automerge` cast (whose object starts out
+  verified, with its stored bytes). Input and receive functions return
+  flat values (see above).
 
 #### The deferred verification
 
@@ -774,6 +881,12 @@ where the value is stored, sent or cast, e.g. at the `UPDATE`, not at the
 not catch it. Every other bad input (framing, checksums, change columns,
 missing dependencies, duplicate seq, decoder panics) fails inside `merge`.
 Verifying eagerly would cost a load per merge and undo most of the gain.
+The check runs only while `pg_automerge.verify_writes` is on (read when
+the value is flattened; see [The `pg_automerge.verify_writes`
+setting](#the-pg_automergeverify_writes-setting)). A save merged with
+`merge(automerge, bytea)` that contains `a` and is its own canonical or
+compressed encoding is the result as it is, verified by that encoding,
+and needs no check.
 
 The failure path is tested with a test-only hook
 (`test_hooks::set_fail_reload_check`, feature `test-hooks`) that makes the
@@ -782,7 +895,10 @@ check fail: `merge(...)` and reads of its result succeed and run no check;
 the row is unchanged; a PL/pgSQL variable holding the result stays usable
 after the failed `UPDATE` and stores fine once the check passes; on input,
 canonical bytes and compressed saves take no check while other input
-fails.
+fails. The setting is tested the same way (`src/tests/loads.rs`): off, the
+forced failure never runs and a real input whose re-save does not load is
+stored and then fails to read with `XX000`; only superusers may change
+it.
 
 #### Pitfalls avoided (supabase/pg_crdt's expanded automerge)
 
@@ -920,16 +1036,27 @@ What costs a load, per call:
   version) is loaded once to validate it (3 MB: 2.6 s; 877 kB: 180 ms;
   83 kB: 20 ms). Any other input (a save plus trailing change chunks, a
   save by an implementation whose encoding differs) costs two loads
-  (validate, then verify the normalized re-save).
+  (validate, then verify the normalized re-save; one with
+  `pg_automerge.verify_writes` off).
 - `merge(doc, $changes::bytea)` sends and parses only the new changes, but
   on a stored `doc` still loads it, saves the result and loads it once more
-  to verify it (on the 3 MB document: 5.3 s for a one-change update, 2.6 s
-  when the changes are already there). A full save through
-  `merge(doc, $save::automerge)` costs normalizing the input (one or two
-  loads, see above) plus one load of the newer side.
+  to verify it (on the 3 MB document: 5.2 s for a one-change update; 2.7 s
+  with `pg_automerge.verify_writes` off). Changes that are already there
+  are usually seen from the chunk hashes without a load (185 ms, the
+  detoast and the row rewrite).
+- A newer full save of the stored document, `merge(doc, $save::bytea)` or
+  `merge(doc, $save::automerge)` with a cast in the query, costs one load
+  (of the save; 2.8 s on the 3 MB document), and the stored document is
+  never loaded. The upsert (`INSERT .. ON CONFLICT DO UPDATE SET doc =
+  merge(docs.doc, EXCLUDED.doc)`) and a typed `automerge` parameter in a
+  custom plan cost two (see [Expanded values](#expanded-values)). A
+  concurrent save (neither contains the other) costs a load of each side
+  and the verification load.
 - `automerge_contains(doc, changes bytea)` and the no-op check of
-  `merge(doc, changes bytea)` need no load for re-sent latest changes and
-  (for `automerge_contains`) new changes on top of the current heads.
+  `merge(doc, changes bytea)` need no load for re-sent latest changes, a
+  re-sent save of the document, and (for `automerge_contains`) new changes
+  on top of the current heads; for any other single save
+  `automerge_contains` loads the stored document, never the save.
 - History (the 3 MB document plus 200 small changes, 201 changes):
   `automerge_change_count` 2 ms; `automerge_changes_meta` 2.8 s (one load);
   `automerge_changes` and `automerge_changes_bytes` for all changes 5.1 s
@@ -979,10 +1106,10 @@ What costs a load, per call:
   `#[pg_extern(sql = false)]`, `CREATE TYPE`). Three Rust types map to SQL
   `automerge` with `TypeOrigin::ThisExtension`, all listed in that block's
   `creates`, so pgrx orders every other function after the type:
-  `AutomergeDatum` (a new flat value: the input functions and the `bytea`
-  cast), `AutomergeArg` (an argument, flat or expanded) and
-  `AutomergeValue` (other results: new flat bytes, or a datum passed
-  through, i.e. an unchanged argument or a new expanded object).
+  `AutomergeDatum` (a new flat value: the input and receive functions),
+  `AutomergeArg` (an argument, flat or expanded) and `AutomergeValue`
+  (other results: new flat bytes, or a datum passed through, i.e. an
+  unchanged argument or a new expanded object, e.g. the `bytea` cast's).
 - `AutomergeArg` is not detoasted up front: the heads fast path fetches a
   prefix with `pg_detoast_datum_slice`, and `AutomergeArg::detoast()`
   returns a `Detoasted` guard holding either the detoasted bytes of a flat
@@ -1018,8 +1145,13 @@ What costs a load, per call:
   assertions make large documents quadratic, and its overflow checks turned a
   counter past i64::MAX into a panic on read in dev builds only.
 - Test instrumentation (a counter of in-place merges, the list of sent
-  notifications, the core's count of live loaded documents behind the
+  notifications, the core's counts of live loaded documents and of
+  `Automerge::load` calls, the forced failure of the save-and-load check
+  and an override of `pg_automerge.verify_writes`, behind the
   `test-hooks` feature) is compiled only into test builds.
+- `pg_automerge.verify_writes` is defined in `_PG_init` and registered with
+  the core (`set_verification_check`), which asks it whenever it would run
+  the save-and-load check (`verification_enabled`).
 
 ## Testing
 
@@ -1037,7 +1169,10 @@ What costs a load, per call:
   random-history generator and stored-bytes wrappers around the
   `Input`-based API.
 - `#[pg_test]`s (`cargo pgrx test pg18`) for SQL behaviour, in
-  `src/tests/{io,merge,history,notify,expanded}.rs`. They are `include!`d
+  `src/tests/{io,merge,history,notify,expanded,hardening,loads}.rs`
+  (`loads.rs` counts the `Automerge::load` calls of each write path, and
+  covers the release of the cast's expanded values and the
+  `pg_automerge.verify_writes` setting). They are `include!`d
   into the `#[pg_schema] mod tests` in `lib.rs` rather than declared as
   submodules, because pgrx runs each test as a function of the `tests`
   schema and only items of that exact module go there. Test documents are
@@ -1103,7 +1238,11 @@ What costs a load, per call:
 - `tests/bench_expanded.sh` (`mise run bench-expanded`, not part of
   `mise run test`) installs a release build and times the SQL workloads
   of [Performance](#performance) on three generated documents;
-  `mise run bench-core` times the Rust primitives (`examples/bench_core.rs`).
+  `tests/bench_sql.sh` (`mise run bench-sql`) times the everyday paths
+  (reads, inserts, the merge and upsert forms of a write) one statement at
+  a time through psql, writes in `BEGIN .. ROLLBACK`, median of three
+  runs; `mise run bench-core` times the Rust primitives
+  (`examples/bench_core.rs`).
 - CI (`.github/workflows/ci.yml`) runs `mise run ci` (lint, test, regress)
   on every push and pull request, and the benchmarks nightly (uploaded as a
   workflow-run artifact). Runs are grouped by event and ref, so a newer
@@ -1233,3 +1372,33 @@ The jsonb reads gain from building jsonb directly (no JSON text and
 `jsonb_in`: about 60 ms on the 3 MB and 877 kB documents) and, on the
 list documents, from the one-sweep walk; on the 3 MB text the two
 roughly cancel out.
+
+### SQL paths: redundant loads removed (2026-09-28)
+
+`mise run bench-sql` (release build, median of three, milliseconds; one
+load of the 3 MB text takes about 2.5 s, of the 877 kB list about 160
+ms). "newer" is the stored document plus one change by another actor as a
+compressed save; "changes" its `save_after(stored heads)`. Loads counted
+by the pg_tests of `src/tests/loads.rs`.
+
+| Path | loads before → after | 877 kB before | after | 3.0 MB before | after |
+|---|---|---|---|---|---|
+| R1 `doc->>'status'` | 1 → 1 | 310 | 314 | 2817 | 2813 |
+| R2 three accessors in one `SELECT` | 3 → 3 | 908 | 915 | 8423 | 8358 |
+| R3 `automerge_heads(doc)` | 0 → 0 | 0.5 | 0.5 | 0.5 | 0.5 |
+| I1 `INSERT` of newer (bytea) | 1 → 1 | 210 | 216 | 2778 | 2788 |
+| W1 `merge(doc, changes::bytea)` | 2 → 2 | 362 | 365 | 5217 | 5253 |
+| W2 `merge(doc, newer::bytea)` | 3 → 1 | 505 | 213 | 7390 | 2789 |
+| W3 `merge(doc, newer::automerge)` | 2 → 1 | 395 | 217 | 5311 | 2761 |
+| W4 upsert of newer, `merge(docs.doc, excluded.doc)` | 2 → 2 | 381 | 370 | 5342 | 5345 |
+| W5 W1 again (already there) | 0 → 0 | 35 | 35 | 185 | 189 |
+| W6 W3 with a text parameter (`\bind`, custom plan) | 2 → 2 | 391 | 381 | 5365 | 5352 |
+
+With `pg_automerge.verify_writes = off`, W1 takes one load (210 ms and
+2722 ms); the other paths are unchanged (their writes need no check).
+W2 no longer loads the stored document plus the save (as `a ++ save`)
+and then verifies the result: the save is loaded on its own and, since
+it contains the stored document, is the result, verified by its own
+encoding. W3's cast hands its loaded document to `merge`. W4 and W6 stay
+at two loads because Postgres flattens `EXCLUDED` and constant-folded
+parameters (see [Expanded values](#expanded-values)).

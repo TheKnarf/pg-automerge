@@ -339,3 +339,150 @@ fn contains_changes_matches_loaded_document() {
         "{fast_true} {fast_false} {slow}"
     );
 }
+
+/// Loads taken by `f` on this thread.
+fn loads_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = pg_automerge_core::test_hooks::loads();
+    let result = f();
+    (result, pg_automerge_core::test_hooks::loads() - before)
+}
+
+#[test]
+fn full_saves_load_once_when_they_contain_the_document() {
+    use pg_automerge_core::loaded::{self, Input, LoadedDoc};
+    use pg_automerge_core::test_hooks::reload_checks;
+
+    let mut base = AutoCommit::new().with_actor(actor(1));
+    base.put(ROOT, "pad", "long enough to compress ".repeat(40))
+        .unwrap();
+    base.commit();
+    let older = base.save();
+    base.put(ROOT, "status", "stored").unwrap();
+    base.commit();
+    let a = stored(&mut base);
+    let mut newer = AutoCommit::load(&base.save()).unwrap().with_actor(actor(2));
+    newer.put(ROOT, "status", "edited").unwrap();
+    newer.commit();
+    let newer_stored = stored(&mut newer);
+
+    // A newer save, compressed or canonical: one load (the save), no
+    // check, and the result is the save's own stored bytes.
+    for input in [newer.save(), newer_stored.clone()] {
+        let checks = reload_checks();
+        let (got, n) = loads_of(|| loaded::merge_changes(Input::Stored(&a), &input).unwrap());
+        let got = got.expect("new changes");
+        assert_eq!(n, 1);
+        assert!(!got.is_unverified());
+        assert_eq!(got.cached_stored(), Some(newer_stored.as_slice()));
+        assert_eq!(reload_checks(), checks);
+        // The same through a loaded `a`: nothing loaded at all.
+        let loaded_a = LoadedDoc::from_stored(&a).unwrap();
+        let (got, n) =
+            loads_of(|| loaded::merge_changes(Input::Loaded(&loaded_a), &input).unwrap());
+        assert_eq!(n, 1);
+        assert_eq!(got.unwrap().cached_stored(), Some(newer_stored.as_slice()));
+    }
+    // The document's own save, or one it contains: the header decides
+    // (no load), or `a` is loaded first because the save has fewer
+    // changes (one load, never the save).
+    for input in [a.clone(), base.save()] {
+        assert_eq!(loads_of(|| merge_changes(&a, &input).unwrap()), (None, 0));
+    }
+    assert_eq!(loads_of(|| merge_changes(&a, &older).unwrap()), (None, 1));
+    assert_eq!(
+        loads_of(|| contains_changes(&a, &older).unwrap()),
+        (true, 1)
+    );
+    assert_eq!(
+        loads_of(|| contains_changes(&a, &newer.save()).unwrap()),
+        (false, 1)
+    );
+    assert_eq!(loads_of(|| contains_changes(&a, &a).unwrap()), (true, 0));
+
+    // A concurrent save: both loaded, merged into `a`'s document, checked
+    // when saved.
+    let mut other = AutoCommit::load(&older).unwrap().with_actor(actor(3));
+    other.put(ROOT, "other", true).unwrap();
+    other.commit();
+    let (got, n) = loads_of(|| loaded::merge_changes(Input::Stored(&a), &other.save()).unwrap());
+    let got = got.unwrap();
+    assert_eq!(n, 2);
+    assert!(got.is_unverified());
+    let checks = reload_checks();
+    let bytes = got.stored().unwrap().to_vec();
+    assert_eq!(reload_checks(), checks + 1);
+    assert_eq!(to_json(&bytes).unwrap()["other"], json!(true));
+    assert_eq!(to_json(&bytes).unwrap()["status"], json!("stored"));
+    assert_eq!(heads(&bytes).unwrap().len(), 2);
+
+    // A save whose trailing changes depend on changes only `a` has: loaded
+    // as `a ++ input`, as before.
+    let mut writer = AutoCommit::load(&a).unwrap().with_actor(actor(4));
+    let heads_a = writer.get_heads();
+    writer.put(ROOT, "later", 1i64).unwrap();
+    let trailing = [older.as_slice(), &writer.save_after(&heads_a)].concat();
+    let got = apply(&a, &trailing);
+    assert_eq!(heads(&got).unwrap(), sorted_heads(&mut writer));
+    assert_eq!(to_json(&got).unwrap()["later"], json!(1));
+
+    // Strict: a save with a bad checksum is rejected even when its heads
+    // are known; any corruption is a clean error or a valid result.
+    let mut bad = a.clone();
+    bad[5] ^= 1;
+    assert!(invalid(merge_changes(&a, &bad)).contains("bad checksum"));
+    let save = newer.save();
+    for i in (0..save.len()).step_by(7) {
+        let mut b = save.clone();
+        b[i] ^= 0x5a;
+        match merge_changes(&a, &b) {
+            Ok(_) | Err(Error::InvalidInput(_) | Error::MissingDependencies(_)) => {}
+            Err(e) => panic!("byte {i}: {e:?}"),
+        }
+    }
+}
+
+#[test]
+fn verification_can_be_switched_off() {
+    use pg_automerge_core::loaded::{self, Input, LoadedDoc};
+    use pg_automerge_core::test_hooks::{reload_checks, set_verification};
+
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            set_verification(None);
+        }
+    }
+    let _reset = Reset;
+
+    let mut doc = AutoCommit::new().with_actor(actor(1));
+    doc.put(ROOT, "x", 1i64).unwrap();
+    let heads = doc.get_heads();
+    let save = doc.save();
+    doc.put(ROOT, "y", 2i64).unwrap();
+    let change = doc.save_after(&heads);
+    let trailing = [save.as_slice(), &change].concat();
+    let a = normalize(&save).unwrap();
+    assert!(pg_automerge_core::verification_enabled());
+
+    // On: input that is not its own encoding is loaded back.
+    let checks = reload_checks();
+    let (on, n) = loads_of(|| normalize(&trailing).unwrap());
+    assert_eq!((n, reload_checks()), (2, checks + 1));
+    // Off: the same bytes, one load, no check; also for merge results.
+    set_verification(Some(false));
+    assert!(!pg_automerge_core::verification_enabled());
+    let (off, n) = loads_of(|| normalize(&trailing).unwrap());
+    assert_eq!((n, reload_checks()), (1, checks + 1));
+    assert_eq!(on, off);
+    let loaded = LoadedDoc::from_external(&trailing).unwrap();
+    assert_eq!(loaded.cached_stored(), Some(on.as_slice()));
+    let merged = loaded::merge_changes(Input::Stored(&a), &change)
+        .unwrap()
+        .unwrap();
+    assert!(merged.is_unverified());
+    let (bytes, n) = loads_of(|| merged.stored().unwrap().to_vec());
+    assert_eq!((n, reload_checks()), (0, checks + 1));
+    assert_eq!(bytes, on);
+    set_verification(None);
+    assert!(pg_automerge_core::verification_enabled());
+}

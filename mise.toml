@@ -98,3 +98,7 @@ run = [
   "mise run test",
   "mise run regress",
 ]
+
+[tasks.bench-sql]
+description = "Median timings of the everyday SQL paths (reads, inserts, merges, upserts) on a release build; not part of test"
+run = "bash tests/bench_sql.sh"

@@ -226,7 +226,7 @@ pub(crate) fn guard_for<T>(
 /// Empty input is the empty document. Unguarded: callers run it inside
 /// [`guard_input`].
 fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
-    let doc = Automerge::load(bytes).map_err(|e| match e {
+    let doc = load_bytes(bytes).map_err(|e| match e {
         AutomergeError::MissingDeps => Error::InvalidInput(
             "invalid automerge document: changes are missing dependencies".into(),
         ),
@@ -247,8 +247,10 @@ fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
 /// The save is guarded too: a document that loaded from malformed (but
 /// checksummed) input could still trip an assertion when re-encoded.
 ///
-/// The result is loaded back and must have the same heads, unless loading
-/// it provably parses the very bytes the first load already accepted:
+/// The result is loaded back and must have the same heads (when
+/// verification is on, see [`verification_enabled`]), unless loading it
+/// provably parses the very bytes the first load already accepted (see
+/// `loads_as_saved`):
 ///
 /// - the input already was the canonical encoding (`saved == bytes`), or
 /// - the input is one document chunk with deflated columns (a compressed
@@ -273,16 +275,64 @@ fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
 /// missing dependencies, and for input that does not survive a save and
 /// load.
 pub fn normalize(bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    guard_input(|| {
-        let doc = load_external(bytes)?;
-        let saved = doc.save_nocompress();
-        if saved != bytes && header::inflate_document(bytes).as_deref() != Some(saved.as_slice()) {
-            let mut heads = doc.get_heads();
-            heads.sort_unstable();
-            reload_check(&saved, &heads, "invalid automerge document")?;
-        }
-        Ok(saved)
-    })
+    guard_input(|| normalize_unguarded(bytes).map(|(_, saved)| saved))
+}
+
+/// [`normalize`], keeping the loaded document: the document and its
+/// stored bytes (checked as `normalize` checks them). Unguarded.
+pub(crate) fn normalize_unguarded(bytes: &[u8]) -> Result<(Automerge, Vec<u8>), Error> {
+    let doc = load_external(bytes)?;
+    let saved = doc.save_nocompress();
+    if !loads_as_saved(bytes, &saved) && verification_enabled() {
+        let mut heads = doc.get_heads();
+        heads.sort_unstable();
+        reload_check(&saved, &heads, "invalid automerge document")?;
+    }
+    Ok((doc, saved))
+}
+
+/// Whether loading `saved` (the `save_nocompress()` of a document loaded
+/// from `input`) provably parses the bytes the load of `input` already
+/// accepted, so the save-and-load check is not needed: `input` is the
+/// canonical encoding itself, or one compressed document chunk that
+/// inflates to it (see [`normalize`]).
+pub(crate) fn loads_as_saved(input: &[u8], saved: &[u8]) -> bool {
+    saved == input || header::inflate_document(input).as_deref() == Some(saved)
+}
+
+/// The process-wide switch of the save-and-load check (see
+/// [`set_verification_check`]).
+static VERIFICATION_CHECK: OnceLock<fn() -> bool> = OnceLock::new();
+
+/// Register the function that says whether the save-and-load check of
+/// values built from external input is on (the extension registers the
+/// `pg_automerge.verify_writes` setting). Only the first registration
+/// counts; without one the check is always on.
+pub fn set_verification_check(check: fn() -> bool) {
+    let _ = VERIFICATION_CHECK.set(check);
+}
+
+/// Whether the save-and-load check of values built from external input
+/// runs: [`normalize`] and the deferred check of
+/// [`loaded::LoadedDoc::stored`]. On unless the registered switch (see
+/// [`set_verification_check`]) says otherwise. With the check off, input
+/// that loads but whose normalized save does not load back (malformed
+/// input with valid checksums, seen only in fuzzing) is stored as is and
+/// fails when it is next loaded.
+pub fn verification_enabled() -> bool {
+    #[cfg(feature = "test-hooks")]
+    if let Some(on) = test_hooks::verification_override() {
+        return on;
+    }
+    VERIFICATION_CHECK.get().is_none_or(|check| check())
+}
+
+/// `Automerge::load`, counted for the tests (see `test_hooks::loads`,
+/// feature `test-hooks`).
+pub(crate) fn load_bytes(bytes: &[u8]) -> Result<Automerge, AutomergeError> {
+    #[cfg(feature = "test-hooks")]
+    test_hooks::count_load();
+    Automerge::load(bytes)
 }
 
 /// The safeguard of [`normalize`] for a document built from external
@@ -296,7 +346,7 @@ pub(crate) fn reload_check(saved: &[u8], heads: &[ChangeHash], what: &str) -> Re
             "{what}: does not survive a save and load (forced by a test hook)"
         )));
     }
-    let reloaded = Automerge::load(saved).map_err(|e| {
+    let reloaded = load_bytes(saved).map_err(|e| {
         Error::InvalidInput(format!("{what}: does not survive a save and load ({e})"))
     })?;
     let mut reloaded_heads = reloaded.get_heads();
@@ -313,8 +363,7 @@ pub(crate) fn reload_check(saved: &[u8], heads: &[ChangeHash], what: &str) -> Re
 /// in, so failure here means on-disk corruption (or a bug) and is reported
 /// as internal.
 pub(crate) fn load_stored_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
-    Automerge::load(bytes)
-        .map_err(|e| Error::Internal(format!("corrupt stored automerge value: {e}")))
+    load_bytes(bytes).map_err(|e| Error::Internal(format!("corrupt stored automerge value: {e}")))
 }
 
 /// `Err(missing hashes)` if `doc` holds changes whose dependencies are absent.
@@ -410,7 +459,7 @@ pub(crate) fn apply_changes(
     let mut combined = Vec::with_capacity(a.len() + changes.len());
     combined.extend_from_slice(a);
     combined.extend_from_slice(changes);
-    let doc = Automerge::load(&combined)
+    let doc = load_bytes(&combined)
         .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
     drop(combined);
     if let Err(mut missing) = ensure_complete(&doc) {

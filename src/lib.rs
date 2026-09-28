@@ -29,11 +29,35 @@ mod notify;
 
 ::pgrx::pg_module_magic!(name, version);
 
+/// `pg_automerge.verify_writes`: whether values built from client input
+/// are loaded back once before they are stored or sent (see
+/// docs/DESIGN.md, "Invariants" and "The deferred verification").
+static VERIFY_WRITES: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+
 /// Library initialization: let the core's long loops (the jsonb walk,
-/// history rows) honour query cancel and `statement_timeout`.
+/// history rows) honour query cancel and `statement_timeout`, and define
+/// the `pg_automerge.verify_writes` setting.
 #[pgrx::pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     pg_automerge_core::set_interrupt_check(check_for_interrupts);
+    pgrx::GucRegistry::define_bool_guc(
+        c"pg_automerge.verify_writes",
+        c"Load back the normalized save of values built from client input before storing them.",
+        c"On (the default), a value built from client bytes (input, the bytea cast, merge with a \
+          bytea) is loaded back once before it is stored or sent, unless it provably is the input's \
+          own encoding, so malformed input that loads but whose save does not is rejected (22P02) \
+          instead of stored. Off skips that load, which halves the cost of such writes, at the \
+          risk of storing a value that fails when it is next read. Superuser-only.",
+        &VERIFY_WRITES,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
+    pg_automerge_core::set_verification_check(verify_writes);
+}
+
+/// The current value of `pg_automerge.verify_writes`.
+fn verify_writes() -> bool {
+    VERIFY_WRITES.get()
 }
 
 /// `CHECK_FOR_INTERRUPTS()`. An interrupt raises an ERROR, which unwinds

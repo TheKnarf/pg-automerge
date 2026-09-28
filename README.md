@@ -72,6 +72,8 @@ ON CONFLICT (id) DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc);
 
 -- Or persist incrementally: $2 is only the new changes (save_incremental()
 -- or save_after(heads)), bound as bytea, applied on top of the stored row.
+-- A full save works here too, and when the row exists this costs one load
+-- of the save against the upsert's two.
 UPDATE docs SET doc = merge(doc, $2) WHERE id = $1;
 
 -- Read: automerge casts implicitly to jsonb.
@@ -146,8 +148,9 @@ to wait for another's row lock re-checks the whole `WHERE` against the
 committed row (EvalPlanQual), so it skips the row if the other writer
 already stored the same changes and merges into the new version otherwise.
 For bare changes (`$1` bytea) the check usually needs no load of the
-document; for a full save (`$1::automerge`) it costs one extra load when
-there is something new.
+document; for a full save it needs none when the save is the stored
+document's own, and costs one extra load of the stored document when there
+is something new.
 
 ## Merging in PL/pgSQL and nested merges
 
@@ -219,11 +222,20 @@ concurrent values show Automerge's winner. Details in
   `FROM docs, LATERAL (SELECT doc::jsonb AS j OFFSET 0) x` and read
   `x.j->>'a'` (the `OFFSET 0` stops the planner from inlining the cast
   back), or keep the generated jsonb column shown above.
-- **Some input costs two loads.** A full save, compressed
+- **Some writes cost two loads.** A full save, compressed
   (`Automerge.save()`) or not (`saveNoCompress()`, `doc::bytea`), is loaded
-  once to validate it. Other input (a save followed by change chunks, a
-  document saved by a different Automerge implementation or version whose
-  encoding differs) is loaded, re-saved and loaded again to verify it.
+  once to validate it, and `merge(doc, $save)` with a newer save loads only
+  the save. Other input (a save followed by change chunks, a document saved
+  by a different Automerge implementation or version whose encoding
+  differs) and every merged result of incremental changes is loaded,
+  re-saved and loaded again to verify it; the upsert of a full save loads
+  it twice (Postgres hands `EXCLUDED` over flat).
+- **`pg_automerge.verify_writes`** (default `on`, superuser-only) is that
+  verification load. `off` halves incremental writes
+  (`merge(doc, $changes)`: one load instead of two) but lets malformed
+  input that loads, but whose re-save does not, be stored and fail on every
+  later read (`XX000`); use it only for trusted writers. See
+  [DESIGN.md](docs/DESIGN.md#the-pg_automergeverify_writes-setting).
 - `merge(doc, $1)` with a parameter the driver types as `bytea` uses
   `merge(automerge, bytea)`, which accepts full saves and bare change
   chunks. An *untyped* literal or parameter (`merge(doc, '\x..')`) resolves
@@ -312,7 +324,9 @@ document (3,000,000-character text; release build, warm cache):
 | `doc->>'status'` (load, then jsonb) | 2.8 s |
 | `automerge_heads`, `automerge_change_count` (header only) | 0.3 ms, 2 ms |
 | `merge(doc, x)` when `x` adds nothing | 16 ms (detoasting) |
-| `UPDATE .. SET doc = merge(doc, one change set)` | 5.2 s (load, save, verification load) |
+| `UPDATE .. SET doc = merge(doc, one change set)` | 5.2 s (load, save, verification load); 2.7 s with `pg_automerge.verify_writes = off` |
+| `UPDATE .. SET doc = merge(doc, newer full save)` | 2.8 s (one load, of the save) |
+| `INSERT .. ON CONFLICT DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc)`, newer save | 5.3 s (two loads) |
 | PL/pgSQL: merge 20 change sets into a variable, then store | 5.4 s |
 | `automerge_changes_meta(doc)` / `automerge_changes(doc)` (201 changes) | 2.8 s / 5.1 s |
 
@@ -336,7 +350,8 @@ mise run dump        # only: pg_dump/pg_restore and COPY round trips of every ob
 mise run upgrade     # only: ALTER EXTENSION UPDATE from every released version
 mise run replication # logical replication in a scratch cluster (not part of test)
 mise run fuzz        # a long mutation-fuzzing session of the core (not part of test)
-mise run bench-expanded  # SQL timings on a release build (minutes)
+mise run bench-sql   # median timings of the everyday SQL paths on a release build (minutes)
+mise run bench-expanded  # SQL timings of merge chains and PL/pgSQL loops on a release build (minutes)
 mise run bench-core  # Rust timings of load, normalize and the jsonb walk
 mise run package     # release package for the Postgres of $PG_CONFIG (required)
 mise run run         # install and open psql against the pgrx-managed Postgres

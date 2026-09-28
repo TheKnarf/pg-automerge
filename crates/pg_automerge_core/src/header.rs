@@ -465,6 +465,46 @@ fn chunk(chunk_type: u8, data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Whether `bytes` starts with the magic bytes and type of a document
+/// chunk (a save, compressed or not, possibly followed by more chunks).
+/// Nothing else is checked.
+pub fn starts_with_document(bytes: &[u8]) -> bool {
+    bytes.len() > 8 && bytes[..4] == MAGIC && bytes[8] == DOCUMENT_CHUNK
+}
+
+/// The header of external input that is exactly one document chunk (see
+/// [`document_chunk`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentChunk {
+    /// The heads the header lists (not verified against the changes: only
+    /// a load does that).
+    pub heads: Vec<ChangeHash>,
+    /// The number of changes, when [`change_count_from_bytes`] can read it
+    /// (not when the change actor column is deflated).
+    pub change_count: Option<u64>,
+}
+
+/// Read the header of external input that is exactly one document chunk
+/// (compressed or not) with a valid checksum, without loading it: what
+/// Automerge checks of a document chunk it then skips because it already
+/// has all of the chunk's heads (automerge 0.12 `storage/load.rs`). `None`
+/// for anything else. Hashes the whole chunk; never panics.
+pub fn document_chunk(bytes: &[u8]) -> Option<DocumentChunk> {
+    use sha2::{Digest, Sha256};
+
+    let heads = heads_from_bytes(bytes)?;
+    // The checksum: the first four bytes of sha256(type || uleb128 length
+    // || data), which is everything after the magic and the checksum.
+    let hash: [u8; 32] = Sha256::digest(&bytes[8..]).into();
+    if hash[..4] != bytes[4..8] {
+        return None;
+    }
+    Some(DocumentChunk {
+        heads,
+        change_count: change_count_from_bytes(bytes),
+    })
+}
+
 /// Chunk type of an uncompressed change chunk.
 const CHANGE_CHUNK: u8 = 1;
 
