@@ -5,7 +5,8 @@ documents in an `automerge` column, lets you query them with every `jsonb`
 operator, function and index, and merges concurrent writes so that two
 backends never overwrite each other's changes.
 
-The extension does not edit documents and never creates changes. Your backend
+The extension does not edit documents and never creates changes (it can
+list and return the changes a document already has). Your backend
 syncs with its frontends, owns the actor IDs, and persists Automerge saves;
 Postgres stores them, merges them and makes them queryable. See
 [docs/DESIGN.md](docs/DESIGN.md) for the full specification.
@@ -32,6 +33,14 @@ SELECT jsonb_path_query(doc, '$.items[*] ? (@.done == false)') FROM docs;
 
 -- Load it back in the backend.
 SELECT doc::bytea FROM docs WHERE id = $1;
+
+-- Or only what a replica at heads $2 (text[]) is missing, as change chunks
+-- for loadIncremental / applyChanges (Automerge's save_after).
+SELECT automerge_changes_bytes(doc, $2) FROM docs WHERE id = $1;
+
+-- History: who changed what, and the state as of any change.
+SELECT seq, actor, time, message FROM docs, automerge_changes_meta(doc) WHERE id = $1;
+SELECT automerge_to_jsonb(doc, ARRAY[$2]) FROM docs WHERE id = $1;
 ```
 
 For read-heavy tables, keep a jsonb copy and index it (the cast is IMMUTABLE):
@@ -56,6 +65,12 @@ CREATE INDEX ON docs USING gin ((doc::jsonb));
 | `merge_agg(automerge)` | Aggregate merge of all non-null inputs. |
 | `automerge_heads(automerge) → text[]` | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
 | `automerge_contains(a, b) → bool` | Whether `a` already has every change of `b`. |
+| `automerge_changes(doc, since_heads text[] DEFAULT '{}')` | `SETOF automerge_change (hash, actor, seq, start_op, op_count, time, message, deps, change bytea)`: every change not reachable from `since_heads` (all by default), dependencies first. Rebuilds change bytes (costly on big documents). |
+| `automerge_changes_meta(doc, since_heads DEFAULT '{}')` | The same rows without `change` (`SETOF automerge_change_meta`); needs only the change graph. |
+| `automerge_changes_bytes(doc, since_heads DEFAULT '{}') → bytea` | Those changes as concatenated change chunks (`save_after(since_heads)`); `merge(replica, ...)` or `loadIncremental` applies them. |
+| `automerge_get_change(doc, hash) → automerge_change` | One change with its bytes; NULL if absent. |
+| `automerge_change_count(doc) → bigint` | Number of changes, read from the stored bytes without loading the document. |
+| `automerge_to_jsonb(doc, heads text[]) → jsonb` | The state as of `heads` (`'{}'`: before any change). |
 
 jsonb mapping: maps/tables → objects, lists → arrays, text → strings,
 integers and counters → exact numbers, NaN/±Infinity → `null`, timestamps →
@@ -96,6 +111,19 @@ Gotchas:
   MB a single call can take a noticeable time.
 - Malformed input is always SQLSTATE `22P02` (`invalid automerge document`),
   including input that passes Automerge's checksums but panics its decoder.
+- In `since_heads`, hashes the document does not have are **ignored** (as
+  in Automerge's `getChanges`): a replica that is ahead of the stored row
+  gets every change that is not an ancestor of the heads the row knows,
+  which is more than it needs but never less. A mistyped hash therefore
+  returns more changes, not an error. `automerge_to_jsonb(doc, heads)`
+  instead fails with `22023` for an unknown hash. Malformed hashes (not 64
+  hex digits) are `22P02` everywhere.
+- `time` is Automerge's commit time in Unix seconds, NULL when unset.
+- `automerge_changes`, `automerge_changes_bytes` and `automerge_get_change`
+  rebuild change bytes from the document (on a 3 MB document, all changes
+  took 5 s against 2.8 s for `automerge_changes_meta`); prefer
+  `automerge_changes_meta` for listings. The set-returning functions
+  compute all rows up front, so `LIMIT` does not make them cheaper.
 
 ## Development
 

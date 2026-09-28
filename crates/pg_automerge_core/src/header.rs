@@ -36,18 +36,23 @@ use automerge::ChangeHash;
 const MAGIC: [u8; 4] = [0x85, 0x6f, 0x4a, 0x83];
 const DOCUMENT_CHUNK: u8 = 0;
 
-/// Result of reading heads from (a prefix of) stored bytes.
+/// Result of reading something from (a prefix of) stored bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HeadsPrefix {
-    /// The heads, in the order the header lists them (sorted by hash in
-    /// practice, but callers must not rely on it).
-    Found(Vec<ChangeHash>),
-    /// The prefix ends before the heads do: at least this many bytes of the
-    /// value (counted from its start) are needed.
+pub enum Prefix<T> {
+    /// The value read.
+    Found(T),
+    /// The prefix ends before the value does: at least this many bytes of
+    /// the value (counted from its start) are needed.
     NeedMore(usize),
-    /// Not a single document chunk; do a full load instead.
+    /// Not a single document chunk (or not in the expected shape); do a
+    /// full load instead.
     NotSingleDoc,
 }
+
+/// Result of reading heads from (a prefix of) stored bytes. `Found` holds
+/// the heads in the order the header lists them (sorted by hash in
+/// practice, but callers must not rely on it).
+pub type HeadsPrefix = Prefix<Vec<ChangeHash>>;
 
 /// Why parsing stopped.
 enum Stop {
@@ -96,6 +101,27 @@ impl Reader<'_> {
     fn uleb_usize(&mut self) -> Result<usize, Stop> {
         usize::try_from(self.uleb()?).map_err(|_| Stop::NotSingleDoc)
     }
+
+    /// A signed LEB128 value of at most 64 bits.
+    fn sleb(&mut self) -> Result<i64, Stop> {
+        let mut value = 0i64;
+        for i in 0..10 {
+            let byte = self.take(1)?[0];
+            let bits = i64::from(byte & 0x7f);
+            if i == 9 && !(bits == 0 || bits == 0x7f) {
+                return Err(Stop::NotSingleDoc);
+            }
+            value |= bits << (7 * i);
+            if byte & 0x80 == 0 {
+                let shift = 7 * (i + 1);
+                if shift < 64 && byte & 0x40 != 0 {
+                    value |= -1i64 << shift;
+                }
+                return Ok(value);
+            }
+        }
+        Err(Stop::NotSingleDoc)
+    }
 }
 
 /// Read the heads of a stored value given its first `prefix.len()` bytes and
@@ -122,11 +148,15 @@ pub fn heads_from_bytes(bytes: &[u8]) -> Option<Vec<ChangeHash>> {
 }
 
 fn parse(prefix: &[u8], total_len: usize) -> Result<Vec<ChangeHash>, Stop> {
-    let mut r = Reader {
+    parse_heads(&mut Reader {
         prefix,
         total_len,
         pos: 0,
-    };
+    })
+}
+
+/// Parse up to the end of the heads, leaving `r` just after them.
+fn parse_heads(r: &mut Reader<'_>) -> Result<Vec<ChangeHash>, Stop> {
     if r.take(4)? != MAGIC {
         return Err(Stop::NotSingleDoc);
     }
@@ -136,7 +166,7 @@ fn parse(prefix: &[u8], total_len: usize) -> Result<Vec<ChangeHash>, Stop> {
     }
     let data_len = r.uleb_usize()?;
     // Exactly one chunk: the data runs to the end of the value.
-    if r.pos.checked_add(data_len) != Some(total_len) {
+    if r.pos.checked_add(data_len) != Some(r.total_len) {
         return Err(Stop::NotSingleDoc);
     }
     let actors = r.uleb_usize()?;
@@ -146,7 +176,7 @@ fn parse(prefix: &[u8], total_len: usize) -> Result<Vec<ChangeHash>, Stop> {
     }
     let count = r.uleb_usize()?;
     // Bound the allocation by what the value can hold.
-    if count > total_len / 32 {
+    if count > r.total_len / 32 {
         return Err(Stop::NotSingleDoc);
     }
     let mut heads = Vec::with_capacity(count);
@@ -155,6 +185,135 @@ fn parse(prefix: &[u8], total_len: usize) -> Result<Vec<ChangeHash>, Stop> {
         heads.push(ChangeHash(bytes));
     }
     Ok(heads)
+}
+
+/// Column spec of the change actor column: column id 0, type actor (1), not
+/// deflated (automerge `change_graph.rs`, `ids::ACTOR_COL_SPEC`).
+const CHANGE_ACTOR_SPEC: u64 = 0x01;
+/// The deflate bit of a column spec.
+const DEFLATE_BIT: u64 = 0x08;
+
+/// Read the number of changes of a stored value from (a prefix of) its
+/// bytes, without loading it.
+///
+/// After the heads, a document chunk has the change column metadata
+/// (uleb128 count, then uleb128 spec and length per column), the op column
+/// metadata, then the column data, change columns first. Every change has
+/// exactly one entry in the change actor column, which is RLE encoded
+/// (signed LEB128 count: `n > 0` a run of `n` copies of the next value,
+/// `n < 0` that many literal values, `0` a run of nulls); Automerge's
+/// loader takes the number of changes from this column's length and
+/// rejects documents whose other change columns disagree. An absent column
+/// means no changes.
+///
+/// So only the header, the metadata and the (small) actor column are read.
+/// Anything unexpected (a deflated or repeated actor column, a null run, a
+/// value that does not end where the column does, lengths beyond the value)
+/// is `NotSingleDoc`, and callers load the document instead. Never panics.
+pub fn change_count_from_prefix(prefix: &[u8], total_len: usize) -> Prefix<u64> {
+    let prefix = &prefix[..prefix.len().min(total_len)];
+    let mut r = Reader {
+        prefix,
+        total_len,
+        pos: 0,
+    };
+    match parse_change_count(&mut r) {
+        Ok(n) => Prefix::Found(n),
+        Err(Stop::NeedMore(n)) => Prefix::NeedMore(n),
+        Err(Stop::NotSingleDoc) => Prefix::NotSingleDoc,
+    }
+}
+
+/// [`change_count_from_prefix`] on complete bytes.
+pub fn change_count_from_bytes(bytes: &[u8]) -> Option<u64> {
+    match change_count_from_prefix(bytes, bytes.len()) {
+        Prefix::Found(n) => Some(n),
+        Prefix::NeedMore(_) | Prefix::NotSingleDoc => None,
+    }
+}
+
+/// Column metadata: the offset (within this group's data) and length of the
+/// column with spec `wanted`, if present, and the group's total data length.
+fn column_metadata(
+    r: &mut Reader<'_>,
+    wanted: Option<u64>,
+) -> Result<(Option<(usize, usize)>, usize), Stop> {
+    let count = r.uleb_usize()?;
+    // Each entry takes at least two bytes.
+    if count > r.total_len / 2 {
+        return Err(Stop::NotSingleDoc);
+    }
+    let mut offset = 0usize;
+    let mut found = None;
+    for _ in 0..count {
+        let spec = r.uleb()?;
+        if spec > u64::from(u32::MAX) {
+            return Err(Stop::NotSingleDoc);
+        }
+        let len = r.uleb_usize()?;
+        if Some(spec & !DEFLATE_BIT) == wanted {
+            if found.is_some() || spec & DEFLATE_BIT != 0 {
+                return Err(Stop::NotSingleDoc);
+            }
+            found = Some((offset, len));
+        }
+        offset = offset.checked_add(len).ok_or(Stop::NotSingleDoc)?;
+    }
+    Ok((found, offset))
+}
+
+fn parse_change_count(r: &mut Reader<'_>) -> Result<u64, Stop> {
+    parse_heads(r)?;
+    let (actor_col, change_len) = column_metadata(r, Some(CHANGE_ACTOR_SPEC))?;
+    let (_, ops_len) = column_metadata(r, None)?;
+    let data_start = r.pos;
+    let data_end = data_start
+        .checked_add(change_len)
+        .and_then(|n| n.checked_add(ops_len))
+        .ok_or(Stop::NotSingleDoc)?;
+    if data_end > r.total_len {
+        return Err(Stop::NotSingleDoc);
+    }
+    let Some((offset, len)) = actor_col else {
+        return Ok(0);
+    };
+    r.pos = data_start + offset;
+    let column = r.take(len)?;
+    count_rle(column)
+}
+
+/// Number of values in a complete RLE column of uleb128 values without
+/// nulls.
+fn count_rle(column: &[u8]) -> Result<u64, Stop> {
+    let mut r = Reader {
+        prefix: column,
+        total_len: column.len(),
+        pos: 0,
+    };
+    let mut count = 0u64;
+    while r.pos < column.len() {
+        let n = r.sleb()?;
+        let values = match n {
+            n if n > 0 => {
+                r.uleb()?;
+                n.unsigned_abs()
+            }
+            n if n < 0 => {
+                let k = n.unsigned_abs();
+                // Each literal value takes at least one byte.
+                if k > (column.len() - r.pos) as u64 {
+                    return Err(Stop::NotSingleDoc);
+                }
+                for _ in 0..k {
+                    r.uleb()?;
+                }
+                k
+            }
+            _ => return Err(Stop::NotSingleDoc),
+        };
+        count = count.checked_add(values).ok_or(Stop::NotSingleDoc)?;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]

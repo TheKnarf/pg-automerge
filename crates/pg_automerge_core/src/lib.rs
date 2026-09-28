@@ -15,23 +15,30 @@ use automerge::{Automerge, AutomergeError, ChangeHash, ReadDoc};
 
 pub mod encoding;
 pub mod header;
+pub mod history;
 pub mod json;
 
 pub use automerge;
 pub use serde_json;
 
 /// Errors surfaced to SQL. The glue maps [`Error::InvalidInput`] to SQLSTATE
-/// 22P02 (invalid_text_representation) and [`Error::Internal`] to XX000.
+/// 22P02 (invalid_text_representation), [`Error::InvalidParameter`] to 22023
+/// (invalid_parameter_value) and [`Error::Internal`] to XX000.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     InvalidInput(String),
+    /// A well-formed argument that does not fit the document, e.g. heads
+    /// the document does not have.
+    InvalidParameter(String),
     Internal(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidInput(msg) | Error::Internal(msg) => f.write_str(msg),
+            Error::InvalidInput(msg) | Error::InvalidParameter(msg) | Error::Internal(msg) => {
+                f.write_str(msg)
+            }
         }
     }
 }
@@ -79,7 +86,7 @@ fn guard_input<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
 }
 
 /// `guard` for operations on stored (already validated) values.
-fn guard_stored<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+pub(crate) fn guard_stored<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     guard(f, |msg| {
         Error::Internal(format!("automerge failed on a stored value: {msg}"))
     })
@@ -148,7 +155,7 @@ pub fn load_stored(bytes: &[u8]) -> Result<Automerge, Error> {
     guard_stored(|| load_stored_unguarded(bytes))
 }
 
-fn load_stored_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
+pub(crate) fn load_stored_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
     Automerge::load(bytes)
         .map_err(|e| Error::Internal(format!("corrupt stored automerge value: {e}")))
 }
@@ -175,7 +182,7 @@ fn has_all(doc: &Automerge, heads: &[ChangeHash]) -> bool {
 /// Heads of a stored value: read from the document chunk header when the
 /// value is a single document chunk (always, for values this extension
 /// stored), otherwise by loading it. See [`header`].
-fn stored_heads_unguarded(bytes: &[u8]) -> Result<Vec<ChangeHash>, Error> {
+pub(crate) fn stored_heads_unguarded(bytes: &[u8]) -> Result<Vec<ChangeHash>, Error> {
     match header::heads_from_bytes(bytes) {
         Some(heads) => Ok(heads),
         None => Ok(load_stored_unguarded(bytes)?.get_heads()),
@@ -188,7 +195,7 @@ pub fn stored_heads(bytes: &[u8]) -> Result<Vec<ChangeHash>, Error> {
 }
 
 /// Whether every hash in `sub` is in `sup`.
-fn is_subset(sub: &[ChangeHash], sup: &[ChangeHash]) -> bool {
+pub fn is_subset(sub: &[ChangeHash], sup: &[ChangeHash]) -> bool {
     if sub.len() * sup.len() <= 256 {
         return sub.iter().all(|h| sup.contains(h));
     }

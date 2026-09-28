@@ -11,13 +11,17 @@ In scope:
 - Storing Automerge documents produced elsewhere.
 - Reading them with every `jsonb` operator/function/index.
 - `merge(a, b)`: CRDT merge so concurrent writers never overwrite each other.
+- Read-only history: listing a document's changes, fetching change bytes
+  (e.g. everything since a replica's heads), and the state as of earlier
+  heads (see "History").
 
 Out of scope (by decision):
 
 - Server-side edits (no `set`/`splice`/subscripting, no `jsonb -> automerge`).
 - Actor IDs. All changes are authored by the application backend, which owns
   actor IDs. The extension never creates changes.
-- Sync protocol, history queries, history pruning.
+- Sync protocol, history pruning, and anything that writes history (the
+  history functions only read it).
 
 ## Intended usage
 
@@ -208,8 +212,23 @@ that is not exactly one document chunk (wrong magic or type, trailing
 chunks, lengths that do not add up to the value's size) falls back to a
 full load.
 
-`automerge_heads` and `automerge_contains` take their arguments without
-detoasting them (`LazyAutomerge`): they read the value's size with
+The change count comes from the same place: after the heads come the
+change and op column metadata (uleb128 count, then uleb128 spec and
+length per column) and then the column data, change columns first. The
+change actor column (spec `0x01`) has one RLE-encoded entry per change
+(signed LEB128 run count: `n > 0` repeats the next value `n` times, `n < 0`
+is followed by `-n` literal values, `0` is a null run), and Automerge's
+loader takes the number of changes from its length and rejects documents
+whose other change columns disagree. `header::change_count_from_prefix`
+counts it; an absent column means no changes; a deflated or repeated
+actor column, a null run, or anything that does not add up falls back to
+a load. A property test compares it with the loaded change graph over the
+same generated documents (and a many-actor document with literal and
+repeat runs).
+
+`automerge_heads`, `automerge_contains`, `automerge_change_count` and the
+since-functions of "History" take their document without detoasting it
+(`LazyAutomerge`): they read the value's size with
 `toast_raw_datum_size` and fetch only a prefix (4 kB, grown as needed) with
 `pg_detoast_datum_slice`, which for an out-of-line value reads only the
 TOAST chunks covering it and for a compressed value decompresses only that
@@ -237,6 +256,109 @@ comparisons of the current state (not history); history equality is
 `merge` is commutative in state only: when neither input contains the other
 the re-saved bytes depend on argument order, so `doc::bytea` is not an
 identity; `automerge_heads` is.
+
+### History (read-only)
+
+Automerge keeps a document as an op set plus a change graph: hash, actor,
+seq, op range, time, message and deps of every change. Change *bytes* are
+not stored; Automerge rebuilds them from the op set on request. So the
+metadata functions cost one load, while the functions returning change
+bytes cost a load plus re-encoding those changes (about as much again for
+all changes of a document). Nothing here creates changes.
+
+Two composite types describe a change:
+
+```sql
+CREATE TYPE automerge_change AS (
+    hash text,          -- 64 lowercase hex digits
+    actor text,         -- lowercase hex
+    seq bigint,         -- 1, 2, ... per actor
+    start_op bigint,    -- counter of the change's first op
+    op_count bigint,    -- number of ops (0 for an empty change)
+    "time" timestamptz, -- NULL when not set (0)
+    message text,       -- NULL when not set
+    deps text[],        -- sorted hashes of its dependencies
+    change bytea        -- the change chunk (uncompressed, as save_after emits it)
+);
+-- automerge_change_meta: the same without `change`.
+```
+
+- `automerge_changes(doc automerge, since_heads text[] DEFAULT '{}') →
+  SETOF automerge_change`: every change not reachable from `since_heads`
+  (all changes for `'{}'`), in causal order: each change comes after its
+  dependencies, and otherwise in Automerge's own order (which already is
+  causal, so it is kept as is). Rebuilds the bytes of the returned changes.
+- `automerge_changes_meta(doc, since_heads text[] DEFAULT '{}') → SETOF
+  automerge_change_meta`: the same rows from the change graph only
+  (`get_changes_meta`); no change is rebuilt. Use it whenever the bytes are
+  not needed.
+- `automerge_changes_bytes(doc, since_heads text[] DEFAULT '{}') → bytea`:
+  those changes' chunks concatenated in the same causal order, i.e.
+  Automerge's `save_after(since_heads)`. A replica at `since_heads` loads it
+  with `loadIncremental` / `applyChanges`, and `merge(replica,
+  automerge_changes_bytes(full, automerge_heads(replica)))` has the heads
+  and jsonb of `full` (tested). Empty when there is nothing new.
+- `automerge_get_change(doc, hash text) → automerge_change`: one change with
+  its bytes, or NULL if the document does not have it.
+- `automerge_change_count(doc) → bigint`: number of changes. Read from a
+  prefix of the stored value (see "Heads fast path"), without loading it.
+- `automerge_to_jsonb(doc automerge, heads text[]) → jsonb`: the state as of
+  `heads` (Automerge's `*_at` reads), with the same mapping as the cast.
+  `'{}'` is the state before any change (`{}`); the current heads give the
+  current state. Every hash must be a change of the document, otherwise
+  `22023` (`automerge document does not contain change <hash>`).
+
+All are `IMMUTABLE STRICT PARALLEL SAFE`: the result depends only on the
+arguments (a stored value's history is part of its bytes). `STRICT` with
+defaults: a NULL argument gives NULL (no rows for the set-returning ones).
+
+"Since heads" semantics are Automerge's `get_changes(have_deps)`: the
+changes that are neither in `since_heads` nor ancestors of them.
+**Hashes the document does not have are ignored**, as Automerge does: a
+replica that is ahead of the stored row (it has changes the row lacks)
+gets everything that is not an ancestor of the heads the row knows, a
+superset of what it is missing and never less, which it deduplicates on
+load. (An error would make that sync case fail; a typo in a hash also
+just returns more changes.) Automerge computes the set from the per-actor
+sequence numbers of the known heads' ancestors; for histories written by
+Automerge (each change depends on its actor's previous change) that is
+exactly the set of non-ancestors, which a property test checks against a
+walk of the dependency graph. `automerge_to_jsonb(doc, heads)` instead
+rejects unknown hashes, since it cannot show a state it does not have.
+
+Hash arguments must be exactly 64 hex digits, either case (`22P02`
+`invalid automerge change hash "..."` otherwise); a NULL array element is
+`22004` (`since_heads must not contain NULL`).
+
+Time: Automerge change times are Unix **seconds** (as documented for the
+Rust crate's `CommitOptions::with_time`; check what your producer writes).
+`time` is NULL when the change has none (0) and when Postgres cannot
+represent it; a producer writing milliseconds shows up as a date tens of
+thousands of years ahead.
+
+Shortcuts: when every current head of `doc` is in `since_heads`, the
+since-functions return nothing without loading (heads read from the
+header, as in `automerge_heads`). Measured on the 3 MB document of "Heads
+fast path" plus 200 small changes (201 changes; release build, warm
+cache): `automerge_change_count` 2 ms; `automerge_changes_meta` 2.8 s (one
+load); `automerge_changes` and `automerge_changes_bytes` for all changes
+5.1 s (load plus rebuilding 3 MB of changes); since the 100th change, or one
+`automerge_get_change`, 2.7-2.8 s; `automerge_to_jsonb(doc, old heads)` 3.5
+s against 3.0 s for the current state; any since-function given the
+current heads 1 ms.
+
+Set-returning functions compute all rows on the first call: the document
+is loaded, the rows are copied into a Rust `Vec` and the document is
+dropped before the first row is returned. pgrx keeps that `Vec` in the
+SRF's multi-call memory context, which Postgres deletes when the scan ends
+or is cut short (`LIMIT`, a closed cursor, an error), dropping it; tested
+with `LIMIT` on a target-list SRF, closed cursors and errors mid-scan.
+Memory: for `automerge_changes` the `Vec` holds the change bytes (about the
+size of the document's history, 3 MB above) until the scan ends; in
+`FROM`, Postgres additionally materializes the rows in a tuplestore
+(spilling to disk past `work_mem`). Rows are built with the function's
+declared result type (looked up by the function's OID), so they do not
+depend on `search_path`.
 
 ## jsonb mapping
 
@@ -279,9 +401,13 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   ```
 
 - Expression indexes also work: `CREATE INDEX ON docs USING gin ((doc::jsonb));`
-- `automerge_heads` never loads the document, and `merge` / `merge_agg` /
-  `automerge_contains` skip loads where the headers decide (see "Heads fast
+- `automerge_heads` and `automerge_change_count` never load the document,
+  and `merge` / `merge_agg` / `automerge_contains` and the history
+  since-functions skip loads where the headers decide (see "Heads fast
   path").
+- History: `automerge_changes_meta` costs a load; `automerge_changes`,
+  `automerge_changes_bytes` and `automerge_get_change` also rebuild the
+  returned changes' bytes (see "History").
 - Persisting incrementally with `merge(doc, $changes::bytea)` sends and
   parses only the new changes, but still loads the stored document, saves
   the result and loads it once more to verify it (on the 3 MB document
@@ -305,7 +431,9 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   Both are listed in the `creates` of the type's `extension_sql!` block.
 - Errors: never panic across FFI. Map Automerge errors to `ereport(ERROR)`
   with SQLSTATE `22P02` (invalid_text_representation) for bad input (text,
-  binary recv and bytea alike) and `XX000` otherwise.
+  binary recv and bytea alike, and malformed change hashes), `22023`
+  (invalid_parameter_value) for well-formed heads a document does not
+  have, `22004` for NULL array elements, and `XX000` otherwise.
   The automerge decoder is not panic-free: input whose chunk checksums are
   valid but whose column data is malformed can panic inside
   `Automerge::load` (found by fuzzing with recomputed checksums). The core
@@ -319,8 +447,8 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   don't check for interrupts, so cancel/`statement_timeout` wait for the call
   to return. Only `merge_agg_trans` checks between inputs.
 - Code layout: all Automerge logic (normalize, merge, merge_changes, heads
-  and the header parser, contains, the jsonb mapping, hex/base64/ISO 8601
-  encoders) is plain Rust in
+  and the header parser, contains, the history functions in `history.rs`,
+  the jsonb mapping, hex/base64/ISO 8601 encoders) is plain Rust in
   `crates/pg_automerge_core` with `#[test]`s; `src/lib.rs` is pgrx glue. The
   I/O functions are declared by hand inside the `CREATE TYPE` block
   (`#[pg_extern(sql = false)]`), and the Rust type `AutomergeDatum` maps to SQL
@@ -329,7 +457,10 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
 - Tests: `#[pg_test]` for SQL behaviour, plain `#[test]` for the pure
   conversion logic (edge cases in `crates/pg_automerge_core/tests/`:
   `edge_cases.rs`, `merge_changes.rs` for `merge(automerge, bytea)`,
-  `heads_fast_path.rs` for the header parser property test), and
+  `heads_fast_path.rs` for the header parser property test, `history.rs`
+  for the history functions, checked against Automerge (`fork_at`,
+  `get_changes`) and a dependency-graph walk; `common/` holds the shared
+  random-history generator), and
   `tests/pg_regress` for user-facing examples. `tests/concurrency.sh`
   (`mise run concurrency`, also the last step of `mise run test`) runs two real psql sessions against one row to
   check the EvalPlanQual claim above, the upsert path and REPEATABLE READ,
@@ -337,6 +468,9 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   `merge(doc, $1::bytea)` (plus the orphaned-changes rejection), and a
   pg_dump/restore round trip. Build test documents in Rust with
   `automerge::AutoCommit` and pass them in as `bytea`.
+- `mise run regress` passes `--resetdb`: a reused regress database would
+  keep the extension objects of an earlier build, so new functions would be
+  missing.
 - Build profile: dev builds compile dependencies optimized and Automerge
   without debug assertions or overflow checks (Cargo.toml). Its debug
   assertions make large documents quadratic, and its overflow checks turned a

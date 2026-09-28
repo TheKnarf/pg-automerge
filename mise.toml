@@ -27,7 +27,9 @@ run = [
 
 [tasks.regress]
 description = "Run pg_regress tests in tests/pg_regress"
-run = "cargo pgrx regress pg{{env.PG_VERSION}}"
+# --resetdb: recreate the regress database so setup.sql installs the
+# current extension SQL (a reused database keeps the old objects).
+run = "cargo pgrx regress pg{{env.PG_VERSION}} --resetdb"
 
 [tasks.run]
 description = "Install the extension and open psql against a pgrx-managed Postgres"

@@ -2,7 +2,7 @@
 //! tests/pg_regress/sql/automerge.sql. Regenerate with
 //! `cargo run -p pg_automerge_core --example gen_regress`.
 
-use automerge::transaction::Transactable;
+use automerge::transaction::{CommitOptions, Transactable};
 use automerge::{ActorId, AutoCommit, ObjType, ROOT, ScalarValue};
 use pg_automerge_core::encoding::to_hex_literal;
 
@@ -57,6 +57,21 @@ fn main() {
     println!("\\set bob '\\{}'", hex(&mut bob));
     println!("\\set bob_changes '\\{}'", to_hex_literal(&bob_changes));
     println!("\\set types '\\{}'", hex(&mut types));
+    // A short history with commit messages and times (Unix seconds).
+    let mut log = AutoCommit::new().with_actor(ActorId::from([0x04u8; 16]));
+    for (status, message, time) in [
+        ("draft", "create", 1_704_164_645),
+        ("review", "submit", 1_704_251_045),
+        ("published", "publish", 1_704_337_445),
+    ] {
+        log.put(ROOT, "status", status).unwrap();
+        log.commit_with(
+            CommitOptions::default()
+                .with_message(message)
+                .with_time(time),
+        );
+    }
+    println!("\\set log '\\{}'", hex(&mut log));
     // A compressed, incremental save (document chunk + a trailing change).
     let mut inc = base.fork().with_actor(ActorId::from([0x03u8; 16]));
     let heads = inc.get_heads();

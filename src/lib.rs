@@ -6,15 +6,16 @@
 use std::ffi::{CStr, CString};
 
 use pg_automerge_core::automerge::ChangeHash;
-use pg_automerge_core::header::{self, HeadsPrefix};
+use pg_automerge_core::header::{self, Prefix};
 use pg_automerge_core::{self as am, Error, MergeAccumulator};
 use pgrx::callconv::{Arg, ArgAbi, BoxRet, FcInfo};
 use pgrx::datum::Datum;
+use pgrx::heap_tuple::PgHeapTuple;
 use pgrx::pgrx_sql_entity_graph::metadata::{
     ArgumentError, ReturnsError, ReturnsRef, SqlMappingRef, SqlTranslatable, TypeOrigin,
 };
 use pgrx::prelude::*;
-use pgrx::{Internal, JsonB, PgMemoryContexts};
+use pgrx::{Internal, JsonB, PgMemoryContexts, PgTupleDesc};
 
 ::pgrx::pg_module_magic!(name, version);
 
@@ -158,23 +159,38 @@ impl LazyAutomerge {
             .expect("not null")
     }
 
-    /// The heads, read from as short a prefix as possible; a full load only
-    /// if the value is not a single document chunk.
-    fn heads(&self) -> Result<Vec<ChangeHash>, Error> {
+    /// Run a header parser on as short a prefix as possible (4 kB first,
+    /// then growing to what the parser asks for, at least doubling). `None`
+    /// if the value is not in the shape the parser expects, so the caller
+    /// must load it.
+    fn read_prefix<T>(&self, parse: impl Fn(&[u8], usize) -> Prefix<T>) -> Option<T> {
         let total = self.len();
         let mut want = total.min(Self::FIRST_PREFIX);
         loop {
             let prefix = self.prefix(want);
-            match header::heads_from_prefix(&prefix, total) {
-                HeadsPrefix::Found(heads) => return Ok(heads),
-                HeadsPrefix::NeedMore(n) if prefix.len() == want && want < total => {
+            match parse(&prefix, total) {
+                Prefix::Found(value) => return Some(value),
+                Prefix::NeedMore(n) if prefix.len() == want && want < total => {
                     want = n.max(want.saturating_mul(2)).min(total);
                 }
-                HeadsPrefix::NeedMore(_) | HeadsPrefix::NotSingleDoc => {
-                    return am::stored_heads(&self.bytes());
-                }
+                Prefix::NeedMore(_) | Prefix::NotSingleDoc => return None,
             }
         }
+    }
+
+    /// The heads, read from as short a prefix as possible; a full load only
+    /// if the value is not a single document chunk.
+    fn heads(&self) -> Result<Vec<ChangeHash>, Error> {
+        match self.read_prefix(header::heads_from_prefix) {
+            Some(heads) => Ok(heads),
+            None => am::stored_heads(&self.bytes()),
+        }
+    }
+
+    /// Whether the value has nothing that is not already in `since`: every
+    /// head of the value is in `since`. Reads only the heads.
+    fn nothing_since(&self, since: &[ChangeHash]) -> bool {
+        !since.is_empty() && am::is_subset(&self.heads().or_raise(), since)
     }
 }
 
@@ -182,6 +198,7 @@ impl LazyAutomerge {
 fn raise(err: Error) -> ! {
     let code = match err {
         Error::InvalidInput(_) => PgSqlErrorCode::ERRCODE_INVALID_TEXT_REPRESENTATION,
+        Error::InvalidParameter(_) => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
         Error::Internal(_) => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
     };
     pgrx::pg_sys::panic::ErrorReport::new(code, err.to_string(), pgrx::function_name!())
@@ -439,6 +456,212 @@ fn automerge_contains(a: LazyAutomerge, b: LazyAutomerge) -> bool {
         Some(answer) => answer,
         None => am::contains_loaded(&a.bytes(), &heads_b).or_raise(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// History: individual changes and past states (read-only)
+// ---------------------------------------------------------------------------
+
+extension_sql!(
+    r#"
+-- One change of a document (automerge_changes, automerge_get_change).
+CREATE TYPE automerge_change AS (
+    hash text,          -- change hash, 64 lowercase hex digits
+    actor text,         -- actor id, lowercase hex
+    seq bigint,         -- 1, 2, ... per actor
+    start_op bigint,    -- counter of the change's first op
+    op_count bigint,    -- number of ops (0 for an empty change)
+    "time" timestamptz, -- commit time (Unix seconds); NULL when not set
+    message text,       -- commit message; NULL when not set
+    deps text[],        -- sorted hashes of the changes it depends on
+    change bytea        -- the change chunk, loadable by any Automerge
+);
+COMMENT ON TYPE automerge_change IS 'One change of an automerge document.';
+
+-- The same without the change bytes (automerge_changes_meta).
+CREATE TYPE automerge_change_meta AS (
+    hash text,
+    actor text,
+    seq bigint,
+    start_op bigint,
+    op_count bigint,
+    "time" timestamptz,
+    message text,
+    deps text[]
+);
+COMMENT ON TYPE automerge_change_meta IS
+    'Metadata of one change of an automerge document (no change bytes).';
+"#,
+    name = "automerge_change_types",
+    requires = ["automerge_type"],
+);
+
+/// A `text[]` argument of change hashes: no NULL elements (22004), every
+/// element 64 hex digits (22P02).
+fn hashes_arg(name: &str, texts: &[Option<String>]) -> Vec<ChangeHash> {
+    let texts: Vec<&str> = texts
+        .iter()
+        .map(|t| {
+            t.as_deref().unwrap_or_else(|| {
+                pgrx::pg_sys::panic::ErrorReport::new(
+                    PgSqlErrorCode::ERRCODE_NULL_VALUE_NOT_ALLOWED,
+                    format!("{name} must not contain NULL"),
+                    pgrx::function_name!(),
+                )
+                .report(PgLogLevel::ERROR);
+                unreachable!("ereport(ERROR) does not return")
+            })
+        })
+        .collect();
+    am::history::parse_hashes(&texts).or_raise()
+}
+
+fn to_i64(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or_else(|_| raise(Error::Internal(format!("{n} exceeds bigint"))))
+}
+
+/// The declared result type of the function being called (the composite
+/// type of a `SETOF automerge_change` function, say), looked up by OID so
+/// that it does not depend on `search_path`.
+fn result_type(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Oid {
+    // SAFETY: fcinfo and its flinfo are this call's.
+    unsafe { pg_sys::get_func_rettype((*(*fcinfo).flinfo).fn_oid) }
+}
+
+/// Build an `automerge_change` (with bytes) or `automerge_change_meta`
+/// (without) tuple of type `typoid` from a row.
+fn change_tuple(
+    typoid: pg_sys::Oid,
+    row: am::history::ChangeInfo,
+) -> pgrx::composite_type!('static, "automerge_change") {
+    let time = am::history::pg_timestamptz_micros(row.time)
+        .and_then(|micros| pgrx::datum::TimestampWithTimeZone::try_from(micros).ok());
+    let mut datums = vec![
+        row.hash.into_datum(),
+        row.actor.into_datum(),
+        to_i64(row.seq).into_datum(),
+        to_i64(row.start_op).into_datum(),
+        to_i64(row.op_count).into_datum(),
+        time.into_datum(),
+        row.message.into_datum(),
+        row.deps.into_datum(),
+    ];
+    if let Some(bytes) = row.bytes {
+        datums.push(bytes.into_datum());
+    }
+    let tupdesc = PgTupleDesc::for_composite_type_by_oid(typoid).unwrap_or_else(|| {
+        raise(Error::Internal(format!(
+            "type {typoid:?} is not a composite type"
+        )))
+    });
+    if tupdesc.len() != datums.len() {
+        raise(Error::Internal(format!(
+            "result type has {} attributes, expected {}",
+            tupdesc.len(),
+            datums.len()
+        )));
+    }
+    // SAFETY: the datums are, in order, text, text, int8, int8, int8,
+    // timestamptz, text, text[] and (for automerge_change) bytea, the
+    // attribute types of the types created in `automerge_change_types`;
+    // the count is checked above.
+    unsafe { PgHeapTuple::from_datums(tupdesc, datums) }.unwrap_or_else(|e| {
+        raise(Error::Internal(format!(
+            "could not build a change row: {e}"
+        )))
+    })
+}
+
+/// Every change of `doc` not reachable from `since_heads` (all of them for
+/// `'{}'`), in causal order (each change after its dependencies), with the
+/// change bytes.
+///
+/// The rows are computed in full on the first call and returned one by one
+/// from a Rust `Vec` owned by the SRF's multi-call memory context (freed on
+/// completion and on early termination); no Automerge document outlives
+/// the first call. Rebuilding change bytes is the expensive part; use
+/// `automerge_changes_meta` when only metadata is needed.
+#[pg_extern(immutable, strict, parallel_safe, requires = ["automerge_change_types"])]
+fn automerge_changes(
+    doc: LazyAutomerge,
+    since_heads: default!(Vec<Option<String>>, "'{}'"),
+    fcinfo: pg_sys::FunctionCallInfo,
+) -> SetOfIterator<'static, pgrx::composite_type!('static, "automerge_change")> {
+    let since = hashes_arg("since_heads", &since_heads);
+    let rows = if doc.nothing_since(&since) {
+        Vec::new()
+    } else {
+        am::history::changes(&doc.bytes(), &since).or_raise()
+    };
+    let typoid = result_type(fcinfo);
+    SetOfIterator::new(rows.into_iter().map(move |row| change_tuple(typoid, row)))
+}
+
+/// Like `automerge_changes`, without the change bytes: answered from the
+/// change graph of the loaded document, no change is rebuilt.
+#[pg_extern(immutable, strict, parallel_safe, requires = ["automerge_change_types"])]
+fn automerge_changes_meta(
+    doc: LazyAutomerge,
+    since_heads: default!(Vec<Option<String>>, "'{}'"),
+    fcinfo: pg_sys::FunctionCallInfo,
+) -> SetOfIterator<'static, pgrx::composite_type!('static, "automerge_change_meta")> {
+    let since = hashes_arg("since_heads", &since_heads);
+    let rows = if doc.nothing_since(&since) {
+        Vec::new()
+    } else {
+        am::history::changes_meta(&doc.bytes(), &since).or_raise()
+    };
+    let typoid = result_type(fcinfo);
+    SetOfIterator::new(rows.into_iter().map(move |row| change_tuple(typoid, row)))
+}
+
+/// The changes of `doc` not reachable from `since_heads`, as concatenated
+/// change chunks in causal order (Automerge's `save_after(since_heads)`):
+/// load it with `loadIncremental` / `applyChanges`, or apply it with
+/// `merge(automerge, bytea)`. Empty when there is nothing new.
+#[pg_extern(immutable, strict, parallel_safe)]
+fn automerge_changes_bytes(
+    doc: LazyAutomerge,
+    since_heads: default!(Vec<Option<String>>, "'{}'"),
+) -> Vec<u8> {
+    let since = hashes_arg("since_heads", &since_heads);
+    if doc.nothing_since(&since) {
+        return Vec::new();
+    }
+    am::history::changes_bytes(&doc.bytes(), &since).or_raise()
+}
+
+/// The change with hash `hash` (64 hex digits, either case), with its
+/// bytes; NULL if `doc` does not have it.
+#[pg_extern(immutable, strict, parallel_safe, requires = ["automerge_change_types"])]
+fn automerge_get_change(
+    doc: AutomergeDatum,
+    hash: &str,
+    fcinfo: pg_sys::FunctionCallInfo,
+) -> Option<pgrx::composite_type!('static, "automerge_change")> {
+    let hash = am::history::parse_hash(hash).or_raise();
+    let row = am::history::change(doc.bytes(), &hash).or_raise()?;
+    Some(change_tuple(result_type(fcinfo), row))
+}
+
+/// Number of changes in the document. Read from the stored header and the
+/// change actor column (a prefix of the value) when possible, otherwise from
+/// the change graph of the loaded document.
+#[pg_extern(immutable, strict, parallel_safe)]
+fn automerge_change_count(doc: LazyAutomerge) -> i64 {
+    let n = match doc.read_prefix(header::change_count_from_prefix) {
+        Some(n) => n,
+        None => am::history::change_count_loaded(&doc.bytes()).or_raise(),
+    };
+    to_i64(n)
+}
+
+/// The document's state as of `heads` as jsonb. Every head must be a change
+/// of the document (22023 otherwise); `'{}'` is the state before any change.
+#[pg_extern(immutable, strict, parallel_safe, name = "automerge_to_jsonb")]
+fn automerge_to_jsonb_at(doc: AutomergeDatum, heads: Vec<Option<String>>) -> JsonB {
+    let heads = hashes_arg("heads", &heads);
+    JsonB(am::history::to_json_at(doc.bytes(), &heads).or_raise())
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -1701,6 +1924,439 @@ mod tests {
         );
         // Everything contains itself (6) and the empty document (5 more).
         assert_eq!(true_pairs, 11);
+    }
+
+    // -- history -----------------------------------------------------------
+
+    /// base -> (a: two changes, one with message and time) and
+    /// (b: one change) concurrently, merged. Returns (merged, base, a, b).
+    fn history_docs() -> (AutoCommit, AutoCommit, AutoCommit, AutoCommit) {
+        use pg_automerge_core::automerge::transaction::CommitOptions;
+        let mut base = AutoCommit::new().with_actor(actor(1));
+        base.put(ROOT, "title", "base").unwrap();
+        base.commit_with(
+            CommitOptions::default()
+                .with_message("create")
+                .with_time(1_700_000_000),
+        );
+        let mut a = base.fork().with_actor(actor(2));
+        a.put(ROOT, "title", "from a").unwrap();
+        a.commit();
+        a.put(ROOT, "a", 1i64).unwrap();
+        a.commit_with(CommitOptions::default().with_message("second a"));
+        let mut b = base.fork().with_actor(actor(3));
+        b.put(ROOT, "b", true).unwrap();
+        b.commit();
+        let mut merged = a.fork().with_actor(actor(4));
+        merged.merge(&mut b.fork()).unwrap();
+        (merged, base, a, b)
+    }
+
+    fn heads_of(doc: &mut AutoCommit) -> Vec<String> {
+        let mut h: Vec<String> = doc.get_heads().iter().map(ToString::to_string).collect();
+        h.sort();
+        h
+    }
+
+    #[pg_test]
+    fn changes_rows_order_and_columns() {
+        let (mut merged, mut base, _, _) = history_docs();
+        Spi::run("CREATE TEMP TABLE hist (id int, doc automerge)").unwrap();
+        Spi::run_with_args("INSERT INTO hist VALUES (1, $1)", &[merged.save().into()]).unwrap();
+        let n: i64 = one("SELECT count(*) FROM hist, automerge_changes(doc)", &[]);
+        assert_eq!(n, 4);
+        // Causal order: every dep of a row appears on an earlier row.
+        let bad: i64 = one(
+            "WITH c AS (SELECT x.* FROM hist, automerge_changes(doc) WITH ORDINALITY x(hash, actor, seq, start_op, op_count, time, message, deps, change, o)) \
+             SELECT count(*) FROM c, unnest(c.deps) d \
+             WHERE NOT EXISTS (SELECT 1 FROM c e WHERE e.hash = d AND e.o < c.o)",
+            &[],
+        );
+        assert_eq!(bad, 0);
+        // First row: the base change, with its time and message.
+        let (hash, actor_hex) = Spi::get_two::<String, String>(
+            "SELECT hash, actor FROM hist, automerge_changes(doc) LIMIT 1",
+        )
+        .unwrap();
+        assert_eq!(hash.unwrap(), heads_of(&mut base)[0]);
+        assert_eq!(actor_hex.unwrap(), "01".repeat(16));
+        let first: bool = one(
+            "SELECT seq = 1 AND start_op = 1 AND op_count = 1 \
+                    AND time = to_timestamp(1700000000) AND message = 'create' \
+                    AND deps = '{}' AND length(change) > 0 \
+             FROM hist, automerge_changes(doc) LIMIT 1",
+            &[],
+        );
+        assert!(first);
+        // Unset time and message are NULL.
+        let nulls: i64 = one(
+            "SELECT count(*) FROM hist, automerge_changes(doc) WHERE time IS NULL",
+            &[],
+        );
+        assert_eq!(nulls, 3);
+        let messages: Vec<String> = one(
+            "SELECT array_agg(message ORDER BY message) FROM hist, automerge_changes(doc) WHERE message IS NOT NULL",
+            &[],
+        );
+        assert_eq!(messages, vec!["create", "second a"]);
+        // Metadata-only rows equal the full rows without the bytes.
+        let same: bool = one(
+            "SELECT array_agg(ROW(c.hash, c.actor, c.seq, c.start_op, c.op_count, c.time, c.message, c.deps)::automerge_change_meta) \
+                  = (SELECT array_agg(m) FROM hist, automerge_changes_meta(doc) m) \
+             FROM hist, automerge_changes(doc) c",
+            &[],
+        );
+        assert!(same);
+        // Each row's bytes are exactly that change: loading them all (in
+        // order) rebuilds the document.
+        let rebuilt: bool = one(
+            "SELECT automerge_heads(string_agg(change, ''::bytea)::automerge) \
+                  = (SELECT automerge_heads(doc) FROM hist) \
+             FROM hist, automerge_changes(doc)",
+            &[],
+        );
+        assert!(rebuilt);
+        let concat: bool = one(
+            "SELECT string_agg(change, ''::bytea) = (SELECT automerge_changes_bytes(doc) FROM hist) \
+             FROM hist, automerge_changes(doc)",
+            &[],
+        );
+        assert!(concat);
+        // Column types of the result.
+        let types: String = one(
+            "SELECT string_agg(format_type(atttypid, atttypmod), ',' ORDER BY attnum) \
+             FROM pg_attribute WHERE attrelid = 'automerge_change'::regclass AND attnum > 0",
+            &[],
+        );
+        assert_eq!(
+            types,
+            "text,text,bigint,bigint,bigint,timestamp with time zone,text,text[],bytea"
+        );
+    }
+
+    #[pg_test]
+    fn changes_since_heads() {
+        let (mut merged, mut base, mut a, mut b) = history_docs();
+        let args = [
+            merged.save().into(),
+            heads_of(&mut base).into(),
+            heads_of(&mut a).into(),
+            heads_of(&mut b).into(),
+            heads_of(&mut merged).into(),
+        ];
+        let q = |expr: &str| {
+            format!(
+                "WITH v(doc, base, a, b, cur) AS (SELECT $1::automerge, $2::text[], $3::text[], $4::text[], $5::text[]) SELECT {expr} FROM v"
+            )
+        };
+        let count = |since: &str| -> i64 {
+            one(
+                &q(&format!(
+                    "(SELECT count(*) FROM automerge_changes_meta(doc, {since}))"
+                )),
+                &args,
+            )
+        };
+        assert_eq!(count("'{}'"), 4);
+        assert_eq!(count("base"), 3);
+        assert_eq!(count("a"), 1);
+        assert_eq!(count("b"), 2);
+        assert_eq!(count("a || b"), 0);
+        assert_eq!(count("cur"), 0);
+        // Unknown hashes are ignored (a replica ahead of the stored doc).
+        assert_eq!(count("base || repeat('ab', 32)"), 3);
+        assert_eq!(count("ARRAY[repeat('ab', 32)]"), 4);
+        // Uppercase is accepted.
+        assert_eq!(count("ARRAY[upper(a[1])]"), 1);
+        let since_b: String = one(
+            &q("(SELECT string_agg(hash, ',') FROM automerge_changes(doc, b))"),
+            &args,
+        );
+        let a_changes: String = one(
+            &q(
+                "(SELECT string_agg(hash, ',') FROM automerge_changes(doc) c WHERE c.actor = repeat('02', 16))",
+            ),
+            &args,
+        );
+        assert_eq!(since_b, a_changes);
+        let empty: Vec<u8> = one(&q("automerge_changes_bytes(doc, cur)"), &args);
+        assert!(empty.is_empty());
+        // Bad hashes: 22P02; NULL elements: 22004.
+        for since in [
+            "ARRAY['abc']",
+            "ARRAY[repeat('g', 64)]",
+            "ARRAY[repeat('ab', 33)]",
+        ] {
+            let err = sql_error(&format!(
+                "SELECT count(*) FROM automerge_changes(''::bytea::automerge, {since})"
+            ));
+            assert!(
+                err.starts_with("22P02: invalid automerge change hash"),
+                "{err}"
+            );
+        }
+        let err =
+            sql_error("SELECT automerge_changes_bytes(''::bytea::automerge, ARRAY[NULL]::text[])");
+        assert_eq!(err, "22004: since_heads must not contain NULL");
+        // STRICT: NULL arguments give NULL / no rows.
+        let null = Spi::get_one::<Vec<u8>>("SELECT automerge_changes_bytes(NULL, '{}')");
+        assert_eq!(null.unwrap(), None);
+        let rows: i64 = one("SELECT count(*) FROM automerge_changes(NULL)", &[]);
+        assert_eq!(rows, 0);
+    }
+
+    #[pg_test]
+    fn changes_bytes_round_trip_through_merge() {
+        let (mut merged, mut base, mut a, _) = history_docs();
+        Spi::run("CREATE TEMP TABLE rt (id text PRIMARY KEY, doc automerge NOT NULL)").unwrap();
+        Spi::run_with_args(
+            "INSERT INTO rt VALUES ('full', $1), ('base', $2), ('a', $3)",
+            &[merged.save().into(), base.save().into(), a.save().into()],
+        )
+        .unwrap();
+        for replica in ["base", "a"] {
+            let ok: bool = one(
+                "SELECT automerge_heads(m) = automerge_heads(f.doc) AND m::jsonb = f.doc::jsonb \
+                 FROM rt f, rt r, \
+                      LATERAL (SELECT merge(r.doc, automerge_changes_bytes(f.doc, automerge_heads(r.doc)))) x(m) \
+                 WHERE f.id = 'full' AND r.id = $1",
+                &[replica.into()],
+            );
+            assert!(ok, "{replica}");
+        }
+        // The delta is only what the replica lacks.
+        let n: i64 = one(
+            "SELECT count(*) FROM rt f, rt r, automerge_changes(f.doc, automerge_heads(r.doc)) \
+             WHERE f.id = 'full' AND r.id = 'a'",
+            &[],
+        );
+        assert_eq!(n, 1);
+        // In an UPDATE: bring a stored replica up to date.
+        Spi::run(
+            "UPDATE rt r SET doc = merge(r.doc, automerge_changes_bytes(f.doc, automerge_heads(r.doc))) \
+             FROM rt f WHERE f.id = 'full' AND r.id = 'base'",
+        )
+        .unwrap();
+        let heads: Vec<String> = one("SELECT automerge_heads(doc) FROM rt WHERE id = 'base'", &[]);
+        assert_eq!(heads, heads_of(&mut merged));
+        // Loadable by Automerge itself, on top of the replica.
+        let delta: Vec<u8> = one(
+            "SELECT automerge_changes_bytes(f.doc, automerge_heads(r.doc)) FROM rt f, rt r \
+             WHERE f.id = 'full' AND r.id = 'a'",
+            &[],
+        );
+        let mut replica = a.fork();
+        replica.load_incremental(&delta).unwrap();
+        assert_eq!(heads_of(&mut replica), heads_of(&mut merged));
+    }
+
+    #[pg_test]
+    fn get_change_by_hash() {
+        let (mut merged, mut base, _, _) = history_docs();
+        let base_head = heads_of(&mut base)[0].clone();
+        let args = [merged.save().into(), base_head.clone().into()];
+        let msg: String = one(
+            "SELECT (automerge_get_change($1::automerge, $2)).message",
+            &args,
+        );
+        assert_eq!(msg, "create");
+        let same: bool = one(
+            "SELECT automerge_get_change($1::automerge, upper($2)) \
+                  = (SELECT c FROM automerge_changes($1::automerge) c WHERE c.hash = $2)",
+            &args,
+        );
+        assert!(same);
+        let change: Vec<u8> = one(
+            "SELECT (automerge_get_change($1::automerge, $2)).change",
+            &args,
+        );
+        let loaded = pg_automerge_core::automerge::Change::from_bytes(change).unwrap();
+        assert_eq!(loaded.hash().to_string(), base_head);
+        let missing: bool = one(
+            "SELECT automerge_get_change($1::automerge, repeat('00', 32)) IS NULL",
+            &args[..1],
+        );
+        assert!(missing);
+        let err = sql_error(&format!(
+            "SELECT automerge_get_change('{}'::automerge, 'nope')",
+            pg_automerge_core::encoding::to_hex_literal(&merged.save())
+        ));
+        assert_eq!(
+            err,
+            "22P02: invalid automerge change hash \"nope\": expected 64 hexadecimal digits"
+        );
+    }
+
+    #[pg_test]
+    fn to_jsonb_at_heads() {
+        let (mut merged, mut base, mut a, mut b) = history_docs();
+        let args = [
+            merged.save().into(),
+            heads_of(&mut base).into(),
+            heads_of(&mut a).into(),
+            heads_of(&mut b).into(),
+        ];
+        let q = |heads: &str| -> JsonB {
+            one(
+                &format!(
+                    "SELECT automerge_to_jsonb($1::automerge, {heads}) FROM (SELECT $2::text[], $3::text[], $4::text[]) v(base, a, b)"
+                ),
+                &args,
+            )
+        };
+        assert_eq!(q("base").0, json!({"title": "base"}));
+        assert_eq!(q("a").0, json!({"title": "from a", "a": 1}));
+        assert_eq!(q("b").0, json!({"title": "base", "b": true}));
+        assert_eq!(q("a || b").0, json!({"title": "from a", "a": 1, "b": true}));
+        assert_eq!(q("'{}'").0, json!({}));
+        // The current heads give the current state.
+        let current: bool = one(
+            "SELECT automerge_to_jsonb($1::automerge, automerge_heads($1::automerge)) = $1::automerge::jsonb",
+            &args[..1],
+        );
+        assert!(current);
+        // Every change's state, via the change list.
+        let n: i64 = one(
+            "SELECT count(DISTINCT automerge_to_jsonb($1::automerge, ARRAY[hash])) FROM automerge_changes_meta($1::automerge)",
+            &args[..1],
+        );
+        assert_eq!(n, 4);
+        let hex = pg_automerge_core::encoding::to_hex_literal(&merged.save());
+        let unknown = "cd".repeat(32);
+        let err = sql_error(&format!(
+            "SELECT automerge_to_jsonb('{hex}'::automerge, ARRAY['{unknown}'])"
+        ));
+        assert_eq!(
+            err,
+            format!("22023: automerge document does not contain change {unknown}")
+        );
+        let err = sql_error(&format!(
+            "SELECT automerge_to_jsonb('{hex}'::automerge, ARRAY['x'])"
+        ));
+        assert!(err.starts_with("22P02: "), "{err}");
+        let err = sql_error(&format!(
+            "SELECT automerge_to_jsonb('{hex}'::automerge, '{{NULL}}'::text[])"
+        ));
+        assert_eq!(err, "22004: heads must not contain NULL");
+        // The one-argument cast function is unaffected.
+        let cast: bool = one(
+            "SELECT automerge_to_jsonb($1::automerge) = $1::automerge::jsonb",
+            &args[..1],
+        );
+        assert!(cast);
+    }
+
+    #[pg_test]
+    fn change_count_for_every_storage_form() {
+        Spi::run("CREATE TEMP TABLE cc (id int, doc automerge NOT NULL)").unwrap();
+        let (mut merged, _, _, _) = history_docs();
+        let mut many = AutoCommit::new();
+        for i in 0..300u16 {
+            many.set_actor(actor((i % 7) as u8 + 1));
+            many.put(ROOT, format!("k{i}"), i64::from(i)).unwrap();
+            many.commit();
+        }
+        let mut big = AutoCommit::new().with_actor(actor(9));
+        big.put(ROOT, "pad", "abcdefgh".repeat(50_000)).unwrap();
+        big.commit();
+        big.put(ROOT, "more", 1i64).unwrap();
+        for (i, bytes) in [
+            merged.save(),
+            many.save(),
+            big.save(),
+            AutoCommit::new().save(),
+            large_doc().save(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            Spi::run_with_args(
+                "INSERT INTO cc VALUES ($1, $2)",
+                &[(i as i32).into(), bytes.into()],
+            )
+            .unwrap();
+        }
+        let counts: Vec<i64> = one(
+            "SELECT array_agg(automerge_change_count(doc) ORDER BY id) FROM cc",
+            &[],
+        );
+        // large_doc() is one change: AutoCommit commits once, on save.
+        assert_eq!(counts, vec![4, 300, 2, 0, 1]);
+        let disagree: i64 = one(
+            "SELECT count(*) FROM cc \
+             WHERE automerge_change_count(doc) <> (SELECT count(*) FROM automerge_changes_meta(doc))",
+            &[],
+        );
+        assert_eq!(disagree, 0);
+    }
+
+    /// SRFs stopped early (LIMIT on a target-list SRF, closed cursors) and
+    /// SRFs failing mid-statement leave nothing behind.
+    #[pg_test]
+    fn changes_srf_early_termination() {
+        let (mut merged, _, _, _) = history_docs();
+        Spi::run("CREATE TEMP TABLE et (doc automerge)").unwrap();
+        Spi::run_with_args("INSERT INTO et VALUES ($1)", &[merged.save().into()]).unwrap();
+        for _ in 0..50 {
+            let h: String = one("SELECT (automerge_changes(doc)).hash FROM et LIMIT 1", &[]);
+            assert_eq!(h.len(), 64);
+            let h: String = one(
+                "SELECT (automerge_changes_meta(doc, '{}')).hash FROM et LIMIT 1",
+                &[],
+            );
+            assert_eq!(h.len(), 64);
+        }
+        Spi::run(
+            "DO $$ DECLARE c refcursor; r record; BEGIN \
+               FOR i IN 1..20 LOOP \
+                 OPEN c FOR SELECT (automerge_changes(doc)).* FROM et; \
+                 FETCH c INTO r; \
+                 CLOSE c; \
+               END LOOP; END $$",
+        )
+        .unwrap();
+        // An error from a later argument after earlier rows were produced.
+        let err =
+            sql_error("SELECT (automerge_changes(doc)).hash, 1 / (random() * 0)::int FROM et");
+        assert!(err.starts_with("22012: "), "{err}");
+        let n: i64 = one("SELECT count(*) FROM et, automerge_changes(doc)", &[]);
+        assert_eq!(n, 4);
+    }
+
+    #[pg_test]
+    fn history_functions_are_labelled_and_search_path_safe() {
+        let wrong: Vec<String> = one(
+            "SELECT coalesce(array_agg(p.oid::regprocedure::text), '{}') FROM pg_proc p \
+             WHERE p.proname IN ('automerge_changes', 'automerge_changes_meta', 'automerge_changes_bytes', \
+                                 'automerge_get_change', 'automerge_change_count', 'automerge_to_jsonb') \
+               AND NOT (p.provolatile = 'i' AND p.proisstrict AND p.proparallel = 's')",
+            &[],
+        );
+        assert!(wrong.is_empty(), "{wrong:?}");
+        let n: i64 = one(
+            "SELECT count(*) FROM pg_proc WHERE proname IN ('automerge_changes', 'automerge_changes_meta', \
+             'automerge_changes_bytes', 'automerge_get_change', 'automerge_change_count', 'automerge_to_jsonb')",
+            &[],
+        );
+        assert_eq!(n, 7);
+        // Result rows are built from the function's declared type, not a
+        // lookup by name, so they work with the extension off search_path.
+        let (mut merged, _, _, _) = history_docs();
+        let schema: String = one(
+            "SELECT n.nspname::text FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE t.typname = 'automerge_change'",
+            &[],
+        );
+        Spi::run("SET LOCAL search_path TO pg_catalog").unwrap();
+        let n: i64 = one(
+            &format!(
+                "SELECT count(*) FROM {schema}.automerge_changes($1::bytea::{schema}.automerge) c \
+                 WHERE (c).change IS NOT NULL"
+            ),
+            &[merged.save().into()],
+        );
+        Spi::run("RESET search_path").unwrap();
+        assert_eq!(n, 4);
     }
 }
 

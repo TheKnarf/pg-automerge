@@ -1,8 +1,8 @@
-//! Conversion of the current state of an Automerge document to JSON, following
-//! the mapping table in docs/DESIGN.md.
+//! Conversion of the state of an Automerge document (current, or as of given
+//! heads) to JSON, following the mapping table in docs/DESIGN.md.
 
 use automerge::iter::{ListRange, MapRange};
-use automerge::{Automerge, ObjId, ObjType, ROOT, ReadDoc, ScalarValueRef, ValueRef};
+use automerge::{Automerge, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValueRef, ValueRef};
 use serde_json::{Map, Number, Value};
 
 use crate::Error;
@@ -20,9 +20,22 @@ pub const MAX_DEPTH: usize = 1000;
 /// pass through `f64`. For a key with concurrent conflicting values, the
 /// value Automerge's `get` returns (the conflict winner) is used.
 pub fn doc_to_json(doc: &Automerge) -> Result<Value, Error> {
+    doc_to_json_at(doc, None)
+}
+
+/// Convert the state of `doc` as of `heads` (`None`: the current state) to a
+/// JSON object, with the same mapping as [`doc_to_json`].
+///
+/// `heads` must all be changes of `doc` (callers check); Automerge ignores
+/// unknown ones. Every container read with `heads` recomputes Automerge's
+/// clock for them, which costs a walk of the change graph back to the
+/// nearest cached clock, so historical reads are somewhat slower than
+/// current ones. Heads equal to the document's current heads take the
+/// current-state path inside Automerge.
+pub fn doc_to_json_at(doc: &Automerge, heads: Option<&[ChangeHash]>) -> Result<Value, Error> {
     // Depth-first walk with an explicit stack of containers being filled, so
     // the native stack does not grow with document depth.
-    let mut stack = vec![Frame::new(doc, &ROOT, ObjType::Map, None)];
+    let mut stack = vec![Frame::new(doc, heads, &ROOT, ObjType::Map, None)];
     loop {
         let top = stack
             .last_mut()
@@ -39,9 +52,11 @@ pub fn doc_to_json(doc: &Automerge) -> Result<Value, Error> {
         match (value, id) {
             (ValueRef::Scalar(scalar), _) => top.push(key, scalar_to_json(&scalar)),
             (ValueRef::Object(ObjType::Text), Some(id)) => {
-                let text = doc
-                    .text(&id)
-                    .map_err(|e| Error::Internal(format!("could not read automerge text: {e}")))?;
+                let text = match heads {
+                    Some(heads) => doc.text_at(&id, heads),
+                    None => doc.text(&id),
+                }
+                .map_err(|e| Error::Internal(format!("could not read automerge text: {e}")))?;
                 top.push(key, Value::String(sanitize(&text).into_owned()));
             }
             (ValueRef::Object(typ), Some(id)) => {
@@ -50,7 +65,7 @@ pub fn doc_to_json(doc: &Automerge) -> Result<Value, Error> {
                         "automerge document is nested more than {MAX_DEPTH} levels deep"
                     )));
                 }
-                stack.push(Frame::new(doc, &id, typ, key));
+                stack.push(Frame::new(doc, heads, &id, typ, key));
             }
             (ValueRef::Object(_), None) => unreachable!("next_item returns an id for objects"),
         }
@@ -75,17 +90,33 @@ enum Frame<'a> {
 impl<'a> Frame<'a> {
     /// `key_in_parent` is the map key this container is stored under, or
     /// `None` for list elements and the root.
-    fn new(doc: &'a Automerge, obj: &ObjId, typ: ObjType, key_in_parent: Option<String>) -> Self {
+    fn new(
+        doc: &'a Automerge,
+        heads: Option<&[ChangeHash]>,
+        obj: &ObjId,
+        typ: ObjType,
+        key_in_parent: Option<String>,
+    ) -> Self {
         match typ {
-            ObjType::List => Frame::List {
-                key_in_parent,
-                iter: doc.list_range(obj, ..),
-                out: Vec::with_capacity(doc.length(obj)),
-            },
+            ObjType::List => {
+                let (iter, len) = match heads {
+                    // No length_at: that would be a second clock computation.
+                    Some(heads) => (doc.list_range_at(obj, .., heads), 0),
+                    None => (doc.list_range(obj, ..), doc.length(obj)),
+                };
+                Frame::List {
+                    key_in_parent,
+                    iter,
+                    out: Vec::with_capacity(len),
+                }
+            }
             // Text never gets a frame; it is converted in one go via `text()`.
             ObjType::Map | ObjType::Table | ObjType::Text => Frame::Map {
                 key_in_parent,
-                iter: doc.map_range(obj, ..),
+                iter: match heads {
+                    Some(heads) => doc.map_range_at(obj, .., heads),
+                    None => doc.map_range(obj, ..),
+                },
                 out: Map::new(),
             },
         }
