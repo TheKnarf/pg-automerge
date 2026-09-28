@@ -22,8 +22,8 @@ use automerge::{Automerge, Change, ChangeHash};
 
 use crate::{
     Applied, Error, apply_changes, contains_changes_by_heads, ensure_complete, guard_for,
-    guard_input, guard_stored, has_all, header, is_subset, load_stored_unguarded,
-    missing_deps_error, reload_check, stored_heads_unguarded,
+    guard_input, guard_stored, has_all, header, is_subset, load_stored_unguarded, reload_check,
+    stored_heads_unguarded,
 };
 
 /// Number of [`LoadedDoc`]s alive in this process (for leak tests).
@@ -338,7 +338,7 @@ pub fn merge_changes(a: Input<'_>, changes: &[u8]) -> Result<Option<LoadedDoc>, 
                     .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
                 if let Err(mut missing) = ensure_complete(&doc) {
                     missing.sort();
-                    return Err(missing_deps_error(&missing));
+                    return Err(Error::MissingDependencies(missing));
                 }
                 if is_subset(&doc.get_heads(), &heads_a) {
                     return Ok(None);
@@ -347,7 +347,7 @@ pub fn merge_changes(a: Input<'_>, changes: &[u8]) -> Result<Option<LoadedDoc>, 
             }
             None => match apply_changes(&a.bytes_for_load(), &heads_a, changes)? {
                 Applied::Unchanged => return Ok(None),
-                Applied::MissingDeps(missing) => return Err(missing_deps_error(&missing)),
+                Applied::MissingDeps(missing) => return Err(Error::MissingDependencies(missing)),
                 Applied::Changed(doc) => *doc,
             },
         };

@@ -184,7 +184,10 @@ fn a_failed_merge_leaves_the_loaded_document_as_it_was() {
         let err = loaded::merge_changes(Input::Loaded(&loaded_doc), &input)
             .err()
             .unwrap_or_else(|| panic!("{what}: expected an error"));
-        assert!(matches!(err, Error::InvalidInput(_)), "{what}: {err:?}");
+        assert!(
+            matches!(err, Error::InvalidInput(_) | Error::MissingDependencies(_)),
+            "{what}: {err:?}"
+        );
         // Untouched: same heads, same cached bytes, still loads the same.
         let mut h = heads.clone();
         h.sort();

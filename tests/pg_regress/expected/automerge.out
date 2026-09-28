@@ -98,9 +98,13 @@ FROM docs WHERE id = 4;
  t    | t             | t
 (1 row)
 
--- Changes whose dependencies the document lacks are rejected, naming them.
+-- Changes whose dependencies the document lacks are rejected, naming them
+-- in the DETAIL.
+\set VERBOSITY default
 SELECT merge(''::bytea::automerge, :'bob_changes'::bytea);
-ERROR:  invalid automerge changes: missing 1 dependency that neither the document nor the input contains: 891e9df3a1166db354fc4f7695411e61a5b6f0fd9d22eb23b814c8307f9f3573
+ERROR:  invalid automerge changes: missing 1 dependency that neither the document nor the input contains
+DETAIL:  Missing changes: 891e9df3a1166db354fc4f7695411e61a5b6f0fd9d22eb23b814c8307f9f3573.
+\set VERBOSITY terse
 -- An untyped literal resolves to merge(automerge, automerge), which needs a
 -- complete document: cast change chunks to bytea.
 SELECT merge(doc, :'bob_changes') FROM docs WHERE id = 4;
@@ -400,11 +404,14 @@ DROP FUNCTION apply_all(int, bytea[]);
 CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
     FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id');
 UPDATE docs SET doc = merge(doc, :'bob'::automerge) WHERE id = 3;
--- The trigger arguments are checked when it fires.
+-- The trigger arguments are checked when it fires (with a HINT on how to
+-- declare it).
+\set VERBOSITY default
 CREATE TRIGGER docs_bad BEFORE UPDATE ON docs
     FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id');
 UPDATE docs SET doc = doc WHERE id = 3;
-ERROR:  automerge_notify() must be fired AFTER, not BEFORE (trigger "docs_bad"); usage: CREATE TRIGGER ... AFTER INSERT OR UPDATE OR DELETE ON table FOR EACH ROW EXECUTE FUNCTION automerge_notify('channel', 'key_column' [, ...])
+ERROR:  automerge_notify() must be fired AFTER, not BEFORE (trigger "docs_bad")
+HINT:  Declare it as CREATE TRIGGER ... AFTER INSERT OR UPDATE OR DELETE ON table FOR EACH ROW EXECUTE FUNCTION automerge_notify('channel', 'key_column' [, ...]).
 DROP TRIGGER docs_bad ON docs;
 CREATE TRIGGER docs_bad AFTER UPDATE ON docs
     FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'uuid');
@@ -412,5 +419,7 @@ UPDATE docs SET doc = doc WHERE id = 3;
 ERROR:  automerge_notify(): key column "uuid" does not exist in table public.docs (trigger "docs_bad")
 DROP TRIGGER docs_bad ON docs;
 SELECT automerge_notify();
-ERROR:  automerge_notify() can only be called as a trigger; usage: CREATE TRIGGER ... AFTER INSERT OR UPDATE OR DELETE ON table FOR EACH ROW EXECUTE FUNCTION automerge_notify('channel', 'key_column' [, ...])
+ERROR:  automerge_notify() can only be called as a trigger
+HINT:  Declare it as CREATE TRIGGER ... AFTER INSERT OR UPDATE OR DELETE ON table FOR EACH ROW EXECUTE FUNCTION automerge_notify('channel', 'key_column' [, ...]).
+\set VERBOSITY terse
 DROP TABLE docs;

@@ -8,7 +8,7 @@ use pg_automerge_core::{self as am, Error};
 use pgrx::prelude::*;
 use pgrx::{Internal, JsonB};
 
-use crate::datum::{AutomergeArg, AutomergeDatum, AutomergeValue};
+use crate::datum::{AutomergeArg, AutomergeDatum, AutomergeValue, Detoasted};
 use crate::error::{OrRaise, raise};
 
 // The I/O functions are declared by hand in the `automerge_type` block (they
@@ -26,7 +26,8 @@ fn automerge_in(input: &CStr) -> AutomergeDatum {
 
 #[pg_extern(sql = false)]
 fn automerge_out(doc: AutomergeArg) -> CString {
-    CString::new(am::encoding::to_hex_literal(&doc.bytes())).expect("hex output never contains NUL")
+    CString::new(am::encoding::to_hex_literal(doc.detoast().stored()))
+        .expect("hex output never contains NUL")
 }
 
 #[pg_extern(sql = false)]
@@ -50,7 +51,10 @@ fn automerge_recv(buf: Internal) -> AutomergeDatum {
 
 #[pg_extern(sql = false)]
 fn automerge_send(doc: AutomergeArg) -> Vec<u8> {
-    doc.bytes().into_owned()
+    match doc.detoast() {
+        Detoasted::Flat(bytes) => bytes,
+        expanded => expanded.stored().to_vec(),
+    }
 }
 
 extension_sql!(

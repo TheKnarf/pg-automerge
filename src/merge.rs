@@ -20,16 +20,17 @@ fn merge(a: AutomergeArg, b: AutomergeArg) -> AutomergeValue {
     // The same object twice (`doc := merge(doc, doc)`): nothing to do, and
     // no document is borrowed while it could be replaced.
     if a.same_object(&b) {
-        return a.unchanged();
+        return a.detoast().into_value();
     }
-    let a_bytes = a.detoasted();
-    let b_bytes = b.detoasted();
-    let outcome = loaded::merge(a.input(&a_bytes), b.input(&b_bytes)).or_raise();
-    match outcome {
-        MergeOutcome::Left => a.into_value(a_bytes),
-        MergeOutcome::Right => b.into_value(b_bytes),
-        MergeOutcome::New(doc) => a.with_result(*doc),
-    }
+    let doc = {
+        let (da, db) = (a.detoast(), b.detoast());
+        match loaded::merge(da.input(), db.input()).or_raise() {
+            MergeOutcome::Left => return da.into_value(),
+            MergeOutcome::Right => return db.into_value(),
+            MergeOutcome::New(doc) => doc,
+        }
+    };
+    a.with_result(*doc)
 }
 
 /// `merge(automerge, bytea)`: apply an Automerge save or bare change chunks
@@ -38,12 +39,14 @@ fn merge(a: AutomergeArg, b: AutomergeArg) -> AutomergeValue {
 /// Changes with missing dependencies are rejected (22P02), naming them.
 #[pg_extern(immutable, strict, parallel_safe, name = "merge", support = automerge_merge_support)]
 fn merge_bytea(a: AutomergeArg, changes: &[u8]) -> AutomergeValue {
-    let a_bytes = a.detoasted();
-    let result = loaded::merge_changes(a.input(&a_bytes), changes).or_raise();
-    match result {
-        None => a.into_value(a_bytes),
-        Some(doc) => a.with_result(doc),
-    }
+    let doc = {
+        let da = a.detoast();
+        match loaded::merge_changes(da.input(), changes).or_raise() {
+            None => return da.into_value(),
+            Some(doc) => doc,
+        }
+    };
+    a.with_result(doc)
 }
 
 /// Planner support function of both `merge`s: answers PL/pgSQL's

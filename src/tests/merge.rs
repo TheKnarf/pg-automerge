@@ -395,14 +395,18 @@ fn merge_bytea_rejects_bad_input() {
     doc.put(ROOT, "z", 3i64).unwrap();
     let orphan = pg_automerge_core::encoding::to_hex_literal(&doc.save_incremental());
 
-    let err = sql_error(&format!(
+    // The hashes go in the DETAIL, the message stays short.
+    let err = sql_error_report(&format!(
         "SELECT merge('{base_hex}'::bytea::automerge, '{orphan}'::bytea)"
     ));
     assert_eq!(
         err,
-        format!(
-            "22P02: invalid automerge changes: missing 1 dependency that neither the document nor the input contains: {skipped}"
-        )
+        [
+            "22P02".to_string(),
+            "invalid automerge changes: missing 1 dependency that neither the document nor the input contains".to_string(),
+            format!("Missing changes: {skipped}."),
+            String::new(),
+        ]
     );
     for bad in ["\\x0102", "\\x856f4a83", "\\xdeadbeefdeadbeefdeadbeef"] {
         let err = sql_error(&format!(

@@ -10,7 +10,7 @@ use pgrx::prelude::*;
 use pgrx::{JsonB, PgTupleDesc};
 
 use crate::datum::AutomergeArg;
-use crate::error::{OrRaise, raise};
+use crate::error::{OrRaise, null_element, raise};
 
 extension_sql!(
     r#"
@@ -48,22 +48,16 @@ COMMENT ON TYPE automerge_change_meta IS
 
 /// A `text[]` argument of change hashes: no NULL elements (22004), every
 /// element 64 hex digits (22P02).
+#[track_caller]
 fn hashes_arg(name: &str, texts: &[Option<String>]) -> Vec<ChangeHash> {
-    let texts: Vec<&str> = texts
-        .iter()
-        .map(|t| {
-            t.as_deref().unwrap_or_else(|| {
-                pgrx::pg_sys::panic::ErrorReport::new(
-                    PgSqlErrorCode::ERRCODE_NULL_VALUE_NOT_ALLOWED,
-                    format!("{name} must not contain NULL"),
-                    pgrx::function_name!(),
-                )
-                .report(PgLogLevel::ERROR);
-                unreachable!("ereport(ERROR) does not return")
-            })
-        })
-        .collect();
-    am::history::parse_hashes(&texts).or_raise()
+    let mut hashes = Vec::with_capacity(texts.len());
+    for text in texts {
+        match text {
+            Some(text) => hashes.push(text.as_str()),
+            None => null_element(name),
+        }
+    }
+    am::history::parse_hashes(&hashes).or_raise()
 }
 
 fn to_i64(n: u64) -> i64 {

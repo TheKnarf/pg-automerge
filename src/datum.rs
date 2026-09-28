@@ -3,8 +3,6 @@
 //! front, with the prefix reads of the heads fast path) and
 //! [`AutomergeValue`] (a result).
 
-use std::borrow::Cow;
-
 use pg_automerge_core::automerge::ChangeHash;
 use pg_automerge_core::header::{self, Prefix};
 use pg_automerge_core::loaded::{Input, LoadedDoc};
@@ -16,7 +14,7 @@ use pgrx::pgrx_sql_entity_graph::metadata::{
 };
 use pgrx::prelude::*;
 
-use crate::error::{OrRaise, raise};
+use crate::error::OrRaise;
 use crate::expanded::{
     ExpandedAutomerge, expanded_doc, expanded_object, new_expanded, replace_in_place,
 };
@@ -144,13 +142,26 @@ impl AutomergeArg {
         }
     }
 
-    /// Run `f` on this value as a core [`Input`]: the loaded document of an
-    /// expanded value, or the detoasted bytes of a flat one.
-    pub(crate) fn with_input<T>(&self, f: impl FnOnce(Input<'_>) -> T) -> T {
-        match self.loaded() {
-            Some(doc) => f(Input::Loaded(doc)),
-            None => f(Input::Stored(&self.bytes())),
+    /// The whole value for the rest of the call: a flat value detoasted (and
+    /// copied) once, an expanded one used in place.
+    pub(crate) fn detoast(&self) -> Detoasted<'_> {
+        match self {
+            // SAFETY: a non-null varlena datum of this call.
+            Self::Flat(datum) => Detoasted::Flat(
+                unsafe { Vec::<u8>::from_polymorphic_datum(*datum, false, pg_sys::InvalidOid) }
+                    .expect("not null"),
+            ),
+            Self::Expanded { datum, .. } => Detoasted::Expanded {
+                datum: *datum,
+                doc: self.loaded().expect("expanded"),
+            },
         }
+    }
+
+    /// Run `f` on this value as a core [`Input`] (see
+    /// [`AutomergeArg::detoast`]).
+    pub(crate) fn with_input<T>(&self, f: impl FnOnce(Input<'_>) -> T) -> T {
+        f(self.detoast().input())
     }
 
     /// Length of the stored bytes of a flat value (without the varlena
@@ -177,21 +188,6 @@ impl AutomergeArg {
                 pg_sys::pfree(slice.cast());
             }
             bytes
-        }
-    }
-
-    /// All stored bytes: detoasted and copied for a flat value; for an
-    /// expanded one its stored bytes (saved once and cached in the object).
-    pub(crate) fn bytes(&self) -> Cow<'_, [u8]> {
-        match self {
-            // SAFETY: a non-null varlena datum of this call.
-            Self::Flat(datum) => Cow::Owned(
-                unsafe { Vec::<u8>::from_polymorphic_datum(*datum, false, pg_sys::InvalidOid) }
-                    .expect("not null"),
-            ),
-            Self::Expanded { .. } => {
-                Cow::Borrowed(self.loaded().expect("expanded").stored().or_raise())
-            }
         }
     }
 
@@ -226,7 +222,7 @@ impl AutomergeArg {
         }
         match self.read_prefix(header::heads_from_prefix) {
             Some(heads) => Ok(heads),
-            None => am::stored_heads(&self.bytes()),
+            None => am::stored_heads(self.detoast().stored()),
         }
     }
 
@@ -245,47 +241,6 @@ impl AutomergeArg {
         }
     }
 
-    /// The detoasted bytes of a flat value (`None` for an expanded one), to
-    /// be used through [`AutomergeArg::input`] and
-    /// [`AutomergeArg::into_value`] so that a flat value is detoasted once.
-    pub(crate) fn detoasted(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Flat(_) => Some(self.bytes().into_owned()),
-            Self::Expanded { .. } => None,
-        }
-    }
-
-    /// This value as a core [`Input`], given its [`AutomergeArg::detoasted`]
-    /// bytes.
-    pub(crate) fn input<'a>(&'a self, detoasted: &'a Option<Vec<u8>>) -> Input<'a> {
-        match (detoasted, self.loaded()) {
-            (Some(bytes), _) => Input::Stored(bytes),
-            (None, Some(doc)) => Input::Loaded(doc),
-            (None, None) => raise(Error::Internal(
-                "flat automerge value was not detoasted".into(),
-            )),
-        }
-    }
-
-    /// [`AutomergeArg::unchanged`], reusing the detoasted bytes.
-    pub(crate) fn into_value(self, detoasted: Option<Vec<u8>>) -> AutomergeValue {
-        match detoasted {
-            Some(bytes) => AutomergeValue::Bytes(bytes),
-            None => self.unchanged(),
-        }
-    }
-
-    /// The result for "this argument, unchanged": the datum itself for an
-    /// expanded value (its owner keeps it alive for as long as the result
-    /// can be used, as for any argument passed through), a copy of the
-    /// bytes for a flat one (as before expanded values existed).
-    pub(crate) fn unchanged(&self) -> AutomergeValue {
-        match self {
-            Self::Expanded { datum, .. } => AutomergeValue::Datum(*datum),
-            Self::Flat(_) => AutomergeValue::Bytes(self.bytes().into_owned()),
-        }
-    }
-
     /// The result for a new document `doc` computed from this argument: in
     /// place when this is a read-write expanded pointer (the object's
     /// document is replaced, and its pointer returned), otherwise a new
@@ -294,7 +249,8 @@ impl AutomergeArg {
     /// Replacing is the only mutation of an expanded object; the new
     /// document was built completely beforehand (from a clone), so a
     /// failure never leaves the object half-modified, as PL/pgSQL's
-    /// in-place assignment requires.
+    /// in-place assignment requires. The caller must not hold a
+    /// [`Detoasted`] of this argument any more.
     pub(crate) fn with_result(&self, doc: LoadedDoc) -> AutomergeValue {
         match self {
             Self::Expanded {
@@ -311,6 +267,47 @@ impl AutomergeArg {
                 AutomergeValue::Datum(*datum)
             }
             _ => AutomergeValue::Datum(new_expanded(doc)),
+        }
+    }
+}
+
+/// An argument's whole value for the rest of a call (see
+/// [`AutomergeArg::detoast`]).
+pub(crate) enum Detoasted<'a> {
+    /// The detoasted stored bytes of a flat value.
+    Flat(Vec<u8>),
+    /// An expanded value: its datum and its document.
+    Expanded {
+        datum: pg_sys::Datum,
+        doc: &'a LoadedDoc,
+    },
+}
+
+impl Detoasted<'_> {
+    /// The value as a core [`Input`].
+    pub(crate) fn input(&self) -> Input<'_> {
+        match self {
+            Self::Flat(bytes) => Input::Stored(bytes),
+            Self::Expanded { doc, .. } => Input::Loaded(doc),
+        }
+    }
+
+    /// The stored bytes: those of a flat value; for an expanded one its
+    /// save (computed once and cached in the object).
+    pub(crate) fn stored(&self) -> &[u8] {
+        match self {
+            Self::Flat(bytes) => bytes,
+            Self::Expanded { doc, .. } => doc.stored().or_raise(),
+        }
+    }
+
+    /// The argument, unchanged, as a result: the bytes of a flat value, the
+    /// datum itself for an expanded one (its owner keeps it alive for as
+    /// long as the result can be used, as for any argument passed through).
+    pub(crate) fn into_value(self) -> AutomergeValue {
+        match self {
+            Self::Flat(bytes) => AutomergeValue::Bytes(bytes),
+            Self::Expanded { datum, .. } => AutomergeValue::Datum(datum),
         }
     }
 }

@@ -51,8 +51,11 @@ SELECT merge(doc, :'bob_changes'::bytea)::bytea = doc::bytea AS noop,
        (doc || :'bob_changes'::bytea)::bytea = doc::bytea AS operator_noop,
        merge(doc, ''::bytea)::bytea = doc::bytea AS empty_noop
 FROM docs WHERE id = 4;
--- Changes whose dependencies the document lacks are rejected, naming them.
+-- Changes whose dependencies the document lacks are rejected, naming them
+-- in the DETAIL.
+\set VERBOSITY default
 SELECT merge(''::bytea::automerge, :'bob_changes'::bytea);
+\set VERBOSITY terse
 -- An untyped literal resolves to merge(automerge, automerge), which needs a
 -- complete document: cast change chunks to bytea.
 SELECT merge(doc, :'bob_changes') FROM docs WHERE id = 4;
@@ -219,7 +222,9 @@ DROP FUNCTION apply_all(int, bytea[]);
 CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
     FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id');
 UPDATE docs SET doc = merge(doc, :'bob'::automerge) WHERE id = 3;
--- The trigger arguments are checked when it fires.
+-- The trigger arguments are checked when it fires (with a HINT on how to
+-- declare it).
+\set VERBOSITY default
 CREATE TRIGGER docs_bad BEFORE UPDATE ON docs
     FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id');
 UPDATE docs SET doc = doc WHERE id = 3;
@@ -229,5 +234,6 @@ CREATE TRIGGER docs_bad AFTER UPDATE ON docs
 UPDATE docs SET doc = doc WHERE id = 3;
 DROP TRIGGER docs_bad ON docs;
 SELECT automerge_notify();
+\set VERBOSITY terse
 
 DROP TABLE docs;

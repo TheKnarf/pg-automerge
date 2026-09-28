@@ -82,6 +82,23 @@ fn sql_error(sql: &str) -> String {
     one("SELECT pg_temp.sql_error($1)", &[sql.into()])
 }
 
+/// The error `sql` raises: [SQLSTATE, message, DETAIL, HINT], "" for an
+/// absent DETAIL or HINT.
+fn sql_error_report(sql: &str) -> Vec<String> {
+    Spi::run(
+        "CREATE OR REPLACE FUNCTION pg_temp.sql_error_report(q text) RETURNS text[] \
+         LANGUAGE plpgsql AS $$ \
+         DECLARE s text; m text; d text; h text; \
+         BEGIN EXECUTE q; RETURN NULL; \
+         EXCEPTION WHEN OTHERS THEN \
+           GET STACKED DIAGNOSTICS s = RETURNED_SQLSTATE, m = MESSAGE_TEXT, \
+             d = PG_EXCEPTION_DETAIL, h = PG_EXCEPTION_HINT; \
+           RETURN ARRAY[s, m, coalesce(d, ''), coalesce(h, '')]; END $$",
+    )
+    .unwrap();
+    one("SELECT pg_temp.sql_error_report($1)", &[sql.into()])
+}
+
 fn explain(sql: &str) -> String {
     explain_with("COSTS OFF", sql)
 }

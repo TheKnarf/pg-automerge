@@ -22,25 +22,85 @@ pub mod notify;
 pub use automerge;
 pub use serde_json;
 
-/// Errors surfaced to SQL. The glue maps [`Error::InvalidInput`] to SQLSTATE
-/// 22P02 (invalid_text_representation), [`Error::InvalidParameter`] to 22023
-/// (invalid_parameter_value) and [`Error::Internal`] to XX000.
+/// Errors surfaced to SQL. The glue maps [`Error::InvalidInput`] and
+/// [`Error::MissingDependencies`] to SQLSTATE 22P02
+/// (invalid_text_representation), [`Error::InvalidParameter`] to 22023
+/// (invalid_parameter_value) and [`Error::Internal`] to XX000, with
+/// [`Error::message`] as the message and [`Error::detail`] as the DETAIL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    /// Malformed or unacceptable client input (bytes, text, hashes).
     InvalidInput(String),
     /// A well-formed argument that does not fit the document, e.g. heads
     /// the document does not have.
     InvalidParameter(String),
+    /// Changes whose dependencies are in neither the document nor the
+    /// input (`merge(automerge, bytea)`): the missing hashes, sorted.
+    /// Invalid input, like [`Error::InvalidInput`].
+    MissingDependencies(Vec<ChangeHash>),
+    /// A broken invariant: a stored value that does not load, or a bug.
     Internal(String),
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Error {
+    /// How many missing hashes [`Error::detail`] names.
+    const SHOWN: usize = 5;
+
+    /// The primary message: one short line.
+    pub fn message(&self) -> String {
         match self {
             Error::InvalidInput(msg) | Error::InvalidParameter(msg) | Error::Internal(msg) => {
-                f.write_str(msg)
+                msg.clone()
+            }
+            Error::MissingDependencies(missing) => {
+                let what = if missing.len() == 1 {
+                    "dependency"
+                } else {
+                    "dependencies"
+                };
+                format!(
+                    "invalid automerge changes: missing {} {what} that neither the document nor the input contains",
+                    missing.len()
+                )
             }
         }
+    }
+
+    /// Supporting detail, if any: for [`Error::MissingDependencies`] the
+    /// missing hashes (at most five, then a count of the others).
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Error::MissingDependencies(missing) => {
+                Some(format!("Missing changes: {}.", Self::list_missing(missing)))
+            }
+            _ => None,
+        }
+    }
+
+    fn list_missing(missing: &[ChangeHash]) -> String {
+        let shown: Vec<String> = missing
+            .iter()
+            .take(Self::SHOWN)
+            .map(ToString::to_string)
+            .collect();
+        let more = if missing.len() > Self::SHOWN {
+            format!(" and {} more", missing.len() - Self::SHOWN)
+        } else {
+            String::new()
+        };
+        format!("{}{more}", shown.join(", "))
+    }
+}
+
+impl fmt::Display for Error {
+    /// The message, followed by the missing hashes for
+    /// [`Error::MissingDependencies`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message())?;
+        if let Error::MissingDependencies(missing) = self {
+            write!(f, ": {}", Self::list_missing(missing))?;
+        }
+        Ok(())
     }
 }
 
@@ -285,28 +345,6 @@ pub(crate) fn apply_changes(
     } else {
         Ok(Applied::Changed(Box::new(doc)))
     }
-}
-
-/// The error for changes whose dependencies are in neither the document
-/// nor the input (`missing` sorted): names at most five of them.
-pub(crate) fn missing_deps_error(missing: &[ChangeHash]) -> Error {
-    const SHOWN: usize = 5;
-    let shown: Vec<String> = missing.iter().take(SHOWN).map(|h| h.to_string()).collect();
-    let more = if missing.len() > SHOWN {
-        format!(" and {} more", missing.len() - SHOWN)
-    } else {
-        String::new()
-    };
-    let what = if missing.len() == 1 {
-        "dependency"
-    } else {
-        "dependencies"
-    };
-    Error::InvalidInput(format!(
-        "invalid automerge changes: missing {} {what} that neither the document nor the input contains: {}{more}",
-        missing.len(),
-        shown.join(", ")
-    ))
 }
 
 /// Decide `contains_changes(a, changes)` from `a`'s heads and the framing

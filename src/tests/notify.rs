@@ -336,9 +336,21 @@ fn notify_trigger_validates_usage() {
         &[],
     );
     assert_eq!(labels, "vfalseutrigger");
-    let err = sql_error("SELECT automerge_notify()");
-    assert!(
-        err.starts_with("0A000: automerge_notify() can only be called as a trigger"),
-        "{err}"
+    // The usage goes in the HINT, the message stays short.
+    let err = sql_error_report("SELECT automerge_notify()");
+    assert_eq!(err[..2], ["0A000", "automerge_notify() can only be called as a trigger"]);
+    assert_eq!(err[2], "");
+    assert!(err[3].starts_with("Declare it as CREATE TRIGGER ... AFTER"), "{err:?}");
+    Spi::run("DROP TRIGGER IF EXISTS t ON nv").unwrap();
+    Spi::run("CREATE TRIGGER t BEFORE INSERT ON nv FOR EACH ROW EXECUTE FUNCTION automerge_notify('c', 'id')").unwrap();
+    let err = sql_error_report("INSERT INTO nv VALUES (1, NULL)");
+    assert_eq!(
+        err[..3],
+        [
+            "39P01",
+            "automerge_notify() must be fired AFTER, not BEFORE (trigger \"t\")",
+            ""
+        ]
     );
+    assert!(err[3].contains("automerge_notify('channel', 'key_column' [, ...])"), "{err:?}");
 }

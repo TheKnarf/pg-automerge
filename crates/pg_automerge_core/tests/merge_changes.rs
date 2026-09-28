@@ -34,6 +34,7 @@ fn apply(a: &[u8], changes: &[u8]) -> Vec<u8> {
 fn invalid(result: Result<Option<Vec<u8>>, Error>) -> String {
     match result {
         Err(Error::InvalidInput(msg)) => msg,
+        Err(e @ Error::MissingDependencies(_)) => e.to_string(),
         other => panic!("expected InvalidInput, got {other:?}"),
     }
 }
@@ -325,7 +326,9 @@ fn contains_changes_matches_loaded_document() {
                 // error for orphaned changes, which are not contained).
                 match merge_changes(a, &bytes) {
                     Ok(None) => assert!(expected),
-                    Ok(Some(_)) | Err(Error::InvalidInput(_)) => assert!(!expected),
+                    Ok(Some(_)) | Err(Error::InvalidInput(_) | Error::MissingDependencies(_)) => {
+                        assert!(!expected)
+                    }
                     Err(e) => panic!("{e}"),
                 }
             }
