@@ -1,24 +1,30 @@
 //! Building `jsonb` directly from the core JSON walk, without a detour
 //! through JSON text.
 //!
-//! [`JsonbBuilder`] is a [`JsonSink`] that feeds `pushJsonbValue` and
-//! finishes with `JsonbValueToJsonb`: the same calls `jsonb_in` makes while
-//! it parses text, with the same values, so the result is byte for byte
-//! what `jsonb_in` gives for the JSON text of the walk (pg_tests check
-//! this). The scalars:
+//! [`JsonbBuilder`] is a [`JsonSink`] that assembles the in-memory
+//! `JsonbValue` tree `jsonb_in` builds while it parses text (the tree
+//! `pushJsonbValue` accumulates) and finishes with one `JsonbValueToJsonb`,
+//! so the result is byte for byte what `jsonb_in` gives for the JSON text of
+//! the walk (pg_tests check this). The tree is assembled in Rust memory
+//! rather than through `pushJsonbValue` (one guarded FFI call and a few
+//! pallocs per event): element and pair arrays are allocated once per
+//! container at its exact size, string bytes go to a chunked arena, and
+//! object pairs are sorted and de-duplicated exactly as
+//! `uniqueifyJsonbObject` does (by length, then bytes; of equal keys the
+//! last one wins). Everything is freed when the builder is dropped, after
+//! `JsonbValueToJsonb` copied it. The scalars:
 //!
-//! - strings and keys: copied into palloc'd memory (the parse state keeps
-//!   pointers to them until `JsonbValueToJsonb`), with `jsonb_in`'s length
-//!   limit;
+//! - strings and keys: `jsonb_in`'s length limit;
 //! - `i64`: `int64_to_numeric`, the same numeric `numeric_in` makes of its
 //!   decimal digits;
 //! - `u64` above `i64::MAX` and floats: `numeric_in` on the text
 //!   `serde_json` writes for them (shortest round-trip form for floats),
-//!   exactly as `jsonb_in` would parse that text.
+//!   exactly as `jsonb_in` would parse that text;
+//! - element and pair counts: `pushJsonbValue`'s limits and errors.
 //!
 //! Postgres ERRORs inside these calls (out of memory, the jsonb size
 //! limits) unwind through the walk as pgrx panics, which the core's guard
-//! passes on untouched.
+//! passes on untouched; the Rust memory is freed on the way.
 
 use std::ffi::CString;
 
@@ -59,61 +65,157 @@ unsafe impl SqlTranslatable for JsonbDatum {
         Ok(ReturnsRef::One(SqlMappingRef::literal("jsonb")));
 }
 
-/// A [`JsonSink`] building a `jsonb` value in the current memory context.
-pub struct JsonbBuilder {
-    state: *mut pg_sys::JsonbParseState,
-    /// Whether each open container is an object (values are then
-    /// `WJB_VALUE`s, otherwise `WJB_ELEM`s).
-    open: Vec<bool>,
-    /// What the last `pushJsonbValue` returned: the finished top-level
-    /// container once the last one is closed.
-    last: *mut pg_sys::JsonbValue,
-}
-
-impl Default for JsonbBuilder {
-    fn default() -> Self {
-        Self {
-            state: std::ptr::null_mut(),
-            open: Vec::new(),
-            last: std::ptr::null_mut(),
-        }
-    }
-}
-
 /// `jsonb_in`'s limit on the length of a string or key
 /// (`JENTRY_OFFLENMASK`).
 const MAX_STRING_LEN: usize = 0x0FFF_FFFF;
 
+/// `MaxAllocSize`, which bounds `pushJsonbValue`'s element and pair arrays.
+const MAX_ALLOC_SIZE: usize = 0x3FFF_FFFF;
+
+/// `JB_CMASK`: the largest count a jsonb container header holds.
+const JB_CMASK: usize = 0x0FFF_FFFF;
+
+/// `pushJsonbValue`'s `JSONB_MAX_ELEMS`.
+const MAX_ELEMS: usize = {
+    let n = MAX_ALLOC_SIZE / size_of::<pg_sys::JsonbValue>();
+    if n < JB_CMASK { n } else { JB_CMASK }
+};
+
+/// `pushJsonbValue`'s `JSONB_MAX_PAIRS`.
+const MAX_PAIRS: usize = {
+    let n = MAX_ALLOC_SIZE / size_of::<pg_sys::JsonbPair>();
+    if n < JB_CMASK { n } else { JB_CMASK }
+};
+
+/// Size of a string arena chunk (larger strings get a chunk of their own).
+const CHUNK: usize = 64 * 1024;
+
+/// Append-only storage for string bytes whose addresses never change: a
+/// chunk is never grown past the capacity it was allocated with.
+#[derive(Default)]
+struct StringArena {
+    chunks: Vec<Vec<u8>>,
+}
+
+impl StringArena {
+    /// A copy of `s` that stays at the same address until the arena is
+    /// dropped.
+    fn copy(&mut self, s: &str) -> *const u8 {
+        let fits = self
+            .chunks
+            .last()
+            .is_some_and(|c| c.capacity() - c.len() >= s.len());
+        if !fits {
+            self.chunks.push(Vec::with_capacity(s.len().max(CHUNK)));
+        }
+        let chunk = self.chunks.last_mut().expect("pushed above");
+        let start = chunk.len();
+        // Within capacity: no reallocation, earlier pointers stay valid.
+        chunk.extend_from_slice(s.as_bytes());
+        chunk[start..].as_ptr()
+    }
+}
+
+/// A container being filled.
+enum Open {
+    /// An object: its pairs so far, and the key of the value that comes
+    /// next.
+    Object {
+        pairs: Vec<pg_sys::JsonbPair>,
+        key: Option<pg_sys::JsonbValue>,
+    },
+    /// An array: its elements so far.
+    Array(Vec<pg_sys::JsonbValue>),
+}
+
+/// A [`JsonSink`] building a `jsonb` value (in the current memory context,
+/// by [`JsonbBuilder::finish`]).
+#[derive(Default)]
+pub struct JsonbBuilder {
+    /// Open containers, innermost last.
+    open: Vec<Open>,
+    /// The finished top-level container.
+    root: Option<pg_sys::JsonbValue>,
+    /// The element and pair arrays of finished containers: the tree points
+    /// into them (boxed slices do not move when the box does).
+    values: Vec<Box<[pg_sys::JsonbValue]>>,
+    pairs: Vec<Box<[pg_sys::JsonbPair]>>,
+    /// The bytes of every string and key in the tree.
+    strings: StringArena,
+}
+
+/// The bytes of a `jbvString` value built by [`JsonbBuilder::string_value`].
+fn string_bytes(value: &pg_sys::JsonbValue) -> &[u8] {
+    // SAFETY: only called on keys, which are jbvString values pointing
+    // into the builder's arena for `len` bytes.
+    unsafe {
+        let s = value.val.string;
+        std::slice::from_raw_parts(s.val.cast::<u8>(), s.len as usize)
+    }
+}
+
+/// `uniqueifyJsonbObject`: sort by key (shorter first, then bytewise), and
+/// of equal keys keep the one added last.
+fn uniqueify(pairs: &mut Vec<pg_sys::JsonbPair>) {
+    if pairs.len() < 2 {
+        return;
+    }
+    pairs.sort_unstable_by(|a, b| {
+        let (ka, kb) = (string_bytes(&a.key), string_bytes(&b.key));
+        ka.len()
+            .cmp(&kb.len())
+            .then_with(|| ka.cmp(kb))
+            .then_with(|| b.order.cmp(&a.order))
+    });
+    pairs.dedup_by(|later, earlier| string_bytes(&later.key) == string_bytes(&earlier.key));
+}
+
+fn limit_exceeded(what: &str, max: usize) -> ! {
+    raise(PgError::new(
+        PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+        format!("number of jsonb {what} exceeds the maximum allowed ({max})"),
+    ))
+}
+
 impl JsonbBuilder {
     /// The finished value (every container closed), or `None`.
     pub fn finish(self) -> Option<JsonbDatum> {
-        if !self.open.is_empty() || self.last.is_null() {
+        if !self.open.is_empty() {
             return None;
         }
-        // SAFETY: `last` is the complete container pushJsonbValue returned
-        // for the final end token; converting it copies everything.
-        let jsonb = unsafe { pg_sys::JsonbValueToJsonb(self.last) };
+        let mut root = self.root?;
+        // SAFETY: `root` is a complete container whose arrays and strings
+        // are owned by `self`, alive until after the call, which copies
+        // everything into the new jsonb.
+        let jsonb = unsafe { pg_sys::JsonbValueToJsonb(&raw mut root) };
         Some(JsonbDatum(pg_sys::Datum::from(jsonb)))
     }
 
-    fn push(&mut self, token: pg_sys::JsonbIteratorToken::Type, value: *mut pg_sys::JsonbValue) {
-        // SAFETY: `state` is null or the parse state built by earlier
-        // pushes; `value` is null (container tokens) or a valid scalar
-        // whose string data lives in palloc'd memory until the end.
-        self.last = unsafe { pg_sys::pushJsonbValue(&raw mut self.state, token, value) };
-    }
-
-    fn scalar(&mut self, mut value: pg_sys::JsonbValue) {
-        let token = match self.open.last() {
-            Some(true) => pg_sys::JsonbIteratorToken::WJB_VALUE,
-            _ => pg_sys::JsonbIteratorToken::WJB_ELEM,
-        };
-        self.push(token, &raw mut value);
+    /// Add a finished value to the innermost open container (a key goes
+    /// to an object as the key of its next pair), or make it the root.
+    fn add(&mut self, value: pg_sys::JsonbValue) {
+        match self.open.last_mut() {
+            Some(Open::Array(elems)) => {
+                if elems.len() >= MAX_ELEMS {
+                    limit_exceeded("array elements", MAX_ELEMS);
+                }
+                elems.push(value);
+            }
+            Some(Open::Object { pairs, key }) => {
+                let key = key.take().expect("the walk emits a key before each value");
+                pairs.push(pg_sys::JsonbPair {
+                    key,
+                    value,
+                    order: pairs.len() as u32,
+                });
+            }
+            None => self.root = Some(value),
+        }
     }
 
     /// A string value (for a key or a scalar) with its bytes copied into
-    /// palloc'd memory.
-    fn string_value(s: &str) -> pg_sys::JsonbValue {
+    /// the arena.
+    fn string_value(&mut self, s: &str) -> pg_sys::JsonbValue {
         if s.len() > MAX_STRING_LEN {
             raise(
                 PgError::new(
@@ -125,18 +227,13 @@ impl JsonbBuilder {
                 )),
             );
         }
-        // SAFETY: palloc of at least one byte; the string is copied in.
-        let ptr = unsafe {
-            let ptr = pg_sys::palloc(s.len().max(1)).cast::<u8>();
-            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr, s.len());
-            ptr
-        };
+        let ptr = self.strings.copy(s);
         pg_sys::JsonbValue {
             type_: pg_sys::jbvType::jbvString,
             val: pg_sys::JsonbValue__bindgen_ty_1 {
                 string: pg_sys::JsonbValue__bindgen_ty_1__bindgen_ty_1 {
                     len: s.len() as i32,
-                    val: ptr.cast(),
+                    val: ptr.cast_mut().cast(),
                 },
             },
         }
@@ -170,58 +267,83 @@ impl JsonbBuilder {
 
 impl JsonSink for JsonbBuilder {
     fn begin_object(&mut self) {
-        self.push(
-            pg_sys::JsonbIteratorToken::WJB_BEGIN_OBJECT,
-            std::ptr::null_mut(),
-        );
-        self.open.push(true);
+        self.open.push(Open::Object {
+            pairs: Vec::new(),
+            key: None,
+        });
     }
 
     fn end_object(&mut self) {
-        self.open.pop();
-        self.push(
-            pg_sys::JsonbIteratorToken::WJB_END_OBJECT,
-            std::ptr::null_mut(),
-        );
+        let Some(Open::Object { mut pairs, .. }) = self.open.pop() else {
+            panic!("end_object without an open object");
+        };
+        uniqueify(&mut pairs);
+        let mut pairs = pairs.into_boxed_slice();
+        let value = pg_sys::JsonbValue {
+            type_: pg_sys::jbvType::jbvObject,
+            val: pg_sys::JsonbValue__bindgen_ty_1 {
+                object: pg_sys::JsonbValue__bindgen_ty_1__bindgen_ty_3 {
+                    nPairs: pairs.len() as i32,
+                    pairs: pairs.as_mut_ptr(),
+                },
+            },
+        };
+        self.pairs.push(pairs);
+        self.add(value);
     }
 
-    fn begin_array(&mut self, _len_hint: usize) {
-        // No preallocation hint: jsonb_in gives none either (the result is
-        // the same, this only keeps the two paths alike).
-        self.push(
-            pg_sys::JsonbIteratorToken::WJB_BEGIN_ARRAY,
-            std::ptr::null_mut(),
-        );
-        self.open.push(false);
+    fn begin_array(&mut self, len_hint: usize) {
+        self.open
+            .push(Open::Array(Vec::with_capacity(len_hint.min(MAX_ELEMS))));
     }
 
     fn end_array(&mut self) {
-        self.open.pop();
-        self.push(
-            pg_sys::JsonbIteratorToken::WJB_END_ARRAY,
-            std::ptr::null_mut(),
-        );
+        let Some(Open::Array(elems)) = self.open.pop() else {
+            panic!("end_array without an open array");
+        };
+        let mut elems = elems.into_boxed_slice();
+        let value = pg_sys::JsonbValue {
+            type_: pg_sys::jbvType::jbvArray,
+            val: pg_sys::JsonbValue__bindgen_ty_1 {
+                array: pg_sys::JsonbValue__bindgen_ty_1__bindgen_ty_2 {
+                    nElems: elems.len() as i32,
+                    elems: elems.as_mut_ptr(),
+                    rawScalar: false,
+                },
+            },
+        };
+        self.values.push(elems);
+        self.add(value);
     }
 
     fn key(&mut self, key: &str) {
-        let mut value = Self::string_value(key);
-        self.push(pg_sys::JsonbIteratorToken::WJB_KEY, &raw mut value);
+        let value = self.string_value(key);
+        match self.open.last_mut() {
+            Some(Open::Object { pairs, key }) => {
+                if pairs.len() >= MAX_PAIRS {
+                    limit_exceeded("object pairs", MAX_PAIRS);
+                }
+                *key = Some(value);
+            }
+            _ => panic!("key outside an object"),
+        }
     }
 
     fn string(&mut self, value: &str) {
-        self.scalar(Self::string_value(value));
+        let value = self.string_value(value);
+        self.add(value);
     }
 
     fn int(&mut self, value: i64) {
         // SAFETY: plain conversion, palloc'd result.
         let numeric = unsafe { pg_sys::int64_to_numeric(value) };
-        self.scalar(Self::numeric_value(numeric));
+        self.add(Self::numeric_value(numeric));
     }
 
     fn uint(&mut self, value: u64) {
         match i64::try_from(value) {
             Ok(value) => self.int(value),
-            Err(_) => self.scalar(Self::numeric_from_text(&value.to_string())),
+            Err(_) => self.add(Self::numeric_from_text(&value.to_string())),
         }
     }
 
@@ -230,18 +352,18 @@ impl JsonSink for JsonbBuilder {
         let text = pg_automerge_core::serde_json::Number::from_f64(value)
             .expect("the walk only passes finite floats")
             .to_string();
-        self.scalar(Self::numeric_from_text(&text));
+        self.add(Self::numeric_from_text(&text));
     }
 
     fn bool(&mut self, value: bool) {
-        self.scalar(pg_sys::JsonbValue {
+        self.add(pg_sys::JsonbValue {
             type_: pg_sys::jbvType::jbvBool,
             val: pg_sys::JsonbValue__bindgen_ty_1 { boolean: value },
         });
     }
 
     fn null(&mut self) {
-        self.scalar(pg_sys::JsonbValue {
+        self.add(pg_sys::JsonbValue {
             type_: pg_sys::jbvType::jbvNull,
             // SAFETY: an all-zero union is valid; jbvNull reads none of it.
             val: unsafe { std::mem::zeroed() },

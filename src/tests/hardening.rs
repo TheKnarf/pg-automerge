@@ -165,6 +165,58 @@ fn direct_jsonb_is_byte_identical_to_jsonb_in() {
     assert!(same);
 }
 
+/// The builder's own container assembly (exact-size arrays, the string
+/// arena, `uniqueifyJsonbObject`'s key order) on wide objects, keys of
+/// every length in shuffled order, arrays past jsonb's offset stride,
+/// strings filling and crossing arena chunks, strings larger than a chunk,
+/// empty strings and keys, and nesting.
+#[pg_test]
+fn direct_jsonb_wide_objects_and_long_strings_match_jsonb_in() {
+    let mut d = AutoCommit::new().with_actor(actor(9));
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    // 400 keys of lengths 0..=60 (many sharing a length), shuffled.
+    for i in 0..400u64 {
+        let len = (next() % 61) as usize;
+        let key: String = (0..len)
+            .map(|j| char::from(b'a' + ((i as usize * 7 + j) % 26) as u8))
+            .collect();
+        match next() % 4 {
+            0 => d.put(ROOT, key, "x".repeat((next() % 300) as usize)).unwrap(),
+            1 => d.put(ROOT, key, next() as i64).unwrap(),
+            2 => {
+                let m = d.put_object(ROOT, key, ObjType::Map).unwrap();
+                for k in ["b", "a", "ab", "", "ba"] {
+                    d.put(&m, k, k).unwrap();
+                }
+            }
+            _ => d.put(ROOT, key, "").unwrap(),
+        }
+    }
+    // Arrays of 0, 1, 31, 32, 33 and 1000 elements; strings crossing the
+    // 64 kB arena chunks; one string and one key larger than a chunk.
+    let lists = d.put_object(ROOT, "lists", ObjType::List).unwrap();
+    for (i, n) in [0usize, 1, 31, 32, 33, 1000].into_iter().enumerate() {
+        let l = d.insert_object(&lists, i, ObjType::List).unwrap();
+        for j in 0..n {
+            d.insert(&l, j, format!("{j}-{}", "y".repeat(j % 97))).unwrap();
+        }
+    }
+    let big = d.put_object(ROOT, "big", ObjType::Map).unwrap();
+    d.put(&big, "s", "z".repeat(200_000)).unwrap();
+    d.put(&big, "k".repeat(70_000), 1i64).unwrap();
+    let text = d.put_object(&big, "text", ObjType::Text).unwrap();
+    d.splice_text(&text, 0, 0, &"t".repeat(100_000)).unwrap();
+    d.commit();
+    let loaded = d.document().clone();
+    assert_eq!(direct_jsonb(&loaded, None), text_jsonb(&loaded, None));
+}
+
 #[pg_test]
 fn deferred_verification_failure_rejects_at_flatten_time() {
     let mut base = sample();

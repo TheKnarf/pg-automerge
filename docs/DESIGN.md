@@ -982,17 +982,27 @@ conflicting concurrent values, Automerge's winner is used (what `get` returns).
 
 The conversion builds the jsonb value directly: the core's walk
 (`json::write_json_at`) emits events into a `JsonSink`, and the glue's
-`JsonbBuilder` feeds them to `pushJsonbValue` and finishes with
-`JsonbValueToJsonb`, the calls `jsonb_in` makes while parsing, with the
-same values: strings and keys copied into palloc'd memory (with
-`jsonb_in`'s 256 MB string limit), `i64` through `int64_to_numeric`, and
-`u64` above `i64::MAX` and floats through `numeric_in` on the text
-`serde_json` writes for them (the shortest round-trip form), exactly what
-the text path parsed. So the result is byte for byte what the earlier
-`serde_json::Value` → text → `jsonb_in` path produced; a pg_test compares
-the two on every scalar edge case, conflicts, duplicate keys after NUL
-replacement, historical states and generated documents. Postgres errors
-inside those calls unwind through the walk untouched (see
+`JsonbBuilder` assembles from them the in-memory `JsonbValue` tree that
+`jsonb_in` builds while parsing (the tree `pushJsonbValue` accumulates) and
+finishes with one `JsonbValueToJsonb`, with the same values: strings and
+keys with `jsonb_in`'s 256 MB string limit, `i64` through
+`int64_to_numeric`, and `u64` above `i64::MAX` and floats through
+`numeric_in` on the text `serde_json` writes for them (the shortest
+round-trip form), exactly what the text path parsed. The tree is assembled
+in Rust memory rather than through `pushJsonbValue`, which cost one
+guarded FFI call and a few pallocs per event and doubled its arrays as they
+grew: each container's elements or pairs are allocated once at their final
+size, string bytes are copied into a chunked arena whose chunks never move,
+and object pairs are sorted and de-duplicated as `uniqueifyJsonbObject`
+does (by key length, then bytes; of equal keys the one added last wins),
+with `pushJsonbValue`'s element and pair limits and errors. That memory is
+freed when the builder is dropped, also when an error unwinds through it.
+So the result is byte for byte what the earlier `serde_json::Value` → text
+→ `jsonb_in` path produced; pg_tests compare the two on every scalar edge
+case, conflicts, duplicate keys after NUL replacement, historical states,
+generated documents, and wide objects with keys of every length, arrays
+past jsonb's offset stride and strings larger than an arena chunk.
+Postgres errors inside those calls unwind through the walk untouched (see
 [Errors and panics](#errors-and-panics)).
 
 The walk makes one sweep over the document with Automerge's document
@@ -1042,9 +1052,10 @@ bench-core` measures load, normalize, save and walk):
 | 20,000 list items, 401 changes | 877 kB | 161 ms | 3.5 ms | 1.3 ms | 1.8 ms | 72 ms |
 | 2,000 list items, 41 changes | 83 kB | 16 ms | 0.3 ms | 0.1 ms | 0.3 ms | 6.4 ms |
 
-Building the jsonb value from the walk's events costs about as much again
-as the walk on the list documents (a `serde_json::Value`, for
-comparison: 89 ms and 8 ms in total).
+Building the jsonb value from the walk's events adds about 30 ms on the
+877 kB list document (see [the appendix](#jsonb-built-in-rust-memory-2026-09-29));
+a `serde_json::Value`, for comparison, takes 89 ms and 8 ms in total with
+the walk on the two list documents.
 
 What costs a load, per call:
 
@@ -1113,6 +1124,18 @@ What costs a load, per call:
   with (20,000 notifications); re-sending that change 709 ms with a plain
   `merge` (a no-op rewrite of every row, no notifications) and 46 ms with
   the `WHERE NOT automerge_contains` pattern.
+- TOAST compression: stored values are uncompressed saves, which
+  Postgres compresses (`pglz` stores the 877 kB list in 190 kB; the 3 MB
+  text of random letters stays uncompressed, `pglz` gains nothing on it).
+  With the default `pglz`, profiles of the release build on the 877 kB
+  list put about 9% of an `INSERT` of a save and 5% of a `merge` of new
+  changes in `pglz_compress`, and about 1% of a jsonb read in
+  decompression; the rest is Automerge. `lz4` (`ALTER TABLE .. ALTER
+  COLUMN doc SET COMPRESSION lz4`, or `default_toast_compression`, on a
+  server built with it) compresses and decompresses much faster than
+  `pglz`, so it can trim that part of writes; it is not measured here (the
+  pgrx-managed Postgres is built without lz4) and the default is left
+  alone.
 - Merge results are expanded values: nested merges, `merge(...)::jsonb`,
   `merge_agg(...)::jsonb` and PL/pgSQL loops doing `d := merge(d, x)` keep
   the document loaded between steps. Measured with `mise run
@@ -1455,3 +1478,23 @@ flattens `EXCLUDED` and constant-folded parameters (see
 The pgrx-managed Postgres these numbers come from is an assert-enabled
 build (`randomize_mem` shows up in profiles of the jsonb paths), so the
 jsonb part of R1 and R2 is somewhat slower than on a production build.
+
+### jsonb built in Rust memory (2026-09-29)
+
+`JsonbBuilder` assembles the `JsonbValue` tree itself instead of feeding
+every event to `pushJsonbValue` (see [jsonb mapping](#jsonb-mapping)); the
+jsonb bytes are unchanged. `mise run bench-sql`, release build, median of
+seven runs, milliseconds, before and after in one session:
+
+| Path | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|
+| R1 `doc->>'status'` | 313 | 265 | 31 | 27 |
+| R2 three accessors in one `SELECT` | 911 | 810 | 91 | 80 |
+
+On the 3 MB text (one string) the build was never the cost: 2812 → 2787
+ms for R1 (median of five), within noise. Writes do not build jsonb and
+are unchanged. After the change a profile of R1 on the 877 kB list puts
+about 47% in the load, 15% in Automerge's document iterator, 4% in the
+walk's own bookkeeping and about 7% in building the jsonb
+(`JsonbValueToJsonb` 2.4%, `int64_to_numeric` 1%), against about 15% for
+the `pushJsonbValue` path before.
