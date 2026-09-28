@@ -341,6 +341,56 @@ WARNING:  caught SQLSTATE 22P02
 -- No jsonb -> automerge cast (it would fabricate history).
 SELECT '{}'::jsonb::automerge;
 ERROR:  cannot cast type jsonb to automerge at character 19
+-- Merging many change sets in PL/pgSQL: a variable holding a merge result
+-- stays loaded in memory (an expanded value), so each further
+-- `d := merge(d, ...)` applies only the new changes in place; the document
+-- is saved once, when it is stored. A merge that fails leaves the variable
+-- as it was.
+CREATE FUNCTION apply_all(p_id int, change_sets bytea[]) RETURNS int
+LANGUAGE plpgsql AS $$
+DECLARE
+    d automerge;
+    ch bytea;
+    skipped int := 0;
+BEGIN
+    SELECT doc INTO d FROM docs WHERE id = p_id FOR UPDATE;
+    FOREACH ch IN ARRAY change_sets LOOP
+        BEGIN
+            d := merge(d, ch);
+        EXCEPTION WHEN invalid_text_representation THEN
+            RAISE WARNING 'skipped: %', SQLERRM;
+            skipped := skipped + 1;
+        END;
+    END LOOP;
+    UPDATE docs SET doc = d WHERE id = p_id;
+    RETURN skipped;
+END $$;
+INSERT INTO docs VALUES (5, :'base'::bytea);
+SELECT apply_all(5, ARRAY[:'bob_changes'::bytea, '\x0102'::bytea, :'bob_changes'::bytea]) AS skipped;
+WARNING:  skipped: invalid automerge changes: unable to parse chunk: not enough data
+ skipped 
+---------
+       1
+(1 row)
+
+SELECT jsonb_path_query_array(doc, '$.items[*].name') AS items,
+       doc::bytea = merge(:'base'::automerge, :'bob_changes'::bytea)::bytea AS same_as_one_merge
+FROM docs WHERE id = 5;
+      items       | same_as_one_merge 
+------------------+-------------------
+ ["milk", "eggs"] | t
+(1 row)
+
+-- Nested merges keep intermediate results in memory too.
+SELECT (:'base'::automerge || :'alice'::automerge || :'bob'::automerge)->>'title' AS title,
+       automerge_heads(merge(merge(:'base'::automerge, :'alice'::automerge), :'bob_changes'::bytea))
+         = automerge_heads(merge(:'alice'::automerge, :'bob'::automerge)) AS same_heads;
+        title         | same_heads 
+----------------------+------------
+ Groceries for Sunday | t
+(1 row)
+
+DROP FUNCTION apply_all(int, bytea[]);
 -- Change notifications: an AFTER ROW trigger that sends
 --   NOTIFY docs_changed, '{"table":"public.docs","op":"UPDATE","key":{"id":1},
 --     "columns":{"doc":{"heads":[...],"prev_heads":[...]}}}'

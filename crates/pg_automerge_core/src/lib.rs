@@ -17,6 +17,7 @@ pub mod encoding;
 pub mod header;
 pub mod history;
 pub mod json;
+pub mod loaded;
 pub mod notify;
 
 pub use automerge;
@@ -78,7 +79,7 @@ fn guard<T>(
 }
 
 /// `guard` for operations on external input.
-fn guard_input<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+pub(crate) fn guard_input<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     guard(f, |msg| {
         Error::InvalidInput(format!(
             "invalid automerge document: malformed data ({msg})"
@@ -162,7 +163,7 @@ pub(crate) fn load_stored_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
 }
 
 /// `Err(missing hashes)` if `doc` holds changes whose dependencies are absent.
-fn ensure_complete(doc: &Automerge) -> Result<(), Vec<ChangeHash>> {
+pub(crate) fn ensure_complete(doc: &Automerge) -> Result<(), Vec<ChangeHash>> {
     let missing = doc.get_missing_deps(&[]);
     if missing.is_empty() {
         Ok(())
@@ -176,7 +177,7 @@ fn ensure_complete(doc: &Automerge) -> Result<(), Vec<ChangeHash>> {
 /// For a complete document (no queued changes), `get_missing_deps` returns
 /// exactly the given heads that `doc` does not have; any change it has also
 /// has all of its ancestors.
-fn has_all(doc: &Automerge, heads: &[ChangeHash]) -> bool {
+pub(crate) fn has_all(doc: &Automerge, heads: &[ChangeHash]) -> bool {
     doc.get_missing_deps(heads).is_empty()
 }
 
@@ -250,69 +251,18 @@ impl Merged {
 ///
 /// No-op checks, cheapest first: identical bytes; heads read from the
 /// headers (no load); the history of the larger input (one load); the
-/// history of the other.
+/// history of the other. Implemented by [`loaded::merge`], which also takes
+/// loaded documents.
 pub fn merge(a: &[u8], b: &[u8]) -> Result<Merged, Error> {
-    // Byte-identical stored values are the same document.
-    if a == b {
-        return Ok(Merged::Left);
+    match loaded::merge(loaded::Input::Stored(a), loaded::Input::Stored(b))? {
+        loaded::MergeOutcome::Left => Ok(Merged::Left),
+        loaded::MergeOutcome::Right => Ok(Merged::Right),
+        loaded::MergeOutcome::New(doc) => Ok(Merged::New(doc.stored()?.to_vec())),
     }
-    guard_stored(|| merge_unguarded(a, b))
-}
-
-fn merge_unguarded(a: &[u8], b: &[u8]) -> Result<Merged, Error> {
-    let heads_a = stored_heads_unguarded(a)?;
-    let heads_b = stored_heads_unguarded(b)?;
-    if is_subset(&heads_b, &heads_a) {
-        return Ok(Merged::Left);
-    }
-    if is_subset(&heads_a, &heads_b) {
-        // a ⊊ b by heads, so b contains a (see `contains_by_heads`).
-        return Ok(Merged::Right);
-    }
-    // Load the larger value first: a document that contains the other has
-    // a superset of its changes and ops, so it is usually the larger one,
-    // and the containment check then needs only that one load. (Only a
-    // guess: correctness does not depend on the order.)
-    let a_first = a.len() >= b.len();
-    let (first, second) = if a_first { (a, b) } else { (b, a) };
-    let (first_heads, second_heads) = if a_first {
-        (&heads_a, &heads_b)
-    } else {
-        (&heads_b, &heads_a)
-    };
-    let (first_wins, second_wins) = if a_first {
-        (Merged::Left, Merged::Right)
-    } else {
-        (Merged::Right, Merged::Left)
-    };
-    let doc_first = load_stored_unguarded(first)?;
-    if has_all(&doc_first, second_heads) {
-        return Ok(first_wins);
-    }
-    let doc_second = load_stored_unguarded(second)?;
-    if has_all(&doc_second, first_heads) {
-        return Ok(second_wins);
-    }
-    let (mut doc_a, mut doc_b) = if a_first {
-        (doc_first, doc_second)
-    } else {
-        (doc_second, doc_first)
-    };
-    merge_into(&mut doc_a, &mut doc_b)?;
-    Ok(Merged::New(doc_a.save_nocompress()))
 }
 
 fn merge_into(target: &mut Automerge, other: &mut Automerge) -> Result<(), Error> {
-    target
-        .merge(other)
-        .map_err(|e| Error::Internal(format!("could not merge automerge documents: {e}")))?;
-    ensure_complete(target).map_err(|missing| {
-        Error::Internal(format!(
-            "merged automerge document is missing {} dependencies (e.g. {})",
-            missing.len(),
-            missing[0]
-        ))
-    })
+    loaded::merge_from(target, other)
 }
 
 /// Apply external bytes to a stored value: `merge(automerge, bytea)`.
@@ -331,23 +281,29 @@ fn merge_into(target: &mut Automerge, other: &mut Automerge) -> Result<(), Error
 /// - Otherwise `Some` normalized result, which (as in [`normalize`]) is
 ///   loaded back once and must keep its heads.
 pub fn merge_changes(a: &[u8], changes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-    if changes.is_empty() {
-        return Ok(None);
+    match loaded::merge_changes(loaded::Input::Stored(a), changes)? {
+        None => Ok(None),
+        Some(doc) => Ok(Some(doc.stored()?.to_vec())),
     }
-    guard_input(|| merge_changes_unguarded(a, changes))
 }
 
-/// Result of loading `a ++ changes`.
-enum Applied {
+/// Result of loading `a ++ changes` ([`apply_changes`]).
+pub(crate) enum Applied {
     /// Nothing new: the heads are those of `a`.
     Unchanged,
     /// Changes whose dependencies are in neither input (sorted).
     MissingDeps(Vec<ChangeHash>),
-    /// New changes were applied; the document and its sorted heads.
-    Changed(Box<Automerge>, Vec<ChangeHash>),
+    /// New changes were applied.
+    Changed(Box<Automerge>),
 }
 
-fn apply_changes(a: &[u8], heads_a: &[ChangeHash], changes: &[u8]) -> Result<Applied, Error> {
+/// Load `a ++ changes` strictly (the path of `merge(automerge, bytea)`
+/// for input that is not bare change chunks, see [`loaded::merge_changes`]).
+pub(crate) fn apply_changes(
+    a: &[u8],
+    heads_a: &[ChangeHash],
+    changes: &[u8],
+) -> Result<Applied, Error> {
     // `a` is a document chunk, so loading `a ++ changes` is exactly
     // "load_incremental(changes) onto a", except that it is strict: a chunk
     // that fails to parse, or has a bad checksum, fails the whole load
@@ -371,53 +327,30 @@ fn apply_changes(a: &[u8], heads_a: &[ChangeHash], changes: &[u8]) -> Result<App
     if heads == sorted_a {
         Ok(Applied::Unchanged)
     } else {
-        Ok(Applied::Changed(Box::new(doc), heads))
+        Ok(Applied::Changed(Box::new(doc)))
     }
 }
 
-fn merge_changes_unguarded(a: &[u8], changes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-    let heads_a = stored_heads_unguarded(a)?;
-    // Re-sent changes that are exactly `a`'s heads: nothing to load.
-    if contains_changes_by_heads(&heads_a, changes) == Some(true) {
-        return Ok(None);
-    }
-    let (doc, heads) = match apply_changes(a, &heads_a, changes)? {
-        Applied::Unchanged => return Ok(None),
-        Applied::Changed(doc, heads) => (doc, heads),
-        Applied::MissingDeps(missing) => {
-            const SHOWN: usize = 5;
-            let shown: Vec<String> = missing.iter().take(SHOWN).map(|h| h.to_string()).collect();
-            let more = if missing.len() > SHOWN {
-                format!(" and {} more", missing.len() - SHOWN)
-            } else {
-                String::new()
-            };
-            let what = if missing.len() == 1 {
-                "dependency"
-            } else {
-                "dependencies"
-            };
-            return Err(Error::InvalidInput(format!(
-                "invalid automerge changes: missing {} {what} that neither the document nor the input contains: {}{more}",
-                missing.len(),
-                shown.join(", ")
-            )));
-        }
+/// The error for changes whose dependencies are in neither the document
+/// nor the input (`missing` sorted): names at most five of them.
+pub(crate) fn missing_deps_error(missing: &[ChangeHash]) -> Error {
+    const SHOWN: usize = 5;
+    let shown: Vec<String> = missing.iter().take(SHOWN).map(|h| h.to_string()).collect();
+    let more = if missing.len() > SHOWN {
+        format!(" and {} more", missing.len() - SHOWN)
+    } else {
+        String::new()
     };
-    let saved = doc.save_nocompress();
-    // Same safeguard as `normalize`: malformed but checksummed input can
-    // load into a document whose save does not load back.
-    let reloaded = Automerge::load(&saved).map_err(|e| {
-        Error::InvalidInput(format!(
-            "invalid automerge changes: result does not survive a save and load ({e})"
-        ))
-    })?;
-    if reloaded.get_heads() != heads {
-        return Err(Error::InvalidInput(
-            "invalid automerge changes: heads change after a save and load".into(),
-        ));
-    }
-    Ok(Some(saved))
+    let what = if missing.len() == 1 {
+        "dependency"
+    } else {
+        "dependencies"
+    };
+    Error::InvalidInput(format!(
+        "invalid automerge changes: missing {} {what} that neither the document nor the input contains: {}{more}",
+        missing.len(),
+        shown.join(", ")
+    ))
 }
 
 /// Decide `contains_changes(a, changes)` from `a`'s heads and the framing
@@ -477,19 +410,7 @@ pub fn contains_changes_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Opti
 /// are in neither input are not in `a`: `false`, where `merge` raises an
 /// error. Malformed input on the loading path is [`Error::InvalidInput`].
 pub fn contains_changes(a: &[u8], changes: &[u8]) -> Result<bool, Error> {
-    if changes.is_empty() {
-        return Ok(true);
-    }
-    guard_input(|| {
-        let heads_a = stored_heads_unguarded(a)?;
-        if let Some(answer) = contains_changes_by_heads(&heads_a, changes) {
-            return Ok(answer);
-        }
-        Ok(matches!(
-            apply_changes(a, &heads_a, changes)?,
-            Applied::Unchanged
-        ))
-    })
+    loaded::contains_changes(loaded::Input::Stored(a), changes)
 }
 
 /// Current heads as sorted lowercase hex change hashes.
@@ -506,15 +427,7 @@ pub fn heads_to_strings(heads: Vec<ChangeHash>) -> Vec<String> {
 
 /// Whether every change of `b` is already in `a` (so `merge(a, b)` is `a`).
 pub fn contains(a: &[u8], b: &[u8]) -> Result<bool, Error> {
-    if a == b {
-        return Ok(true);
-    }
-    let heads_a = stored_heads(a)?;
-    let heads_b = stored_heads(b)?;
-    match contains_by_heads(&heads_a, &heads_b) {
-        Some(answer) => Ok(answer),
-        None => contains_loaded(a, &heads_b),
-    }
+    loaded::contains(loaded::Input::Stored(a), loaded::Input::Stored(b))
 }
 
 /// Whether the stored value `a` has every change of the history ending at
@@ -536,6 +449,17 @@ pub struct MergeAccumulator {
     /// Bytes of the first input while no later input has added anything, so
     /// the common "all rows are the same or older" case needs no re-save.
     unchanged_first: Option<Vec<u8>>,
+    /// Whether an input was a loaded document with unverified external
+    /// changes (see [`loaded::LoadedDoc`]); the result then is too.
+    unverified: bool,
+}
+
+/// Result of [`MergeAccumulator::finish_loaded`].
+pub enum Accumulated<'a> {
+    /// Stored bytes of an input that already contained all the others.
+    Stored(&'a [u8]),
+    /// A new document (a copy of the state, which stays usable).
+    Loaded(Box<loaded::LoadedDoc>),
 }
 
 impl MergeAccumulator {
@@ -543,35 +467,81 @@ impl MergeAccumulator {
         Self::default()
     }
 
+    /// Add a stored value.
     pub fn add(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        guard_stored(|| self.add_unguarded(bytes))
+        self.add_input(loaded::Input::Stored(bytes))
     }
 
-    fn add_unguarded(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    /// Add a stored value or a loaded document.
+    pub fn add_input(&mut self, input: loaded::Input<'_>) -> Result<(), Error> {
+        let unverified = matches!(input, loaded::Input::Loaded(doc) if doc.is_unverified());
+        let run = || self.add_unguarded(input);
+        if unverified {
+            guard_input(run)
+        } else {
+            guard_stored(run)
+        }
+    }
+
+    fn add_unguarded(&mut self, input: loaded::Input<'_>) -> Result<(), Error> {
         let Some(doc) = self.doc.as_mut() else {
-            self.doc = Some(load_stored_unguarded(bytes)?);
-            self.unchanged_first = Some(bytes.to_vec());
+            match input {
+                loaded::Input::Stored(bytes) => {
+                    self.doc = Some(load_stored_unguarded(bytes)?);
+                    self.unchanged_first = Some(bytes.to_vec());
+                }
+                loaded::Input::Loaded(loaded) => {
+                    self.doc = Some(loaded.doc().clone());
+                    self.unchanged_first = loaded.cached_stored().map(<[u8]>::to_vec);
+                    self.unverified = loaded.is_unverified();
+                }
+            }
             return Ok(());
         };
-        if self.unchanged_first.as_deref() == Some(bytes) {
-            return Ok(());
+        match input {
+            loaded::Input::Stored(bytes) => {
+                if self.unchanged_first.as_deref() == Some(bytes) {
+                    return Ok(());
+                }
+                // Read the heads from the header first: an input that adds
+                // nothing is then never loaded.
+                if has_all(doc, &stored_heads_unguarded(bytes)?) {
+                    return Ok(());
+                }
+                let mut other = load_stored_unguarded(bytes)?;
+                merge_into(doc, &mut other)?;
+            }
+            loaded::Input::Loaded(loaded) => {
+                if has_all(doc, loaded.heads()) {
+                    return Ok(());
+                }
+                loaded::merge_from(doc, loaded.doc())?;
+                self.unverified |= loaded.is_unverified();
+            }
         }
-        // Read the heads from the header first: an input that adds nothing
-        // is then never loaded.
-        if has_all(doc, &stored_heads_unguarded(bytes)?) {
-            return Ok(());
-        }
-        let mut other = load_stored_unguarded(bytes)?;
-        merge_into(doc, &mut other)?;
         self.unchanged_first = None;
         Ok(())
     }
 
     /// The merged stored bytes, or `None` if nothing was added.
     pub fn finish(&self) -> Result<Option<Cow<'_, [u8]>>, Error> {
+        Ok(match self.finish_loaded()? {
+            None => None,
+            Some(Accumulated::Stored(bytes)) => Some(Cow::Borrowed(bytes)),
+            Some(Accumulated::Loaded(doc)) => Some(Cow::Owned(doc.stored()?.to_vec())),
+        })
+    }
+
+    /// The result without saving it: the first input's stored bytes when
+    /// nothing was added to it, otherwise a copy of the merged document
+    /// (the state stays usable, since a final function may run more than
+    /// once). `None` if nothing was added.
+    pub fn finish_loaded(&self) -> Result<Option<Accumulated<'_>>, Error> {
         match (&self.unchanged_first, &self.doc) {
-            (Some(bytes), _) => Ok(Some(Cow::Borrowed(bytes))),
-            (None, Some(doc)) => guard_stored(|| Ok(Some(Cow::Owned(doc.save_nocompress())))),
+            (Some(bytes), _) => Ok(Some(Accumulated::Stored(bytes))),
+            (None, Some(doc)) => Ok(Some(Accumulated::Loaded(Box::new(
+                loaded::LoadedDoc::from_doc(doc.clone(), self.unverified)?,
+            )))),
             (None, None) => Ok(None),
         }
     }

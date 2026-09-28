@@ -187,26 +187,32 @@ pub fn changes_meta(stored: &[u8], since: &[ChangeHash]) -> Result<Vec<ChangeInf
         if nothing_since(stored, since)? {
             return Ok(Vec::new());
         }
-        let doc = load_stored_unguarded(stored)?;
-        let rows = doc
-            .get_changes_meta(since)
-            .iter()
-            .map(ChangeInfo::from_meta)
-            .collect();
-        causal_order(rows)
+        changes_meta_doc(&load_stored_unguarded(stored)?, since)
     })
+}
+
+/// [`changes_meta`] of a loaded document.
+pub fn changes_meta_doc(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
+    let rows = doc
+        .get_changes_meta(since)
+        .iter()
+        .map(ChangeInfo::from_meta)
+        .collect();
+    causal_order(rows)
 }
 
 /// Like [`changes_meta`], with each change's bytes (rebuilt from the op set).
 pub fn changes(stored: &[u8], since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
-    guard_stored(|| changes_unguarded(stored, since))
+    guard_stored(|| {
+        if nothing_since(stored, since)? {
+            return Ok(Vec::new());
+        }
+        changes_doc(&load_stored_unguarded(stored)?, since)
+    })
 }
 
-fn changes_unguarded(stored: &[u8], since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
-    if nothing_since(stored, since)? {
-        return Ok(Vec::new());
-    }
-    let doc = load_stored_unguarded(stored)?;
+/// [`changes`] of a loaded document.
+pub fn changes_doc(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
     let rows = doc
         .get_changes(since)
         .iter()
@@ -221,32 +227,42 @@ fn changes_unguarded(stored: &[u8], since: &[ChangeHash]) -> Result<Vec<ChangeIn
 /// `merge(automerge, bytea)`. Empty when there is nothing new.
 pub fn changes_bytes(stored: &[u8], since: &[ChangeHash]) -> Result<Vec<u8>, Error> {
     guard_stored(|| {
-        let rows = changes_unguarded(stored, since)?;
-        let mut out = Vec::with_capacity(
-            rows.iter()
-                .map(|r| r.bytes.as_ref().map_or(0, Vec::len))
-                .sum(),
-        );
-        for row in rows {
-            out.extend(row.bytes.expect("changes() fills bytes"));
+        if nothing_since(stored, since)? {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        changes_bytes_doc(&load_stored_unguarded(stored)?, since)
     })
+}
+
+/// [`changes_bytes`] of a loaded document.
+pub fn changes_bytes_doc(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<u8>, Error> {
+    let rows = changes_doc(doc, since)?;
+    let mut out = Vec::with_capacity(
+        rows.iter()
+            .map(|r| r.bytes.as_ref().map_or(0, Vec::len))
+            .sum(),
+    );
+    for row in rows {
+        out.extend(row.bytes.expect("changes() fills bytes"));
+    }
+    Ok(out)
 }
 
 /// The change with hash `hash`, with its bytes, or `None` if the document
 /// does not have it.
 pub fn change(stored: &[u8], hash: &ChangeHash) -> Result<Option<ChangeInfo>, Error> {
-    guard_stored(|| {
-        let doc = load_stored_unguarded(stored)?;
-        if doc.get_change_meta_by_hash(hash).is_none() {
-            return Ok(None);
-        }
-        Ok(doc
-            .get_change_by_hash(hash)
-            .as_ref()
-            .map(ChangeInfo::from_change))
-    })
+    guard_stored(|| change_doc(&load_stored_unguarded(stored)?, hash))
+}
+
+/// [`change`] of a loaded document.
+pub fn change_doc(doc: &Automerge, hash: &ChangeHash) -> Result<Option<ChangeInfo>, Error> {
+    if doc.get_change_meta_by_hash(hash).is_none() {
+        return Ok(None);
+    }
+    Ok(doc
+        .get_change_by_hash(hash)
+        .as_ref()
+        .map(ChangeInfo::from_change))
 }
 
 /// Number of changes in the stored value: read from the header and the
@@ -262,7 +278,12 @@ pub fn change_count(stored: &[u8]) -> Result<u64, Error> {
 
 /// [`change_count`] by loading the document.
 pub fn change_count_loaded(stored: &[u8]) -> Result<u64, Error> {
-    guard_stored(|| Ok(load_stored_unguarded(stored)?.stats().num_changes))
+    guard_stored(|| Ok(change_count_doc(&load_stored_unguarded(stored)?)))
+}
+
+/// [`change_count`] of a loaded document.
+pub fn change_count_doc(doc: &Automerge) -> u64 {
+    doc.stats().num_changes
 }
 
 /// The document's state as of `heads` as JSON (see [`crate::json`]).
@@ -271,19 +292,21 @@ pub fn change_count_loaded(stored: &[u8]) -> Result<u64, Error> {
 /// [`Error::InvalidParameter`] naming the first missing one (sorted). Empty
 /// `heads` is the state before any change: `{}`.
 pub fn to_json_at(stored: &[u8], heads: &[ChangeHash]) -> Result<serde_json::Value, Error> {
-    guard_stored(|| {
-        let doc = load_stored_unguarded(stored)?;
-        check_heads(&doc, heads)?;
-        let mut current = doc.get_heads();
-        current.sort_unstable();
-        let mut wanted = heads.to_vec();
-        wanted.sort_unstable();
-        wanted.dedup();
-        if wanted == current {
-            return crate::json::doc_to_json(&doc);
-        }
-        crate::json::doc_to_json_at(&doc, Some(&wanted))
-    })
+    guard_stored(|| to_json_at_doc(&load_stored_unguarded(stored)?, heads))
+}
+
+/// [`to_json_at`] of a loaded document.
+pub fn to_json_at_doc(doc: &Automerge, heads: &[ChangeHash]) -> Result<serde_json::Value, Error> {
+    check_heads(doc, heads)?;
+    let mut current = doc.get_heads();
+    current.sort_unstable();
+    let mut wanted = heads.to_vec();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted == current {
+        return crate::json::doc_to_json(doc);
+    }
+    crate::json::doc_to_json_at(doc, Some(&wanted))
 }
 
 fn check_heads(doc: &Automerge, heads: &[ChangeHash]) -> Result<(), Error> {

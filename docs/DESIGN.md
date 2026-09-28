@@ -114,6 +114,11 @@ All are `IMMUTABLE STRICT PARALLEL SAFE` unless noted.
     `b`; then the larger input is loaded and checked against the other's
     heads (a containing document is usually the larger one, so one load
     decides the common linear case); only then the other.
+  - A new document is returned as an expanded value (see "Expanded
+    values"): kept loaded in memory and saved only when it is stored,
+    sent or cast to `bytea`. When `a` is a read-write expanded pointer
+    (a PL/pgSQL variable in `d := merge(d, x)`, or the result of an inner
+    `merge`), the merge happens in place.
   - Errors (SQLSTATE `22P02`/`XX000` with a clear message) if merged changes
     have missing deps. That cannot happen for two valid stored docs.
   - Note: `merge` is an unreserved keyword in PG15+. Verified: unqualified
@@ -124,10 +129,16 @@ All are `IMMUTABLE STRICT PARALLEL SAFE` unless noted.
   save (compressed or not, optionally followed by change chunks) or bare
   change chunks (`save_incremental()` / `save_after()` output, several may
   be concatenated) whose dependencies are in `a` or earlier in `changes`.
-  - Implemented as a strict `Automerge::load(a ++ changes)`: `a` is a
-    document chunk, so the rest is applied incrementally on top of it, but
-    unlike `load_incremental` a chunk that fails to parse or has a bad
-    checksum fails the whole call instead of being skipped.
+  - Strict, unlike `load_incremental`: a chunk that fails to parse or has
+    a bad checksum fails the whole call instead of being skipped. Bare
+    uncompressed change chunks (the usual input) are split and
+    checksum-checked by `header::change_chunks`, each parsed with
+    `Change::try_from` (the parser `Automerge::load` uses for change
+    chunks) and applied to `a`'s document with `apply_changes`: the same
+    steps as a load of `a ++ changes`, without re-loading `a` when it is
+    already loaded (an expanded value). Anything else (a save, compressed
+    chunks) is loaded as `a ++ changes` (for an expanded `a`, a fresh save
+    of it ++ `changes`).
   - Changes whose dependencies are in neither `a` nor `changes` raise
     `22P02` naming them (`invalid automerge changes: missing 1 dependency
     that neither the document nor the input contains: <hash>`; at most five
@@ -139,8 +150,13 @@ All are `IMMUTABLE STRICT PARALLEL SAFE` unless noted.
   - Malformed input, including decoder panics, is `22P02`. As in
     normalization, a changed result is loaded back once and must keep its
     heads, so a value that loads but whose save does not is never stored.
-    So a real change costs one load of `a ++ changes`, one save and one
-    verification load (about 2x a load of `a`); a no-op costs one load.
+    Since expanded values, that check runs when the result is first
+    flattened (stored, sent, cast to `bytea`), not inside `merge`: see
+    "Expanded values". A real change on a stored `a` costs one load of
+    `a`, one save and one verification load (about 2x a load of `a`); a
+    no-op costs one load; on an expanded `a`, a clone plus applying the
+    changes (milliseconds), with the save and the check deferred to the
+    flattening.
   - A document chunk inside `changes` whose heads `a` already has is skipped
     by Automerge after the checksum check, without decoding its columns.
 - Operators `automerge || automerge` and `automerge || bytea` → `automerge`
@@ -184,7 +200,11 @@ matches nothing (bytea → automerge is not implicit).
   accounting, and without a serialfunc HashAgg cannot spill it; the
   aggregate declares `SSPACE = 1048576` so the planner's per-group estimate
   is realistic and it prefers sorted grouping. `merge_agg_trans` runs
-  `CHECK_FOR_INTERRUPTS` before each input.
+  `CHECK_FOR_INTERRUPTS` before each input. Expanded inputs are used
+  without a load. When no single input contains all others, the result is
+  an expanded value holding a copy of the state (the final function may
+  run more than once, e.g. as a window function), so
+  `merge_agg(doc)::jsonb` needs no save and re-load.
 - `automerge_to_jsonb(automerge) → jsonb`: the cast function.
 - `automerge_heads(automerge) → text[]`: current heads as sorted lowercase hex
   change hashes. Read from the header without loading the document (see
@@ -263,7 +283,7 @@ repeat runs).
 
 `automerge_heads`, `automerge_contains`, `automerge_change_count` and the
 since-functions of "History" take their document without detoasting it
-(`LazyAutomerge`): they read the value's size with
+(`AutomergeArg`; an expanded value is read in memory): they read the value's size with
 `toast_raw_datum_size` and fetch only a prefix (4 kB, grown as needed) with
 `pg_detoast_datum_slice`, which for an out-of-line value reads only the
 TOAST chunks covering it and for a compressed value decompresses only that
@@ -536,6 +556,172 @@ re-sends of the latest changes, are decided from the chunk hashes); for a
 full save it loads the stored document, so a real change then costs one
 more load than the plain `merge`.
 
+## Expanded values
+
+Postgres lets a varlena type have an in-memory "expanded" form
+(`utils/expandeddatum.h`): a function returns a pointer to an object that
+stays in memory, and the flat bytes are produced only when the value is
+stored, sent or copied. For `automerge` the expanded form is the loaded
+Automerge document, so chains of operations stop paying a save and a
+re-load between steps.
+
+### Where it helps, and where it does not
+
+Cost of the primitives (Rust, release build; `load` is `Automerge::load`
+of the stored bytes, `apply` one small change set to a clone):
+
+| Document | Stored | load | save_nocompress | clone | clone + apply | to_json (loaded) |
+|---|---|---|---|---|---|---|
+| 3,000,000-character text, 1 change | 3.0 MB | 2591 ms | 7.7 ms | 0.7 ms | 1.6 ms | 197 ms |
+| 20,000 list items, 401 changes | 877 kB | 155 ms | 3.6 ms | 1.3 ms | 1.8 ms | 165 ms |
+| 2,000 list items, 41 changes | 83 kB | 15 ms | 0.3 ms | 0.1 ms | 0.3 ms | 15 ms |
+
+Loading dominates everything: it rebuilds and hashes every change. The
+flat path of `merge(doc, changes)` costs a load, a save and a verification
+load (2x load); an in-memory document costs a clone plus the new changes.
+So the win is exactly the loads that sit *between* operations:
+
+- Table columns always arrive flat. `UPDATE docs SET doc = merge(doc, $1)`
+  still loads the stored value, applies, saves and verifies once: no
+  change (and none is possible without a cross-statement cache).
+- `merge(merge(a, b), c)`, `a || b || c`: the inner result stays loaded; the
+  outer merge applies into it in place.
+- `merge(...)::jsonb`, `automerge_heads(merge(...))` and the history
+  functions on a merge result read the document in memory (no save, no
+  re-load).
+- PL/pgSQL `d := merge(d, x)` in a loop: the variable holds the expanded
+  document, merged into in place; the save (and its verification) happens
+  once, when `d` is stored.
+- Repeated reads of such a variable (`d->>'a'`, `d->>'b'`) convert from
+  memory instead of loading each time. A variable filled from a table
+  (`SELECT doc INTO d`) is flat until the first `merge` into it (PL/pgSQL
+  expands only arrays by itself).
+- `merge_agg(...)::jsonb` skips the final save and re-load (the inputs
+  still need a load each).
+
+Measured with `mise run bench-expanded` (release build, warm cache, mean of
+two runs, milliseconds; fixtures as in the table above, change sets are
+one small commit each, `merge_agg` over the document and 8 concurrent
+forks):
+
+| Workload | 3.0 MB before | after | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|---|---|
+| `UPDATE .. SET doc = merge(doc, c1)` | 5435 | 5452 | 388 | 379 | 43 | 42 |
+| `automerge_heads(merge(doc, c1))` | 5258 | 2642 | 358 | 180 | 40 | 23 |
+| `merge(doc, c1)::jsonb->>'status'` | 8141 | 2895 | 784 | 448 | 81 | 48 |
+| `automerge_heads(merge(merge(merge(doc, c1), c2), c3))` | 15758 | 2645 | 1034 | 187 | 112 | 24 |
+| PL/pgSQL `d := merge(d, c)`, 20 change sets | 105772 | 2697 | 6852 | 217 | 691 | 31 |
+| the same, each merge in a `BEGIN .. EXCEPTION` block | 105827 | 2693 | 6868 | 229 | 686 | 30 |
+| the same, then `UPDATE .. SET doc = d` | 106136 | 5584 | 6890 | 425 | 699 | 52 |
+| 2 merges into `d`, then 10 reads `d->>'status'` | 38960 | 5154 | 4987 | 2805 | 494 | 271 |
+| `merge_agg(doc)::jsonb` over 9 versions | 26488 | 24111 | 2006 | 1759 | 210 | 179 |
+
+The loop goes from one save plus two loads per change set to one load
+(plus one save and one verification load when stored). The statements
+that never store their result (`automerge_heads(merge(..))`) also skip the
+save and verification entirely. The single `UPDATE` is unchanged, as
+expected.
+
+### Implementation
+
+- Object: `ExpandedAutomerge` (`src/lib.rs`), the standard
+  `ExpandedObjectHeader` followed by a pointer to a Rust
+  `pg_automerge_core::loaded::LoadedDoc` (the `Automerge` document, its
+  sorted heads, and its stored bytes once computed). It lives in its own
+  memory context (`automerge expanded document`, a child of the calling
+  context), so Postgres frees or re-parents it with the value
+  (`TransferExpandedObject` when PL/pgSQL keeps it in a variable). The
+  Rust document is dropped by a reset callback registered on that
+  context, so it lives exactly as long as the object. The Rust heap
+  memory is not counted in the context (as for `merge_agg`'s state).
+- Flattening: `get_flat_size` computes the stored bytes
+  (`save_nocompress()`), caches them in the `LoadedDoc` and returns their
+  size; `flatten_into` copies the cached bytes (and checks the size it is
+  given). The bytes are the same as the flat path's, byte for byte (a
+  property test runs chains of merges both ways over generated histories:
+  a document chunk lists changes in the order they were applied, and both
+  paths apply them in the same order).
+- The cache cannot go stale: a `LoadedDoc` is never modified. "In place"
+  means the object's `LoadedDoc` is *replaced* by a new one (built from a
+  clone of the old document plus the new changes, with an empty cache).
+- Read-only vs read-write: only a read-write pointer
+  (`VARTAG_EXPANDED_RW`) allows the replacement. With a read-only pointer
+  (a variable passed to another target, a value in a slot, the other
+  arguments of an in-place call) the function returns a new object and
+  never touches the old one. New objects are returned read-write, as the
+  protocol requires.
+- Failure atomicity: the new document is complete before it replaces the
+  old one, and nothing after the replacement can fail. An error (bad
+  changes, missing dependencies, a duplicate seq, a decoder panic) leaves
+  the argument's document as it was. This is condition 1 of
+  `SupportRequestModifyInPlace`, and it holds for every read-write call,
+  not just PL/pgSQL's.
+- `merge(x, x)` through a read-write and a read-only pointer to the same
+  object (`d := merge(d, d)`, `d := d || d`): recognized by object identity
+  and returned unchanged, before any document is borrowed.
+  `d := merge(d, d::bytea)` reads a flattened copy (argument unboxing
+  happens before the call). This is condition 2 of the support request.
+- Support function: `automerge_merge_support(internal)` is attached to both
+  `merge`s (and so to both `||`) with `SUPPORT`. For
+  `SupportRequestModifyInPlace` it names the first argument when it is the
+  assignment target's `PARAM_EXTERN` Param, otherwise NULL (also for every
+  other request). PL/pgSQL then passes the variable read-write even when
+  it is declared outside a `BEGIN .. EXCEPTION` block, where its value must
+  survive an error; for a local variable referenced once PL/pgSQL 18
+  already transfers ownership into the expression by itself. Both paths
+  are tested (a test-only counter of in-place replacements).
+- Inputs: every function taking `automerge` accepts both forms
+  (`AutomergeArg`); the read functions (heads, jsonb, history,
+  containment, change count) use an expanded argument's document in
+  memory and never flatten it. Output, `send` and casts flatten it (once;
+  the bytes are cached). Functions that
+  receive `automerge` as `bytea` (`doc::bytea` is binary-coercible) get the
+  flattened bytes through the normal detoast.
+- No-op results: an input that already contains the other is returned as
+  is: a flat input as a copy of its bytes (as before), an expanded input
+  as the same pointer, the way `COALESCE` passes an argument through
+  (whoever keeps the result beyond the expression copies it: slots,
+  PL/pgSQL assignment and SQL function results flatten a read-only
+  pointer).
+- `merge(automerge, bytea)` on an expanded document parses the change
+  chunks (`Change::try_from`, the parser `Automerge::load` uses) and
+  applies them to a clone, so it needs no load; a save or compressed
+  chunks go through a strict load of a fresh save of the document plus
+  the input (the old path).
+
+### The deferred verification
+
+A result that contains changes from a `bytea` is marked unverified. Its
+save is loaded back and must keep the heads (the safeguard `normalize` and
+`merge(automerge, bytea)` always had) when it is first flattened, not
+inside `merge`. So such a value can never be stored unless it loads back,
+as before, but the rare input that loads, applies, and then does not
+survive a save and load (seen only in fuzzing, as malformed input with
+recomputed checksums) now fails with the same `22P02` where the value is
+stored, sent or cast, e.g. at the `UPDATE`, not at the `merge` call; a
+`BEGIN .. EXCEPTION` block around only the `merge` does not catch it.
+Every other bad input (framing, checksums, change columns, missing
+dependencies, duplicate seq, decoder panics) still fails inside `merge`.
+Verifying eagerly would cost a load per merge and undo most of the gain.
+
+### Pitfalls avoided (supabase/pg_crdt's expanded automerge)
+
+1. Mutating through a read-only pointer: only `VARTAG_EXPANDED_RW` allows
+   replacement; tested with a PL/pgSQL variable passed read-only to two
+   merges and with an alias (`x := d; d := merge(d, y)` leaves `x`).
+2. Stale flat bytes: the cache belongs to an immutable `LoadedDoc`, and a
+   merge replaces the whole `LoadedDoc`; tested by storing, merging in
+   place and storing again (and in the core tests).
+3. Support function not attached: `SUPPORT automerge_merge_support` is in
+   the generated `CREATE FUNCTION`s; a pg_test checks `pg_proc.prosupport`
+   and that PL/pgSQL's in-place path is taken inside an `EXCEPTION` block.
+4. Document memory outside the object's lifecycle: the document is owned
+   by the object and dropped by its context's reset callback; a pg_test
+   runs about 2,400 merges in PL/pgSQL loops and checks that
+   `pg_backend_memory_contexts` shows at most the live variables' objects
+   during the loop and none after, and that the number of live Rust
+   documents returns to where it was.
+
 ## jsonb mapping
 
 The root is always a map, so it maps to a jsonb object. For a map key with
@@ -596,7 +782,11 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   (for `automerge_contains`) new changes on top of the current heads.
 - `automerge_notify()` reads at most a prefix of each changed `automerge`
   value per row, never loads a document.
-- A per-backend cache of loaded docs and converted jsonb is future work.
+- Merge results are expanded values (see "Expanded values"): nested
+  merges, `merge(...)::jsonb`, `merge_agg(...)::jsonb` and PL/pgSQL loops
+  doing `d := merge(d, x)` keep the document loaded between steps. A
+  per-backend cache of documents loaded from tables (and of converted
+  jsonb) is future work: a table column always arrives flat.
 
 ## Implementation notes (pgrx)
 
@@ -606,10 +796,14 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   give the Rust newtype manual `FromDatum` / `IntoDatum` / `SqlTranslatable`
   impls mapping to SQL `automerge`. Detoast with `pg_detoast_datum_packed` or
   equivalent. Never hold references into a detoasted datum beyond the call.
-  A second Rust type, `LazyAutomerge`, maps to the same SQL type for
-  arguments that are detoasted on demand (only a prefix for the heads); it
-  holds the raw argument datum and exists only for the duration of a call.
-  Both are listed in the `creates` of the type's `extension_sql!` block.
+  That newtype (`AutomergeDatum`) is only a result type (input functions,
+  `bytea` cast). Arguments are `AutomergeArg`: flat (the raw datum,
+  detoasted on demand, only a prefix for the heads) or a pointer to one of
+  our expanded objects (read-only or read-write); it exists only for the
+  duration of a call. Other results are `AutomergeValue`: new flat bytes,
+  or a datum passed through (an unchanged argument, a new expanded
+  object). All three are listed in the `creates` of the type's
+  `extension_sql!` block.
 - Errors: never panic across FFI. Map Automerge errors to `ereport(ERROR)`
   with SQLSTATE `22P02` (invalid_text_representation) for bad input (text,
   binary recv and bytea alike, and malformed change hashes), `22023`
@@ -630,7 +824,8 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
 - Code layout: all Automerge logic (normalize, merge, merge_changes, heads
   and the header parser, the change-chunk splitter, contains and
   contains_changes, the history functions in `history.rs`, the notification
-  payload builder in `notify.rs`, the jsonb mapping, hex/base64/ISO 8601
+  payload builder in `notify.rs`, the in-memory documents behind expanded
+  values in `loaded.rs`, the jsonb mapping, hex/base64/ISO 8601
   encoders) is plain Rust in
   `crates/pg_automerge_core` with `#[test]`s; `src/lib.rs` is pgrx glue. The
   I/O functions are declared by hand inside the `CREATE TYPE` block
@@ -643,7 +838,8 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   `automerge_contains(automerge, bytea)`,
   `heads_fast_path.rs` for the header parser property test, `history.rs`
   for the history functions, checked against Automerge (`fork_at`,
-  `get_changes`) and a dependency-graph walk; `common/` holds the shared
+  `get_changes`) and a dependency-graph walk, `loaded.rs` for loaded
+  documents (byte-identical to the flat path); `common/` holds the shared
   random-history generator), and
   `tests/pg_regress` for user-facing examples. `tests/concurrency.sh`
   (`mise run concurrency`, also the last step of `mise run test`) runs two real psql sessions against one row to
@@ -657,6 +853,9 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
   NOTIFY never delivers there (the pg_tests instead read what the trigger
   sent from a test-only per-backend list). Build test documents in Rust with
   `automerge::AutoCommit` and pass them in as `bytea`.
+- `mise run bench-expanded` (`tests/bench_expanded.sh`, not part of `mise
+  run test`) installs a release build and times the merge workloads of
+  "Expanded values" on three generated documents.
 - `mise run regress` passes `--resetdb`: a reused regress database would
   keep the extension objects of an earlier build, so new functions would be
   missing.

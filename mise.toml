@@ -43,3 +43,7 @@ run = "bash tests/notify.sh"
 [tasks.concurrency]
 description = "Two concurrent psql sessions merging into one row (installs + starts the pgrx Postgres)"
 run = "bash tests/concurrency.sh"
+
+[tasks.bench-expanded]
+description = "Benchmark merge-heavy workloads (PL/pgSQL loops, nested merges, merge_agg) on a release build; not part of test"
+run = "bash tests/bench_expanded.sh"

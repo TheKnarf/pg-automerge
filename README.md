@@ -99,6 +99,33 @@ For bare changes (`$1` bytea) the check usually needs no load of the
 document; for a full save (`$1::automerge`) it costs one extra load when
 there is something new.
 
+### Merging in PL/pgSQL and nested merges
+
+A merge result stays loaded in memory (an expanded value) until it is
+stored, sent or cast to `bytea`, so chains of merges do not save and
+re-load the document at every step:
+
+```sql
+-- d is merged into in place; the document is saved once, at the UPDATE.
+DECLARE d automerge; ch bytea;
+BEGIN
+    SELECT doc INTO d FROM docs WHERE id = $1 FOR UPDATE;
+    FOREACH ch IN ARRAY change_sets LOOP
+        d := merge(d, ch);
+    END LOOP;
+    UPDATE docs SET doc = d WHERE id = $1;
+END;
+```
+
+On a 3 MB document, 20 change sets took 106 s this way before and 5.6 s
+now; `merge(merge(merge(doc, a), b), c)`, `merge(...)::jsonb` and
+`merge_agg(...)::jsonb` also skip the intermediate saves and loads. A
+single `UPDATE .. SET doc = merge(doc, $1)` costs the same as before (the
+column arrives flat). Like `merge_agg`'s state, the in-memory document is
+outside Postgres' memory accounting. A failed `merge` leaves the variable unchanged, also
+inside a `BEGIN .. EXCEPTION` block. Details in
+[DESIGN.md](docs/DESIGN.md#expanded-values).
+
 ### SQL API
 
 | | |
@@ -107,7 +134,7 @@ there is something new.
 | `bytea → automerge` | Assignment cast (validates). |
 | `automerge → bytea` | Explicit cast: the stored Automerge bytes. |
 | `automerge → jsonb` | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
-| `merge(a, b)`, `a \|\| b` | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other. |
+| `merge(a, b)`, `a \|\| b` | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. |
 | `merge(doc, changes bytea)`, `doc \|\| changes` | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them). |
 | `merge_agg(automerge)` | Aggregate merge of all non-null inputs. |
 | `automerge_heads(automerge) → text[]` | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
@@ -160,6 +187,10 @@ Gotchas:
   MB a single call can take a noticeable time.
 - Malformed input is always SQLSTATE `22P02` (`invalid automerge document`),
   including input that passes Automerge's checksums but panics its decoder.
+  One rare case is reported late: a result of `merge(doc, bytea)` is checked
+  to survive a save and load when it is first stored, sent or cast, not
+  inside `merge` (a `BEGIN .. EXCEPTION` around just the `merge` does not
+  catch it). Nothing that fails the check is ever stored.
 - In `since_heads`, hashes the document does not have are **ignored** (as
   in Automerge's `getChanges`): a replica that is ahead of the stored row
   gets every change that is not an ancestor of the heads the row knows,
@@ -189,4 +220,5 @@ mise run test        # core unit tests + #[pg_test] tests + the concurrency and 
 mise run regress     # pg_regress examples in tests/pg_regress
 mise run concurrency # only: two real psql sessions merging into one row, pg_dump round trip
 mise run notify      # only: a real LISTEN session receiving automerge_notify() payloads
+mise run bench-expanded  # timings of merge-heavy workloads on a release build (minutes)
 ```

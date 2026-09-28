@@ -325,6 +325,9 @@ const CHANGE_CHUNK: u8 = 1;
 pub struct ChangeChunk {
     pub hash: ChangeHash,
     pub deps: Vec<ChangeHash>,
+    /// Where the chunk (from its magic bytes to the end of its data) sits
+    /// in the input.
+    pub range: std::ops::Range<usize>,
 }
 
 /// Split `bytes` into uncompressed change chunks (`save_incremental()` /
@@ -351,6 +354,7 @@ pub fn change_chunks(bytes: &[u8]) -> Option<Vec<ChangeChunk>> {
     };
     let mut chunks = Vec::new();
     while r.pos < bytes.len() {
+        let start = r.pos;
         let chunk = (|| -> Result<ChangeChunk, Stop> {
             if r.take(4)? != MAGIC {
                 return Err(Stop::NotSingleDoc);
@@ -393,6 +397,7 @@ pub fn change_chunks(bytes: &[u8]) -> Option<Vec<ChangeChunk>> {
             Ok(ChangeChunk {
                 hash: ChangeHash(hash),
                 deps,
+                range: start..r.pos,
             })
         })()
         .ok()?;
@@ -425,6 +430,7 @@ mod tests {
         for (chunk, change) in chunks.iter().zip(&expected) {
             assert_eq!(chunk.hash, change.hash());
             assert_eq!(chunk.deps, change.deps());
+            assert_eq!(&bytes[chunk.range.clone()], change.raw_bytes());
         }
         // The very first change has no deps.
         let all = change_chunks(&doc.save_after(&[])).unwrap();

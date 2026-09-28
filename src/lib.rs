@@ -3,10 +3,12 @@
 //! This crate is the pgrx glue; all Automerge logic lives in
 //! `pg_automerge_core`. See docs/DESIGN.md for the SQL surface and semantics.
 
+use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 
 use pg_automerge_core::automerge::ChangeHash;
 use pg_automerge_core::header::{self, Prefix};
+use pg_automerge_core::loaded::{self, Input, LoadedDoc, MergeOutcome};
 use pg_automerge_core::{self as am, Error, MergeAccumulator};
 use pgrx::callconv::{Arg, ArgAbi, BoxRet, FcInfo};
 use pgrx::datum::Datum;
@@ -23,30 +25,14 @@ use pgrx::{Internal, JsonB, PgMemoryContexts, PgTupleDesc};
 // The `automerge` type
 // ---------------------------------------------------------------------------
 
-/// A value of the SQL `automerge` type: the canonical stored bytes (the output
-/// of `save_nocompress()`), copied out of the (possibly toasted) datum so no
-/// reference into Postgres memory outlives the call.
+/// A new flat value of the SQL `automerge` type, returned by the input
+/// functions and the `bytea` cast: canonical stored bytes (the output of
+/// `save_nocompress()`).
 ///
 /// Only construct this from bytes that are already validated and normalized
-/// (see [`am::normalize`]); the datum is written to disk as-is.
+/// (see [`am::normalize`]); the datum is written to disk as-is. Arguments
+/// use [`AutomergeArg`], other results [`AutomergeValue`].
 pub struct AutomergeDatum(Vec<u8>);
-
-impl AutomergeDatum {
-    fn bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl FromDatum for AutomergeDatum {
-    unsafe fn from_polymorphic_datum(
-        datum: pg_sys::Datum,
-        is_null: bool,
-        typoid: pg_sys::Oid,
-    ) -> Option<Self> {
-        // Same varlena layout as bytea: detoast and copy the payload.
-        unsafe { Vec::<u8>::from_polymorphic_datum(datum, is_null, typoid) }.map(Self)
-    }
-}
 
 impl IntoDatum for AutomergeDatum {
     fn into_datum(self) -> Option<pg_sys::Datum> {
@@ -55,14 +41,6 @@ impl IntoDatum for AutomergeDatum {
 
     fn type_oid() -> pg_sys::Oid {
         pgrx::regtypein("automerge")
-    }
-}
-
-unsafe impl<'fcx> ArgAbi<'fcx> for AutomergeDatum {
-    unsafe fn unbox_arg_unchecked(arg: Arg<'_, 'fcx>) -> Self {
-        let index = arg.index();
-        unsafe { arg.unbox_arg_using_from_datum() }
-            .unwrap_or_else(|| panic!("argument {index} must not be null"))
     }
 }
 
@@ -83,28 +61,52 @@ unsafe impl SqlTranslatable for AutomergeDatum {
         Ok(ReturnsRef::One(SqlMappingRef::literal("automerge")));
 }
 
-/// An `automerge` argument that is *not* detoasted up front.
+/// An `automerge` argument, flat or expanded, *not* detoasted up front.
 ///
-/// For functions that usually need only the heads, which sit in the first
-/// few hundred bytes of a stored value (see `pg_automerge_core::header`):
-/// [`LazyAutomerge::heads`] fetches just a prefix with
-/// `pg_detoast_datum_slice`, which for an out-of-line value reads only the
-/// TOAST chunks covering it (and for a compressed one decompresses only that
-/// far). The datum is only valid for the current call; this type is only
-/// ever a function argument and never stored.
-pub struct LazyAutomerge(pg_sys::Datum);
+/// - `Flat`: an ordinary varlena datum (inline, compressed or a TOAST
+///   pointer). For functions that usually need only the heads, which sit in
+///   the first few hundred bytes of a stored value (see
+///   `pg_automerge_core::header`), [`AutomergeArg::heads`] fetches just a
+///   prefix with `pg_detoast_datum_slice`, which for an out-of-line value
+///   reads only the TOAST chunks covering it (and for a compressed one
+///   decompresses only that far).
+/// - `Expanded`: a pointer to one of our expanded objects (see "Expanded
+///   values" below), read-write or read-only; the document is used in
+///   place, never flattened to be read.
+///
+/// The datum is only valid for the current call; this type is only ever a
+/// function argument and never stored.
+pub enum AutomergeArg {
+    Flat(pg_sys::Datum),
+    Expanded {
+        datum: pg_sys::Datum,
+        object: *mut ExpandedAutomerge,
+        read_write: bool,
+    },
+}
 
-impl FromDatum for LazyAutomerge {
+impl FromDatum for AutomergeArg {
     unsafe fn from_polymorphic_datum(
         datum: pg_sys::Datum,
         is_null: bool,
         _typoid: pg_sys::Oid,
     ) -> Option<Self> {
-        (!is_null).then_some(Self(datum))
+        if is_null {
+            return None;
+        }
+        // SAFETY: a non-null datum of type automerge (a varlena).
+        Some(match unsafe { expanded_object(datum) } {
+            Some((object, read_write)) => Self::Expanded {
+                datum,
+                object,
+                read_write,
+            },
+            None => Self::Flat(datum),
+        })
     }
 }
 
-unsafe impl<'fcx> ArgAbi<'fcx> for LazyAutomerge {
+unsafe impl<'fcx> ArgAbi<'fcx> for AutomergeArg {
     unsafe fn unbox_arg_unchecked(arg: Arg<'_, 'fcx>) -> Self {
         let index = arg.index();
         unsafe { arg.unbox_arg_using_from_datum() }
@@ -112,8 +114,8 @@ unsafe impl<'fcx> ArgAbi<'fcx> for LazyAutomerge {
     }
 }
 
-unsafe impl SqlTranslatable for LazyAutomerge {
-    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(LazyAutomerge);
+unsafe impl SqlTranslatable for AutomergeArg {
+    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(AutomergeArg);
     const TYPE_ORIGIN: TypeOrigin = TypeOrigin::ThisExtension;
     const ARGUMENT_SQL: Result<SqlMappingRef, ArgumentError> =
         Ok(SqlMappingRef::literal("automerge"));
@@ -121,26 +123,48 @@ unsafe impl SqlTranslatable for LazyAutomerge {
         Ok(ReturnsRef::One(SqlMappingRef::literal("automerge")));
 }
 
-impl LazyAutomerge {
+impl AutomergeArg {
     /// First prefix fetched; covers the heads of documents with dozens of
     /// actors and heads.
     const FIRST_PREFIX: usize = 4096;
 
-    /// Length of the stored bytes (without the varlena header), without
-    /// detoasting.
-    fn len(&self) -> usize {
-        // SAFETY: a non-null varlena datum of this call.
-        let raw = unsafe { pg_sys::toast_raw_datum_size(self.0) };
+    /// The loaded document of an expanded argument.
+    fn loaded(&self) -> Option<&LoadedDoc> {
+        match self {
+            // SAFETY: the object is alive for the duration of the call (its
+            // owner holds it), and nothing mutates it while this shared
+            // reference exists: documents are replaced only through
+            // `replace_in_place`, which callers use after their last read.
+            Self::Expanded { object, .. } => Some(unsafe { expanded_doc(*object) }),
+            Self::Flat(_) => None,
+        }
+    }
+
+    /// Run `f` on this value as a core [`Input`]: the loaded document of an
+    /// expanded value, or the detoasted bytes of a flat one.
+    fn with_input<T>(&self, f: impl FnOnce(Input<'_>) -> T) -> T {
+        match self.loaded() {
+            Some(doc) => f(Input::Loaded(doc)),
+            None => f(Input::Stored(&self.bytes())),
+        }
+    }
+
+    /// Length of the stored bytes of a flat value (without the varlena
+    /// header), without detoasting.
+    fn flat_len(datum: pg_sys::Datum) -> usize {
+        // SAFETY: a non-null, non-expanded varlena datum of this call.
+        let raw = unsafe { pg_sys::toast_raw_datum_size(datum) };
         raw.saturating_sub(pg_sys::VARHDRSZ)
     }
 
-    /// The first `n` stored bytes (fewer if the value is shorter).
-    fn prefix(&self, n: usize) -> Vec<u8> {
+    /// The first `n` stored bytes of a flat value (fewer if it is shorter).
+    fn flat_prefix(datum: pg_sys::Datum, n: usize) -> Vec<u8> {
         let count = i32::try_from(n).unwrap_or(i32::MAX);
-        // SAFETY: a non-null varlena datum of this call. The slice is a
-        // fresh palloc'd, 4-byte-header varlena, copied out and freed.
+        // SAFETY: a non-null, non-expanded varlena datum of this call. The
+        // slice is a fresh palloc'd, 4-byte-header varlena, copied out and
+        // freed.
         unsafe {
-            let datum = self.0.cast_mut_ptr::<pg_sys::varlena>();
+            let datum = datum.cast_mut_ptr::<pg_sys::varlena>();
             let slice = pg_sys::pg_detoast_datum_slice(datum, 0, count);
             let len = pgrx::varlena::varsize_any_exhdr(slice);
             let data = pgrx::varlena::vardata_any(slice).cast::<u8>();
@@ -152,22 +176,33 @@ impl LazyAutomerge {
         }
     }
 
-    /// All stored bytes (detoasted and copied, like [`AutomergeDatum`]).
-    fn bytes(&self) -> Vec<u8> {
-        // SAFETY: a non-null varlena datum of this call.
-        unsafe { Vec::<u8>::from_polymorphic_datum(self.0, false, pg_sys::InvalidOid) }
-            .expect("not null")
+    /// All stored bytes: detoasted and copied for a flat value; for an
+    /// expanded one its stored bytes (saved once and cached in the object).
+    fn bytes(&self) -> Cow<'_, [u8]> {
+        match self {
+            // SAFETY: a non-null varlena datum of this call.
+            Self::Flat(datum) => Cow::Owned(
+                unsafe { Vec::<u8>::from_polymorphic_datum(*datum, false, pg_sys::InvalidOid) }
+                    .expect("not null"),
+            ),
+            Self::Expanded { .. } => {
+                Cow::Borrowed(self.loaded().expect("expanded").stored().or_raise())
+            }
+        }
     }
 
-    /// Run a header parser on as short a prefix as possible (4 kB first,
-    /// then growing to what the parser asks for, at least doubling). `None`
-    /// if the value is not in the shape the parser expects, so the caller
-    /// must load it.
+    /// Run a header parser on as short a prefix of a flat value as possible
+    /// (4 kB first, then growing to what the parser asks for, at least
+    /// doubling). `None` if the value is not in the shape the parser
+    /// expects (or is expanded), so the caller must use the document.
     fn read_prefix<T>(&self, parse: impl Fn(&[u8], usize) -> Prefix<T>) -> Option<T> {
-        let total = self.len();
+        let Self::Flat(datum) = *self else {
+            return None;
+        };
+        let total = Self::flat_len(datum);
         let mut want = total.min(Self::FIRST_PREFIX);
         loop {
-            let prefix = self.prefix(want);
+            let prefix = Self::flat_prefix(datum, want);
             match parse(&prefix, total) {
                 Prefix::Found(value) => return Some(value),
                 Prefix::NeedMore(n) if prefix.len() == want && want < total => {
@@ -178,9 +213,13 @@ impl LazyAutomerge {
         }
     }
 
-    /// The heads, read from as short a prefix as possible; a full load only
-    /// if the value is not a single document chunk.
+    /// The heads: from memory for an expanded value; for a flat one read
+    /// from as short a prefix as possible, with a full load only if the
+    /// value is not a single document chunk.
     fn heads(&self) -> Result<Vec<ChangeHash>, Error> {
+        if let Some(doc) = self.loaded() {
+            return Ok(doc.heads().to_vec());
+        }
         match self.read_prefix(header::heads_from_prefix) {
             Some(heads) => Ok(heads),
             None => am::stored_heads(&self.bytes()),
@@ -191,6 +230,310 @@ impl LazyAutomerge {
     /// head of the value is in `since`. Reads only the heads.
     fn nothing_since(&self, since: &[ChangeHash]) -> bool {
         !since.is_empty() && am::is_subset(&self.heads().or_raise(), since)
+    }
+
+    /// Whether this argument and `other` are the same expanded object
+    /// (through a read-write and a read-only pointer, say).
+    fn same_object(&self, other: &AutomergeArg) -> bool {
+        match (self, other) {
+            (Self::Expanded { object: a, .. }, Self::Expanded { object: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+
+    /// The detoasted bytes of a flat value (`None` for an expanded one), to
+    /// be used through [`AutomergeArg::input`] and
+    /// [`AutomergeArg::into_value`] so that a flat value is detoasted once.
+    fn detoasted(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Flat(_) => Some(self.bytes().into_owned()),
+            Self::Expanded { .. } => None,
+        }
+    }
+
+    /// This value as a core [`Input`], given its [`AutomergeArg::detoasted`]
+    /// bytes.
+    fn input<'a>(&'a self, detoasted: &'a Option<Vec<u8>>) -> Input<'a> {
+        match (detoasted, self.loaded()) {
+            (Some(bytes), _) => Input::Stored(bytes),
+            (None, Some(doc)) => Input::Loaded(doc),
+            (None, None) => raise(Error::Internal(
+                "flat automerge value was not detoasted".into(),
+            )),
+        }
+    }
+
+    /// [`AutomergeArg::unchanged`], reusing the detoasted bytes.
+    fn into_value(self, detoasted: Option<Vec<u8>>) -> AutomergeValue {
+        match detoasted {
+            Some(bytes) => AutomergeValue::Bytes(bytes),
+            None => self.unchanged(),
+        }
+    }
+
+    /// The result for "this argument, unchanged": the datum itself for an
+    /// expanded value (its owner keeps it alive for as long as the result
+    /// can be used, as for any argument passed through), a copy of the
+    /// bytes for a flat one (as before expanded values existed).
+    fn unchanged(&self) -> AutomergeValue {
+        match self {
+            Self::Expanded { datum, .. } => AutomergeValue::Datum(*datum),
+            Self::Flat(_) => AutomergeValue::Bytes(self.bytes().into_owned()),
+        }
+    }
+
+    /// The result for a new document `doc` computed from this argument: in
+    /// place when this is a read-write expanded pointer (the object's
+    /// document is replaced, and its pointer returned), otherwise a new
+    /// expanded object.
+    ///
+    /// Replacing is the only mutation of an expanded object; the new
+    /// document was built completely beforehand (from a clone), so a
+    /// failure never leaves the object half-modified, as PL/pgSQL's
+    /// in-place assignment requires.
+    fn with_result(&self, doc: LoadedDoc) -> AutomergeValue {
+        match self {
+            Self::Expanded {
+                datum,
+                object,
+                read_write: true,
+            } => {
+                // SAFETY: a read-write pointer grants the right to modify the
+                // object; no reference into its old document is alive (the
+                // caller's reads are done).
+                unsafe { replace_in_place(*object, doc) };
+                #[cfg(any(test, feature = "pg_test"))]
+                IN_PLACE_MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                AutomergeValue::Datum(*datum)
+            }
+            _ => AutomergeValue::Datum(new_expanded(doc)),
+        }
+    }
+}
+
+/// A function result of type `automerge`: stored bytes (a new flat
+/// varlena) or a datum that is already an `automerge` value (an argument
+/// passed through, or a pointer to an expanded object).
+pub enum AutomergeValue {
+    Bytes(Vec<u8>),
+    Datum(pg_sys::Datum),
+}
+
+impl IntoDatum for AutomergeValue {
+    fn into_datum(self) -> Option<pg_sys::Datum> {
+        match self {
+            Self::Bytes(bytes) => bytes.into_datum(),
+            Self::Datum(datum) => Some(datum),
+        }
+    }
+
+    fn type_oid() -> pg_sys::Oid {
+        pgrx::regtypein("automerge")
+    }
+}
+
+unsafe impl BoxRet for AutomergeValue {
+    unsafe fn box_into<'fcx>(self, fcinfo: &mut FcInfo<'fcx>) -> Datum<'fcx> {
+        unsafe { fcinfo.return_optional_datum(self.into_datum()) }
+    }
+}
+
+unsafe impl SqlTranslatable for AutomergeValue {
+    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(AutomergeValue);
+    const TYPE_ORIGIN: TypeOrigin = TypeOrigin::ThisExtension;
+    const ARGUMENT_SQL: Result<SqlMappingRef, ArgumentError> =
+        Ok(SqlMappingRef::literal("automerge"));
+    const RETURN_SQL: Result<ReturnsRef, ReturnsError> =
+        Ok(ReturnsRef::One(SqlMappingRef::literal("automerge")));
+}
+
+// ---------------------------------------------------------------------------
+// Expanded values
+// ---------------------------------------------------------------------------
+//
+// An expanded `automerge` value is a loaded document kept in memory between
+// function calls (Postgres' expanded-object protocol, utils/expandeddatum.h),
+// so that `merge(merge(a, b), c)`, `doc := merge(doc, x)` in a PL/pgSQL loop
+// or `merge(..)::jsonb` do not save and re-load the document at every step.
+// See docs/DESIGN.md, "Expanded values".
+//
+// - The object lives in its own memory context, a child of the context the
+//   function was called in; Postgres moves or deletes that context with the
+//   value. The Rust document is owned by the object and dropped by a reset
+//   callback of that context, so it is freed exactly when the object is.
+// - Flattening (storing the value in a tuple, sending it, casting it to
+//   bytea) writes the document's stored bytes: `save_nocompress()`, computed
+//   once and cached in the `LoadedDoc`, and loaded back once first when the
+//   document contains changes from a bytea (the input safeguard). The
+//   document of an object is never modified, only replaced as a whole, so the
+//   cache cannot go stale.
+// - Only a read-write pointer allows replacing the document (in place);
+//   functions given a read-only pointer return a new object.
+
+/// Merges that replaced the document of a read-write argument in place (for
+/// the pg_tests, which check that PL/pgSQL's in-place paths are taken).
+#[cfg(any(test, feature = "pg_test"))]
+static IN_PLACE_MERGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Our expanded object: the standard header, then the document.
+#[repr(C)]
+pub struct ExpandedAutomerge {
+    header: pg_sys::ExpandedObjectHeader,
+    /// Owned (`Box::into_raw`); null once the reset callback dropped it.
+    doc: *mut LoadedDoc,
+    /// Registered on the object's memory context; drops `doc`.
+    callback: pg_sys::MemoryContextCallback,
+}
+
+static EXPANDED_METHODS: pg_sys::ExpandedObjectMethods = pg_sys::ExpandedObjectMethods {
+    get_flat_size: Some(expanded_get_flat_size),
+    flatten_into: Some(expanded_flatten_into),
+};
+
+/// If `datum` points to one of our expanded objects: the object and whether
+/// the pointer is read-write.
+///
+/// # Safety
+///
+/// `datum` must be a non-null varlena datum.
+unsafe fn expanded_object(datum: pg_sys::Datum) -> Option<(*mut ExpandedAutomerge, bool)> {
+    let ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
+    // SAFETY: a varlena; an external (1-byte 0x01 header) one has its tag
+    // in the second byte (varattrib_1b_e).
+    unsafe {
+        if !pgrx::varlena::varatt_is_1b_e(ptr) {
+            return None;
+        }
+        let tag = u32::from(*ptr.cast::<u8>().add(1));
+        let read_write = match tag {
+            pg_sys::vartag_external::VARTAG_EXPANDED_RW => true,
+            pg_sys::vartag_external::VARTAG_EXPANDED_RO => false,
+            _ => return None,
+        };
+        let header = pg_sys::DatumGetEOHP(datum);
+        // Only this extension creates expanded automerge values; anything
+        // else would be flattened through its own methods by a detoast.
+        if !std::ptr::eq((*header).eoh_methods, &EXPANDED_METHODS) {
+            return None;
+        }
+        Some((header.cast::<ExpandedAutomerge>(), read_write))
+    }
+}
+
+/// The document of a live expanded object.
+///
+/// # Safety
+///
+/// `object` must be a live object created by [`new_expanded`], and no
+/// document replacement may happen while the returned reference is used.
+unsafe fn expanded_doc<'a>(object: *mut ExpandedAutomerge) -> &'a LoadedDoc {
+    // SAFETY: per the contract.
+    let doc = unsafe { (*object).doc };
+    if doc.is_null() {
+        raise(Error::Internal(
+            "expanded automerge value used after it was freed".into(),
+        ));
+    }
+    // SAFETY: non-null, owned by the object.
+    unsafe { &*doc }
+}
+
+/// Replace the document of an expanded object (the old one is dropped).
+///
+/// # Safety
+///
+/// `object` must be live, reached through a read-write pointer, and no
+/// reference into its current document may be alive.
+unsafe fn replace_in_place(object: *mut ExpandedAutomerge, doc: LoadedDoc) {
+    // SAFETY: per the contract.
+    unsafe {
+        let old = (*object).doc;
+        if old.is_null() {
+            raise(Error::Internal(
+                "expanded automerge value used after it was freed".into(),
+            ));
+        }
+        // Assigning drops the old document; the cached stored bytes go
+        // with it.
+        *old = doc;
+    }
+}
+
+/// A new expanded object holding `doc`, in a memory context that is a child
+/// of the current one; returns its read-write pointer (as functions must
+/// for new expanded objects).
+fn new_expanded(doc: LoadedDoc) -> pg_sys::Datum {
+    // SAFETY: standard expanded-object setup (see array's
+    // expand_array()). Allocation errors before the document is moved into
+    // the object unwind normally and drop `doc`; after that, nothing can
+    // fail before the callback that frees it is registered.
+    unsafe {
+        let context = pg_sys::AllocSetContextCreateInternal(
+            pg_sys::CurrentMemoryContext,
+            c"automerge expanded document".as_ptr(),
+            pg_sys::ALLOCSET_SMALL_MINSIZE as usize,
+            pg_sys::ALLOCSET_SMALL_INITSIZE as usize,
+            pg_sys::ALLOCSET_SMALL_MAXSIZE as usize,
+        );
+        let object = pg_sys::MemoryContextAllocZero(context, size_of::<ExpandedAutomerge>())
+            .cast::<ExpandedAutomerge>();
+        pg_sys::EOH_init_header(&raw mut (*object).header, &EXPANDED_METHODS, context);
+        (*object).doc = Box::into_raw(Box::new(doc));
+        (*object).callback.func = Some(expanded_drop_doc);
+        (*object).callback.arg = object.cast();
+        pg_sys::MemoryContextRegisterResetCallback(context, &raw mut (*object).callback);
+        pg_sys::Datum::from((*object).header.eoh_rw_ptr.as_mut_ptr())
+    }
+}
+
+/// Reset callback of an object's memory context: drop the document.
+#[pg_guard]
+unsafe extern "C-unwind" fn expanded_drop_doc(arg: *mut std::ffi::c_void) {
+    let object = arg.cast::<ExpandedAutomerge>();
+    // SAFETY: registered by new_expanded with the object as argument; runs
+    // once, before the context's memory is freed.
+    unsafe {
+        let doc = std::mem::replace(&mut (*object).doc, std::ptr::null_mut());
+        if !doc.is_null() {
+            drop(Box::from_raw(doc));
+        }
+    }
+}
+
+/// `get_flat_size` method: computes (and caches) the stored bytes. This is
+/// where a document with changes from a bytea gets its save-and-load check,
+/// so a value that would not load back is an ERROR here and never stored.
+#[pg_guard]
+unsafe extern "C-unwind" fn expanded_get_flat_size(
+    header: *mut pg_sys::ExpandedObjectHeader,
+) -> usize {
+    // SAFETY: Postgres calls the method with one of our objects.
+    let doc = unsafe { expanded_doc(header.cast()) };
+    doc.stored().or_raise().len() + pg_sys::VARHDRSZ
+}
+
+/// `flatten_into` method: the cached stored bytes as a 4-byte-header
+/// varlena, in the space sized by the preceding `get_flat_size` call.
+#[pg_guard]
+unsafe extern "C-unwind" fn expanded_flatten_into(
+    header: *mut pg_sys::ExpandedObjectHeader,
+    result: *mut std::ffi::c_void,
+    allocated_size: usize,
+) {
+    // SAFETY: Postgres calls the method with one of our objects and
+    // `allocated_size` bytes at `result`.
+    unsafe {
+        let doc = expanded_doc(header.cast());
+        let bytes = doc.stored().or_raise();
+        let size = bytes.len() + pg_sys::VARHDRSZ;
+        if size != allocated_size {
+            raise(Error::Internal(format!(
+                "expanded automerge value: flat size changed from {allocated_size} to {size}"
+            )));
+        }
+        let out = result.cast::<u8>();
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(pg_sys::VARHDRSZ), bytes.len());
+        pgrx::varlena::set_varsize_4b(result.cast(), size as i32);
     }
 }
 
@@ -235,8 +578,8 @@ fn automerge_in(input: &CStr) -> AutomergeDatum {
 }
 
 #[pg_extern(sql = false)]
-fn automerge_out(doc: AutomergeDatum) -> CString {
-    CString::new(am::encoding::to_hex_literal(doc.bytes())).expect("hex output never contains NUL")
+fn automerge_out(doc: AutomergeArg) -> CString {
+    CString::new(am::encoding::to_hex_literal(&doc.bytes())).expect("hex output never contains NUL")
 }
 
 #[pg_extern(sql = false)]
@@ -259,8 +602,8 @@ fn automerge_recv(buf: Internal) -> AutomergeDatum {
 }
 
 #[pg_extern(sql = false)]
-fn automerge_send(doc: AutomergeDatum) -> Vec<u8> {
-    doc.0
+fn automerge_send(doc: AutomergeArg) -> Vec<u8> {
+    doc.bytes().into_owned()
 }
 
 extension_sql!(
@@ -290,7 +633,11 @@ COMMENT ON TYPE automerge IS
     'An Automerge CRDT document (uncompressed save format). Implicitly castable to jsonb.';
 "#,
     name = "automerge_type",
-    creates = [Type(AutomergeDatum), Type(LazyAutomerge)],
+    creates = [
+        Type(AutomergeDatum),
+        Type(AutomergeArg),
+        Type(AutomergeValue)
+    ],
 );
 
 // ---------------------------------------------------------------------------
@@ -305,8 +652,11 @@ fn automerge_from_bytea(bytes: &[u8]) -> AutomergeDatum {
 
 /// The current state of the document as jsonb (see the mapping in DESIGN.md).
 #[pg_extern(immutable, strict, parallel_safe)]
-fn automerge_to_jsonb(doc: AutomergeDatum) -> JsonB {
-    JsonB(am::to_json(doc.bytes()).or_raise())
+fn automerge_to_jsonb(doc: AutomergeArg) -> JsonB {
+    JsonB(
+        doc.with_input(|input| loaded::with_doc(input, am::json::doc_to_json))
+            .or_raise(),
+    )
 }
 
 extension_sql!(
@@ -327,13 +677,23 @@ CREATE CAST (automerge AS jsonb) WITH FUNCTION automerge_to_jsonb(automerge) AS 
 // ---------------------------------------------------------------------------
 
 /// CRDT merge: `a` plus every change of `b` it lacks. Returns an input
-/// unchanged when it already contains the other.
-#[pg_extern(immutable, strict, parallel_safe)]
-fn merge(a: AutomergeDatum, b: AutomergeDatum) -> AutomergeDatum {
-    match am::merge(a.bytes(), b.bytes()).or_raise() {
-        am::Merged::Left => a,
-        am::Merged::Right => b,
-        am::Merged::New(bytes) => AutomergeDatum(bytes),
+/// unchanged when it already contains the other; otherwise a new document
+/// as an expanded value (see "Expanded values"), built in place when `a` is
+/// a read-write expanded pointer.
+#[pg_extern(immutable, strict, parallel_safe, support = automerge_merge_support)]
+fn merge(a: AutomergeArg, b: AutomergeArg) -> AutomergeValue {
+    // The same object twice (`doc := merge(doc, doc)`): nothing to do, and
+    // no document is borrowed while it could be replaced.
+    if a.same_object(&b) {
+        return a.unchanged();
+    }
+    let a_bytes = a.detoasted();
+    let b_bytes = b.detoasted();
+    let outcome = loaded::merge(a.input(&a_bytes), b.input(&b_bytes)).or_raise();
+    match outcome {
+        MergeOutcome::Left => a.into_value(a_bytes),
+        MergeOutcome::Right => b.into_value(b_bytes),
+        MergeOutcome::New(doc) => a.with_result(*doc),
     }
 }
 
@@ -341,11 +701,67 @@ fn merge(a: AutomergeDatum, b: AutomergeDatum) -> AutomergeDatum {
 /// (`save_incremental()` / `save_after()` output, possibly concatenated) on
 /// top of the stored document. Returns `a` unchanged when nothing is new.
 /// Changes with missing dependencies are rejected (22P02), naming them.
-#[pg_extern(immutable, strict, parallel_safe, name = "merge")]
-fn merge_bytea(a: AutomergeDatum, changes: &[u8]) -> AutomergeDatum {
-    match am::merge_changes(a.bytes(), changes).or_raise() {
-        None => a,
-        Some(bytes) => AutomergeDatum(bytes),
+#[pg_extern(immutable, strict, parallel_safe, name = "merge", support = automerge_merge_support)]
+fn merge_bytea(a: AutomergeArg, changes: &[u8]) -> AutomergeValue {
+    let a_bytes = a.detoasted();
+    let result = loaded::merge_changes(a.input(&a_bytes), changes).or_raise();
+    match result {
+        None => a.into_value(a_bytes),
+        Some(doc) => a.with_result(doc),
+    }
+}
+
+/// Planner support function of both `merge`s: answers PL/pgSQL's
+/// `SupportRequestModifyInPlace` for `x := merge(x, ...)` (also written
+/// `x := x || ...`) by naming the first argument, so a variable holding an
+/// expanded document is passed read-write and merged into in place.
+///
+/// The two conditions of that request (nodes/supportnodes.h) hold: `merge`
+/// never modifies its first argument on failure (the new document is built
+/// completely before it replaces the old one), and other references to `x`
+/// in the arguments are safe (they arrive read-only and are read before
+/// the replacement; `merge(x, x)` returns `x` untouched).
+#[pg_extern(immutable, strict, parallel_safe)]
+fn automerge_merge_support(request: Internal) -> Internal {
+    let node = request
+        .unwrap()
+        .map_or(std::ptr::null_mut(), |d| d.cast_mut_ptr::<pg_sys::Node>());
+    // SAFETY: the planner passes a valid support request node.
+    let param = unsafe { modify_in_place_param(node) };
+    // A non-NULL datum holding the pointer (NULL pointer: no), since fmgr
+    // rejects a NULL result from a support function.
+    Internal::from(Some(pg_sys::Datum::from(param)))
+}
+
+/// For a `SupportRequestModifyInPlace`: the first argument when it is the
+/// assignment target's Param, otherwise null (also for other requests).
+///
+/// # Safety
+///
+/// `node` must be null or a valid support request node.
+unsafe fn modify_in_place_param(node: *mut pg_sys::Node) -> *mut pg_sys::Node {
+    // SAFETY: per the contract; the request's args is a List of Nodes.
+    unsafe {
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_SupportRequestModifyInPlace {
+            return std::ptr::null_mut();
+        }
+        let request = node.cast::<pg_sys::SupportRequestModifyInPlace>();
+        let args = (*request).args;
+        if args.is_null() || (*args).length < 1 {
+            return std::ptr::null_mut();
+        }
+        let first = (*(*args).elements).ptr_value.cast::<pg_sys::Node>();
+        if first.is_null() || (*first).type_ != pg_sys::NodeTag::T_Param {
+            return std::ptr::null_mut();
+        }
+        let param = first.cast::<pg_sys::Param>();
+        if (*param).paramkind == pg_sys::ParamKind::PARAM_EXTERN
+            && (*param).paramid == (*request).paramid
+        {
+            first
+        } else {
+            std::ptr::null_mut()
+        }
     }
 }
 
@@ -373,7 +789,7 @@ CREATE OPERATOR || (
 #[pg_extern(immutable, parallel_safe)]
 fn merge_agg_trans(
     mut state: Internal,
-    value: Option<AutomergeDatum>,
+    value: Option<AutomergeArg>,
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> Internal {
     let Some(value) = value else { return state };
@@ -400,18 +816,21 @@ fn merge_agg_trans(
             unsafe { state.get_mut::<MergeAccumulator>() }.expect("just initialized")
         }
     };
-    acc.add(value.bytes()).or_raise();
+    value.with_input(|input| acc.add_input(input)).or_raise();
     state
 }
 
 /// Final function of `merge_agg`; NULL if every input was NULL.
 #[pg_extern(immutable, parallel_safe)]
-fn merge_agg_final(state: Internal) -> Option<AutomergeDatum> {
+fn merge_agg_final(state: Internal) -> Option<AutomergeValue> {
     // SAFETY: the state is only ever created by merge_agg_trans.
     let acc = unsafe { state.get::<MergeAccumulator>() }?;
-    acc.finish()
-        .or_raise()
-        .map(|bytes| AutomergeDatum(bytes.into_owned()))
+    Some(match acc.finish_loaded().or_raise()? {
+        am::Accumulated::Stored(bytes) => AutomergeValue::Bytes(bytes.to_vec()),
+        // A copy of the state as an expanded value: saved only if it is
+        // stored or sent, and `merge_agg(doc)::jsonb` needs no re-load.
+        am::Accumulated::Loaded(doc) => AutomergeValue::Datum(new_expanded(*doc)),
+    })
 }
 
 extension_sql!(
@@ -440,7 +859,7 @@ CREATE AGGREGATE merge_agg(automerge) (
 /// Current heads as sorted lowercase hex change hashes. Read from the
 /// start of the stored value; the document is not loaded.
 #[pg_extern(immutable, strict, parallel_safe)]
-fn automerge_heads(doc: LazyAutomerge) -> Vec<String> {
+fn automerge_heads(doc: AutomergeArg) -> Vec<String> {
     am::heads_to_strings(doc.heads().or_raise())
 }
 
@@ -449,12 +868,17 @@ fn automerge_heads(doc: LazyAutomerge) -> Vec<String> {
 /// Decided from the two values' heads when possible (no load, and only a
 /// prefix of each is detoasted); otherwise `a` is loaded, `b` never is.
 #[pg_extern(immutable, strict, parallel_safe)]
-fn automerge_contains(a: LazyAutomerge, b: LazyAutomerge) -> bool {
+fn automerge_contains(a: AutomergeArg, b: AutomergeArg) -> bool {
+    if a.same_object(&b) {
+        return true;
+    }
     let heads_b = b.heads().or_raise();
     let heads_a = a.heads().or_raise();
     match am::contains_by_heads(&heads_a, &heads_b) {
         Some(answer) => answer,
-        None => am::contains_loaded(&a.bytes(), &heads_b).or_raise(),
+        None => a
+            .with_input(|input| loaded::contains_heads(input, &heads_b))
+            .or_raise(),
     }
 }
 
@@ -464,16 +888,19 @@ fn automerge_contains(a: LazyAutomerge, b: LazyAutomerge) -> bool {
 ///
 /// Decided from `doc`'s heads and the chunks' hashes and dependencies when
 /// `changes` is bare change chunks that re-send the current heads or build
-/// on them (no load); otherwise `doc ++ changes` is loaded once (no save).
+/// on them (no load); otherwise `doc ++ changes` is loaded once (no save),
+/// or for an expanded `doc` each chunk's hash is looked up.
 /// Changes with dependencies in neither input are not contained (false).
 #[pg_extern(immutable, strict, parallel_safe, name = "automerge_contains")]
-fn automerge_contains_changes(a: LazyAutomerge, changes: &[u8]) -> bool {
+fn automerge_contains_changes(a: AutomergeArg, changes: &[u8]) -> bool {
     if changes.is_empty() {
         return true;
     }
     match am::contains_changes_by_heads(&a.heads().or_raise(), changes) {
         Some(answer) => answer,
-        None => am::contains_changes(&a.bytes(), changes).or_raise(),
+        None => a
+            .with_input(|input| loaded::contains_changes(input, changes))
+            .or_raise(),
     }
 }
 
@@ -592,7 +1019,12 @@ fn same_raw_datum(a: Option<pg_sys::Datum>, b: Option<pg_sys::Datum>, att: &Attr
 /// Sorted hex heads of an `automerge` column value (`None` for NULL), read
 /// from a prefix of the stored value; never a full load of a stored value.
 fn column_heads(datum: Option<pg_sys::Datum>) -> am::notify::Heads {
-    datum.map(|d| am::heads_to_strings(LazyAutomerge(d).heads().or_raise()))
+    datum.map(|d| {
+        // SAFETY: a non-null automerge datum of the row being processed.
+        let arg = unsafe { AutomergeArg::from_polymorphic_datum(d, false, pg_sys::InvalidOid) }
+            .expect("not null");
+        am::heads_to_strings(arg.heads().or_raise())
+    })
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -1052,7 +1484,7 @@ fn change_tuple(
 /// `automerge_changes_meta` when only metadata is needed.
 #[pg_extern(immutable, strict, parallel_safe, requires = ["automerge_change_types"])]
 fn automerge_changes(
-    doc: LazyAutomerge,
+    doc: AutomergeArg,
     since_heads: default!(Vec<Option<String>>, "'{}'"),
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> SetOfIterator<'static, pgrx::composite_type!('static, "automerge_change")> {
@@ -1060,7 +1492,8 @@ fn automerge_changes(
     let rows = if doc.nothing_since(&since) {
         Vec::new()
     } else {
-        am::history::changes(&doc.bytes(), &since).or_raise()
+        doc.with_input(|input| loaded::with_doc(input, |d| am::history::changes_doc(d, &since)))
+            .or_raise()
     };
     let typoid = result_type(fcinfo);
     SetOfIterator::new(rows.into_iter().map(move |row| change_tuple(typoid, row)))
@@ -1070,7 +1503,7 @@ fn automerge_changes(
 /// change graph of the loaded document, no change is rebuilt.
 #[pg_extern(immutable, strict, parallel_safe, requires = ["automerge_change_types"])]
 fn automerge_changes_meta(
-    doc: LazyAutomerge,
+    doc: AutomergeArg,
     since_heads: default!(Vec<Option<String>>, "'{}'"),
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> SetOfIterator<'static, pgrx::composite_type!('static, "automerge_change_meta")> {
@@ -1078,7 +1511,10 @@ fn automerge_changes_meta(
     let rows = if doc.nothing_since(&since) {
         Vec::new()
     } else {
-        am::history::changes_meta(&doc.bytes(), &since).or_raise()
+        doc.with_input(|input| {
+            loaded::with_doc(input, |d| am::history::changes_meta_doc(d, &since))
+        })
+        .or_raise()
     };
     let typoid = result_type(fcinfo);
     SetOfIterator::new(rows.into_iter().map(move |row| change_tuple(typoid, row)))
@@ -1090,26 +1526,29 @@ fn automerge_changes_meta(
 /// `merge(automerge, bytea)`. Empty when there is nothing new.
 #[pg_extern(immutable, strict, parallel_safe)]
 fn automerge_changes_bytes(
-    doc: LazyAutomerge,
+    doc: AutomergeArg,
     since_heads: default!(Vec<Option<String>>, "'{}'"),
 ) -> Vec<u8> {
     let since = hashes_arg("since_heads", &since_heads);
     if doc.nothing_since(&since) {
         return Vec::new();
     }
-    am::history::changes_bytes(&doc.bytes(), &since).or_raise()
+    doc.with_input(|input| loaded::with_doc(input, |d| am::history::changes_bytes_doc(d, &since)))
+        .or_raise()
 }
 
 /// The change with hash `hash` (64 hex digits, either case), with its
 /// bytes; NULL if `doc` does not have it.
 #[pg_extern(immutable, strict, parallel_safe, requires = ["automerge_change_types"])]
 fn automerge_get_change(
-    doc: AutomergeDatum,
+    doc: AutomergeArg,
     hash: &str,
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> Option<pgrx::composite_type!('static, "automerge_change")> {
     let hash = am::history::parse_hash(hash).or_raise();
-    let row = am::history::change(doc.bytes(), &hash).or_raise()?;
+    let row = doc
+        .with_input(|input| loaded::with_doc(input, |d| am::history::change_doc(d, &hash)))
+        .or_raise()?;
     Some(change_tuple(result_type(fcinfo), row))
 }
 
@@ -1117,10 +1556,12 @@ fn automerge_get_change(
 /// change actor column (a prefix of the value) when possible, otherwise from
 /// the change graph of the loaded document.
 #[pg_extern(immutable, strict, parallel_safe)]
-fn automerge_change_count(doc: LazyAutomerge) -> i64 {
+fn automerge_change_count(doc: AutomergeArg) -> i64 {
     let n = match doc.read_prefix(header::change_count_from_prefix) {
         Some(n) => n,
-        None => am::history::change_count_loaded(&doc.bytes()).or_raise(),
+        None => doc
+            .with_input(|input| loaded::with_doc(input, |d| Ok(am::history::change_count_doc(d))))
+            .or_raise(),
     };
     to_i64(n)
 }
@@ -1128,14 +1569,18 @@ fn automerge_change_count(doc: LazyAutomerge) -> i64 {
 /// The document's state as of `heads` as jsonb. Every head must be a change
 /// of the document (22023 otherwise); `'{}'` is the state before any change.
 #[pg_extern(immutable, strict, parallel_safe, name = "automerge_to_jsonb")]
-fn automerge_to_jsonb_at(doc: AutomergeDatum, heads: Vec<Option<String>>) -> JsonB {
+fn automerge_to_jsonb_at(doc: AutomergeArg, heads: Vec<Option<String>>) -> JsonB {
     let heads = hashes_arg("heads", &heads);
-    JsonB(am::history::to_json_at(doc.bytes(), &heads).or_raise())
+    JsonB(
+        doc.with_input(|input| loaded::with_doc(input, |d| am::history::to_json_at_doc(d, &heads)))
+            .or_raise(),
+    )
 }
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
+    use pg_automerge_core as am;
     use pg_automerge_core::automerge::transaction::Transactable;
     use pg_automerge_core::automerge::{ActorId, AutoCommit, ObjType, ROOT};
     use pgrx::prelude::*;
@@ -3221,6 +3666,528 @@ mod tests {
             err.starts_with("0A000: automerge_notify() can only be called as a trigger"),
             "{err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Expanded values
+    // -----------------------------------------------------------------------
+
+    /// A chain of `n` small change sets on top of `doc`: the base's stored
+    /// bytes, the change sets (bare change chunks), and the stored bytes
+    /// after each step as the flat path computes them (`expected[0]` is the
+    /// base). Loaded into temp tables `ex_base(doc)` and
+    /// `ex(k, c, expected)`.
+    fn expanded_fixture(mut doc: AutoCommit, n: usize) -> (Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        doc.commit();
+        let base = am::normalize(&doc.save()).unwrap();
+        let mut writer = doc.fork().with_actor(actor(9));
+        let mut changes = Vec::new();
+        let mut expected = vec![base.clone()];
+        for k in 1..=n {
+            let heads = writer.get_heads();
+            writer.put(ROOT, "step", k as i64).unwrap();
+            writer.put(ROOT, format!("k{k}"), k as i64).unwrap();
+            writer.commit();
+            let c = writer.save_after(&heads);
+            let next = am::merge_changes(expected.last().unwrap(), &c)
+                .unwrap()
+                .unwrap();
+            changes.push(c);
+            expected.push(next);
+        }
+        Spi::run("CREATE TEMP TABLE ex_base (doc automerge NOT NULL)").unwrap();
+        Spi::run_with_args(
+            "INSERT INTO ex_base VALUES ($1::automerge)",
+            &[base.clone().into()],
+        )
+        .unwrap();
+        Spi::run("CREATE TEMP TABLE ex (k int PRIMARY KEY, c bytea, expected bytea)").unwrap();
+        for k in 1..=n {
+            Spi::run_with_args(
+                "INSERT INTO ex VALUES ($1, $2, $3)",
+                &[
+                    (k as i32).into(),
+                    changes[k - 1].clone().into(),
+                    expected[k].clone().into(),
+                ],
+            )
+            .unwrap();
+        }
+        (base, changes, expected)
+    }
+
+    fn in_place_merges() -> usize {
+        super::IN_PLACE_MERGES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn expanded_contexts() -> i64 {
+        one(
+            "SELECT count(*) FROM pg_backend_memory_contexts \
+             WHERE name = 'automerge expanded document'",
+            &[],
+        )
+    }
+
+    #[pg_test]
+    fn expanded_plpgsql_loops_merge_in_place_and_store_flat_bytes() {
+        let (_, _, expected) = expanded_fixture(sample(), 20);
+        // A local variable, referenced once: PL/pgSQL hands the R/W pointer
+        // over by itself ("transfer"). The same through the operator.
+        Spi::run(
+            "CREATE FUNCTION pg_temp.fold(n int) RETURNS automerge LANGUAGE plpgsql AS $$
+             DECLARE d automerge; ch bytea;
+             BEGIN
+                 SELECT doc INTO d FROM ex_base;
+                 FOR ch IN SELECT c FROM ex WHERE k <= n ORDER BY k LOOP
+                     d := merge(d, ch);
+                 END LOOP;
+                 RETURN d;
+             END $$;
+             CREATE FUNCTION pg_temp.fold_op(n int) RETURNS automerge LANGUAGE plpgsql AS $$
+             DECLARE d automerge; ch bytea;
+             BEGIN
+                 SELECT doc INTO d FROM ex_base;
+                 FOR ch IN SELECT c FROM ex WHERE k <= n ORDER BY k LOOP
+                     d := d || ch;
+                 END LOOP;
+                 RETURN d;
+             END $$;
+             -- Each merge in a block with an EXCEPTION clause: the variable
+             -- is not local to that block, so only merge's support function
+             -- lets PL/pgSQL pass it read-write (\"in place\").
+             CREATE FUNCTION pg_temp.fold_guarded(n int) RETURNS automerge LANGUAGE plpgsql AS $$
+             DECLARE d automerge; ch bytea;
+             BEGIN
+                 SELECT doc INTO d FROM ex_base;
+                 FOR ch IN SELECT c FROM ex WHERE k <= n ORDER BY k LOOP
+                     BEGIN
+                         d := merge(d, ch);
+                     EXCEPTION WHEN invalid_text_representation THEN
+                         RAISE;
+                     END;
+                 END LOOP;
+                 RETURN d;
+             END $$;",
+        )
+        .unwrap();
+        for f in ["fold", "fold_op", "fold_guarded"] {
+            for n in [1usize, 2, 20] {
+                let before = in_place_merges();
+                let bytes: Vec<u8> = one(&format!("SELECT pg_temp.{f}({n})::bytea"), &[]);
+                assert_eq!(bytes, expected[n], "{f}({n})");
+                // The first merge reads the flat value and returns a new
+                // object; every later one replaces the document in place.
+                assert_eq!(in_place_merges() - before, n - 1, "{f}({n})");
+            }
+        }
+        // Stored into a table, sent as text, read as jsonb: all the flat
+        // path's bytes and state.
+        Spi::run("CREATE TEMP TABLE ex_out AS SELECT pg_temp.fold(20) AS doc").unwrap();
+        let same: bool = one(
+            "SELECT doc::bytea = (SELECT expected FROM ex WHERE k = 20) \
+                AND pg_temp.fold(20)::text = doc::text \
+                AND pg_temp.fold(20)::jsonb = doc::jsonb \
+                AND pg_temp.fold(20)::jsonb->>'step' = '20' FROM ex_out",
+            &[],
+        );
+        assert!(same);
+    }
+
+    #[pg_test]
+    fn expanded_read_only_references_are_never_modified() {
+        let (_, _, expected) = expanded_fixture(sample(), 4);
+        Spi::run(
+            "CREATE FUNCTION pg_temp.check(e bytea[]) RETURNS boolean LANGUAGE plpgsql AS $$
+             DECLARE base automerge; d automerge; x automerge; y automerge; z automerge;
+                     c1 bytea; c2 bytea; c3 bytea; c4 bytea;
+             BEGIN
+                 SELECT doc INTO base FROM ex_base;
+                 SELECT c INTO c1 FROM ex WHERE k = 1;
+                 SELECT c INTO c2 FROM ex WHERE k = 2;
+                 SELECT c INTO c3 FROM ex WHERE k = 3;
+                 SELECT c INTO c4 FROM ex WHERE k = 4;
+                 d := merge(base, c1);            -- a new expanded object
+                 ASSERT base::bytea = e[1], 'base was modified';
+                 x := d;                          -- a copy, not an alias
+                 d := merge(d, c2);               -- in place
+                 ASSERT x::bytea = e[2], 'alias x changed with d';
+                 ASSERT d::bytea = e[3], 'd after c2';
+                 -- d passed read-only (the target is another variable),
+                 -- twice: d stays as it is, both results are new objects.
+                 y := merge(d, c3);
+                 z := merge(d, c3);
+                 ASSERT d::bytea = e[3], 'd modified through a read-only reference';
+                 ASSERT y::bytea = e[4] AND z::bytea = e[4], 'y, z';
+                 ASSERT automerge_heads(y) = automerge_heads(z), 'heads y, z';
+                 -- The same object as both arguments, and as its own bytes.
+                 d := merge(d, d);
+                 ASSERT d::bytea = e[3], 'merge(d, d)';
+                 d := merge(d, d::bytea);
+                 ASSERT d::bytea = e[3], 'merge(d, d::bytea)';
+                 d := d || d;
+                 ASSERT d::bytea = e[3], 'd || d';
+                 -- A merge of d into another variable's expression.
+                 y := merge(merge(d, c3), c4);
+                 ASSERT d::bytea = e[3] AND y::bytea = e[5], 'nested';
+                 -- Reads of an expanded variable.
+                 ASSERT d->>'step' = '2', 'jsonb read';
+                 ASSERT automerge_contains(y, d) AND NOT automerge_contains(d, y), 'contains';
+                 ASSERT automerge_contains(d, c2) AND NOT automerge_contains(d, c3), 'contains bytea';
+                 ASSERT automerge_change_count(d) = automerge_change_count(d::bytea::automerge), 'count';
+                 RETURN true;
+             END $$;",
+        )
+        .unwrap();
+        let ok: bool = one("SELECT pg_temp.check($1)", &[expected.clone().into()]);
+        assert!(ok);
+    }
+
+    #[pg_test]
+    fn expanded_failed_merge_leaves_the_variable_unchanged() {
+        let (_, changes, expected) = expanded_fixture(sample(), 3);
+        let mut orphan_source = sample().fork().with_actor(actor(9));
+        orphan_source.put(ROOT, "a", 1i64).unwrap();
+        orphan_source.commit();
+        let mid = orphan_source.get_heads();
+        orphan_source.put(ROOT, "b", 2i64).unwrap();
+        orphan_source.commit();
+        let orphan = orphan_source.save_after(&mid);
+        // Actor 9's first change again, with other content: duplicate seq.
+        let mut dup = sample().fork().with_actor(actor(9));
+        dup.put(ROOT, "other", true).unwrap();
+        dup.commit();
+        let duplicate = dup.save_after(&sample().get_heads());
+        let mut flipped = changes[2].clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x55;
+        Spi::run(
+            "CREATE FUNCTION pg_temp.try_bad(bad bytea[], e bytea[]) RETURNS int LANGUAGE plpgsql AS $$
+             DECLARE d automerge; failed int := 0; b bytea; c1 bytea; c2 bytea; c3 bytea;
+             BEGIN
+                 SELECT c INTO c1 FROM ex WHERE k = 1;
+                 SELECT c INTO c2 FROM ex WHERE k = 2;
+                 SELECT c INTO c3 FROM ex WHERE k = 3;
+                 SELECT doc INTO d FROM ex_base;
+                 d := merge(d, c1);  -- a new expanded object
+                 d := merge(d, c2);  -- in place
+                 d := merge(d, c2);  -- nothing new
+                 FOREACH b IN ARRAY bad LOOP
+                     BEGIN
+                         d := merge(d, b);
+                     EXCEPTION WHEN invalid_text_representation THEN
+                         failed := failed + 1;
+                     END;
+                     ASSERT d::bytea = e[3], 'd changed by a failed merge';
+                     ASSERT automerge_heads(d) = automerge_heads(e[3]::automerge), 'heads';
+                 END LOOP;
+                 d := merge(d, c3);  -- in place
+                 ASSERT d::bytea = e[4], 'good merge after failures';
+                 RETURN failed;
+             END $$;",
+        )
+        .unwrap();
+        let before = in_place_merges();
+        let failed: i32 = one(
+            "SELECT pg_temp.try_bad($1, $2)",
+            &[
+                vec![
+                    orphan,
+                    duplicate,
+                    b"garbage".to_vec(),
+                    flipped,
+                    changes[2][..10].to_vec(),
+                ]
+                .into(),
+                expected.clone().into(),
+            ],
+        );
+        assert_eq!(failed, 5);
+        // The failed merges were handed the variable read-write (the
+        // support function's in-place path) and replaced nothing.
+        assert_eq!(in_place_merges() - before, 2);
+    }
+
+    #[pg_test]
+    fn expanded_values_are_flattened_fresh_after_every_merge() {
+        // The stale-flatten regression: store, merge in place, store again.
+        let (_, _, expected) = expanded_fixture(sample(), 3);
+        Spi::run(
+            "CREATE TEMP TABLE ex_store (id int PRIMARY KEY, doc automerge);
+             CREATE FUNCTION pg_temp.store_steps() RETURNS void LANGUAGE plpgsql AS $$
+             DECLARE d automerge; copy automerge; c1 bytea; c2 bytea; c3 bytea;
+             BEGIN
+                 SELECT c INTO c1 FROM ex WHERE k = 1;
+                 SELECT c INTO c2 FROM ex WHERE k = 2;
+                 SELECT c INTO c3 FROM ex WHERE k = 3;
+                 SELECT doc INTO d FROM ex_base;
+                 d := merge(d, c1);
+                 INSERT INTO ex_store VALUES (1, d);  -- flattens d
+                 copy := d;                           -- a flat copy
+                 d := merge(d, c2);                   -- in place
+                 INSERT INTO ex_store VALUES (2, d);
+                 d := merge(d, c3);
+                 UPDATE ex_store SET doc = d WHERE id = 1;
+                 INSERT INTO ex_store VALUES (3, copy);
+             END $$;",
+        )
+        .unwrap();
+        Spi::run("SELECT pg_temp.store_steps()").unwrap();
+        for (id, step) in [(1, 3usize), (2, 2), (3, 1)] {
+            let bytes: Vec<u8> = one(
+                "SELECT doc::bytea FROM ex_store WHERE id = $1",
+                &[id.into()],
+            );
+            assert_eq!(bytes, expected[step], "row {id}");
+        }
+    }
+
+    #[pg_test]
+    fn expanded_values_in_toasted_columns() {
+        // Big enough to be compressed and stored out of line.
+        let mut doc = AutoCommit::new().with_actor(actor(1));
+        let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
+        doc.splice_text(&text, 0, 0, &"lorem ipsum dolor ".repeat(20_000))
+            .unwrap();
+        let (base, _, expected) = expanded_fixture(doc, 3);
+        Spi::run(
+            "CREATE TEMP TABLE ex_big (id int PRIMARY KEY, doc automerge);
+             INSERT INTO ex_big SELECT 1, doc FROM ex_base;
+             CREATE FUNCTION pg_temp.big() RETURNS void LANGUAGE plpgsql AS $$
+             DECLARE d automerge; ch bytea;
+             BEGIN
+                 SELECT doc INTO d FROM ex_big WHERE id = 1;
+                 FOR ch IN SELECT c FROM ex ORDER BY k LOOP
+                     d := merge(d, ch);
+                 END LOOP;
+                 UPDATE ex_big SET doc = d WHERE id = 1;
+                 INSERT INTO ex_big VALUES (2, d);
+             END $$;",
+        )
+        .unwrap();
+        Spi::run("SELECT pg_temp.big()").unwrap();
+        let (bytes, size): (Option<Vec<u8>>, Option<i32>) =
+            Spi::get_two("SELECT doc::bytea, pg_column_size(doc) FROM ex_big WHERE id = 1")
+                .unwrap();
+        assert_eq!(bytes.unwrap(), expected[3]);
+        assert!(
+            (size.unwrap() as usize) < base.len() / 4,
+            "compressed: {size:?}"
+        );
+        let same: bool = one(
+            "SELECT a.doc::bytea = b.doc::bytea FROM ex_big a, ex_big b WHERE a.id = 1 AND b.id = 2",
+            &[],
+        );
+        assert!(same);
+        // An UPDATE's merge result is stored the same way.
+        Spi::run("UPDATE ex_big SET doc = merge(doc, (SELECT c FROM ex WHERE k = 3)) WHERE id = 1")
+            .unwrap();
+        let bytes: Vec<u8> = one("SELECT doc::bytea FROM ex_big WHERE id = 1", &[]);
+        assert_eq!(bytes, expected[3]);
+    }
+
+    #[pg_test]
+    fn expanded_results_of_nested_merges_and_merge_agg() {
+        let (_, changes, expected) = expanded_fixture(sample(), 3);
+        let hex = |b: &[u8]| am::encoding::to_hex_literal(b);
+        let same: bool = one(
+            "SELECT merge(merge(merge(b.doc, c1.c), c2.c), c3.c)::bytea = c3.expected
+                AND (b.doc || c1.c || c2.c || c3.c)::bytea = c3.expected
+                AND merge(b.doc, c1.c)::text = $1
+                AND merge(b.doc, c1.c)::jsonb->>'step' = '1'
+                AND automerge_heads(merge(b.doc, c1.c)) = automerge_heads(c1.expected::automerge)
+             FROM ex_base b, ex c1, ex c2, ex c3 WHERE c1.k = 1 AND c2.k = 2 AND c3.k = 3",
+            &[hex(&expected[1]).into()],
+        );
+        assert!(same);
+        // Every read function gives the same answer for an expanded value
+        // (a merge result) as for the stored one.
+        let same: bool = one(
+            "WITH v AS (SELECT merge(c1.expected::automerge, c2.c) AS m, c2.expected::automerge AS f
+                        FROM ex c1, ex c2 WHERE c1.k = 1 AND c2.k = 2)
+             SELECT automerge_heads(m) = automerge_heads(f)
+                AND automerge_change_count(m) = automerge_change_count(f)
+                AND automerge_changes_bytes(m) = automerge_changes_bytes(f)
+                AND automerge_changes_bytes(m, automerge_heads(b.doc)) = automerge_changes_bytes(f, automerge_heads(b.doc))
+                AND (SELECT array_agg(hash) FROM automerge_changes_meta(m)) = (SELECT array_agg(hash) FROM automerge_changes_meta(f))
+                AND (SELECT array_agg(change) FROM automerge_changes(m)) = (SELECT array_agg(change) FROM automerge_changes(f))
+                AND automerge_get_change(m, (automerge_heads(f))[1]) = automerge_get_change(f, (automerge_heads(f))[1])
+                AND automerge_to_jsonb(m, automerge_heads(b.doc)) = automerge_to_jsonb(f, automerge_heads(b.doc))
+                AND automerge_contains(m, f) AND automerge_contains(f, m)
+                AND automerge_contains(m, b.doc) AND NOT automerge_contains(b.doc, m)
+                AND automerge_send(m) = automerge_send(f)
+             FROM v, ex_base b",
+            &[],
+        );
+        assert!(same);
+        // merge_agg returns an expanded value when it built a new document.
+        let mut forks = Vec::new();
+        for i in 0..4u8 {
+            let mut fork = sample().fork().with_actor(actor(20 + i));
+            fork.put(ROOT, format!("fork{i}"), true).unwrap();
+            forks.push(am::normalize(&fork.save()).unwrap());
+        }
+        let mut acc = am::MergeAccumulator::new();
+        for f in &forks {
+            acc.add(f).unwrap();
+        }
+        let flat = acc.finish().unwrap().unwrap().into_owned();
+        Spi::run("CREATE TEMP TABLE ex_forks (doc automerge)").unwrap();
+        for f in &forks {
+            Spi::run_with_args(
+                "INSERT INTO ex_forks VALUES ($1::automerge)",
+                &[f.clone().into()],
+            )
+            .unwrap();
+        }
+        let (bytes, json): (Option<Vec<u8>>, Option<JsonB>) =
+            Spi::get_two("SELECT merge_agg(doc)::bytea, merge_agg(doc)::jsonb FROM ex_forks")
+                .unwrap();
+        assert_eq!(bytes.unwrap(), flat);
+        assert_eq!(json.unwrap().0, am::to_json(&flat).unwrap());
+        // merge_agg of expanded inputs (merge results: step k - 1 plus
+        // change set k).
+        let bytes: Vec<u8> = one(
+            "SELECT merge_agg(merge(p.doc, e.c) ORDER BY e.k)::bytea
+             FROM (SELECT 1 AS k, doc FROM ex_base
+                   UNION ALL SELECT k + 1, expected::automerge FROM ex) p
+             JOIN ex e USING (k)",
+            &[],
+        );
+        let mut acc = am::MergeAccumulator::new();
+        for (k, c) in changes.iter().enumerate() {
+            let step = am::merge_changes(&expected[k], c).unwrap().unwrap();
+            assert_eq!(step, expected[k + 1]);
+            acc.add(&step).unwrap();
+        }
+        assert_eq!(bytes, acc.finish().unwrap().unwrap().into_owned());
+    }
+
+    #[pg_test]
+    fn expanded_memory_is_released() {
+        let (_, _, expected) = expanded_fixture(sample(), 200);
+        let live_before = am::loaded::live_count();
+        assert_eq!(expanded_contexts(), 0);
+        Spi::run(
+            "CREATE FUNCTION pg_temp.churn() RETURNS bigint LANGUAGE plpgsql AS $$
+             DECLARE d automerge; x automerge; ch bytea; contexts bigint;
+                     cs bytea[] := ARRAY(SELECT c FROM ex ORDER BY k);
+             BEGIN
+                 SELECT doc INTO d FROM ex_base;
+                 -- In place, 200 times.
+                 FOR ch IN SELECT c FROM ex ORDER BY k LOOP
+                     d := merge(d, ch);
+                 END LOOP;
+                 -- A new object into x each time (d is read-only here); the
+                 -- previous x is freed on assignment.
+                 FOR i IN 1..300 LOOP
+                     x := merge(d, cs[1 + i % 200]) || d;
+                     x := merge(x, d);
+                 END LOOP;
+                 SELECT count(*) INTO contexts FROM pg_backend_memory_contexts
+                 WHERE name = 'automerge expanded document';
+                 ASSERT d::bytea = (SELECT expected FROM ex WHERE k = 200);
+                 RETURN contexts;
+             END $$;",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let contexts: i64 = one("SELECT pg_temp.churn()", &[]);
+            // d, and x (a flat copy or an expanded value), at most.
+            assert!(
+                contexts <= 2,
+                "{contexts} expanded objects alive in the loop"
+            );
+            assert_eq!(expanded_contexts(), 0);
+            assert_eq!(am::loaded::live_count(), live_before);
+        }
+        // Statements: nested merges and merge_agg over many rows.
+        let n: i64 = one(
+            "SELECT count(*) FROM (
+                 SELECT automerge_heads(merge(merge(p.doc, e.c), e.c))
+                 FROM (SELECT 1 AS k, doc FROM ex_base
+                       UNION ALL SELECT k + 1, expected::automerge FROM ex) p
+                 JOIN ex e USING (k)
+             ) s",
+            &[],
+        );
+        assert_eq!(n, 200);
+        let bytes: Vec<u8> = one(
+            "SELECT merge_agg(merge(p.doc, e.c) ORDER BY e.k)::bytea
+             FROM (SELECT 1 AS k, doc FROM ex_base
+                   UNION ALL SELECT k + 1, expected::automerge FROM ex) p
+             JOIN ex e USING (k)",
+            &[],
+        );
+        assert_eq!(bytes.len(), expected[200].len());
+        assert_eq!(expanded_contexts(), 0);
+        assert_eq!(am::loaded::live_count(), live_before);
+    }
+
+    #[pg_test]
+    fn merge_support_function_is_attached_and_answers_modify_in_place() {
+        let attached: String = one(
+            "SELECT string_agg(DISTINCT prosupport::regproc::text, ',') FROM pg_proc \
+             WHERE proname = 'merge' AND prorettype = 'automerge'::regtype",
+            &[],
+        );
+        assert_eq!(attached, "automerge_merge_support");
+        let labels: String = one(
+            "SELECT string_agg(DISTINCT provolatile::text || proisstrict::text || proparallel::text, ',') \
+             FROM pg_proc WHERE oid IN ('merge(automerge, automerge)'::regprocedure, \
+               'merge(automerge, bytea)'::regprocedure, 'automerge_merge_support(internal)'::regprocedure)",
+            &[],
+        );
+        assert_eq!(labels, "itrues");
+
+        // The support function itself: a Param of the target variable as
+        // the first argument is named; anything else is not.
+        // SAFETY: nodes built in the current memory context, as the
+        // planner would pass them.
+        unsafe {
+            let param = |id: i32| {
+                let p = pg_sys::palloc0(size_of::<pg_sys::Param>()).cast::<pg_sys::Param>();
+                (*p).xpr.type_ = pg_sys::NodeTag::T_Param;
+                (*p).paramkind = pg_sys::ParamKind::PARAM_EXTERN;
+                (*p).paramid = id;
+                p.cast::<pg_sys::Node>()
+            };
+            let request = |args: Vec<*mut pg_sys::Node>, paramid: i32| {
+                let r = pg_sys::palloc0(size_of::<pg_sys::SupportRequestModifyInPlace>())
+                    .cast::<pg_sys::SupportRequestModifyInPlace>();
+                (*r).type_ = pg_sys::NodeTag::T_SupportRequestModifyInPlace;
+                let mut list: *mut pg_sys::List = std::ptr::null_mut();
+                for a in args {
+                    list = pg_sys::lappend(list, a.cast());
+                }
+                (*r).args = list;
+                (*r).paramid = paramid;
+                r.cast::<pg_sys::Node>()
+            };
+            let target = param(1);
+            assert_eq!(
+                super::modify_in_place_param(request(vec![target, param(2)], 1)),
+                target
+            );
+            // Other references to the variable are fine (merge copes).
+            let target = param(1);
+            assert_eq!(
+                super::modify_in_place_param(request(vec![target, param(1)], 1)),
+                target
+            );
+            assert!(super::modify_in_place_param(request(vec![param(2), param(1)], 1)).is_null());
+            assert!(super::modify_in_place_param(request(vec![], 1)).is_null());
+            let c = pg_sys::palloc0(size_of::<pg_sys::Const>()).cast::<pg_sys::Node>();
+            (*c).type_ = pg_sys::NodeTag::T_Const;
+            assert!(super::modify_in_place_param(request(vec![c, param(1)], 1)).is_null());
+            let exec = param(1);
+            (*exec.cast::<pg_sys::Param>()).paramkind = pg_sys::ParamKind::PARAM_EXEC;
+            assert!(super::modify_in_place_param(request(vec![exec, param(1)], 1)).is_null());
+            let other =
+                pg_sys::palloc0(size_of::<pg_sys::SupportRequestSimplify>()).cast::<pg_sys::Node>();
+            (*other).type_ = pg_sys::NodeTag::T_SupportRequestSimplify;
+            assert!(super::modify_in_place_param(other).is_null());
+            assert!(super::modify_in_place_param(std::ptr::null_mut()).is_null());
+        }
     }
 }
 
