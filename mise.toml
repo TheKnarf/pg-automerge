@@ -1,0 +1,30 @@
+[tools]
+rust = { version = "1.98.1", components = "rustfmt,clippy" }
+# Must match the `pgrx` crate version in Cargo.toml exactly.
+"cargo:cargo-pgrx" = "0.19.3"
+
+[settings]
+# Build cargo tools from source with --locked for reproducibility.
+cargo.binstall = false
+
+[env]
+PG_VERSION = "18"
+# Linuxbrew's gcc/binutils/libstdc++ target a newer glibc than Debian 12 has;
+# make sure the system toolchain wins when building Postgres and the extension.
+_.path = ["/usr/bin", "/bin"]
+
+[tasks.pgrx-init]
+description = "Download and build the Postgres version pgrx develops against (~/.pgrx)"
+run = "cargo pgrx init --pg{{env.PG_VERSION}} download"
+
+[tasks.test]
+description = "Run #[pg_test] and unit tests in a pgrx-managed Postgres"
+run = "cargo pgrx test pg{{env.PG_VERSION}}"
+
+[tasks.regress]
+description = "Run pg_regress tests in tests/pg_regress"
+run = "cargo pgrx regress pg{{env.PG_VERSION}}"
+
+[tasks.run]
+description = "Install the extension and open psql against a pgrx-managed Postgres"
+run = "cargo pgrx run pg{{env.PG_VERSION}}"
