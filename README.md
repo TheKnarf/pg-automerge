@@ -40,9 +40,13 @@ needed. Then, in each database:
 CREATE EXTENSION pg_automerge;
 ```
 
-There are no published packages yet. To build one for another machine,
-use that server's `pg_config` (same Postgres major version, same
-platform):
+There are no published packages yet (tag builds in CI attach a tarball,
+built against the PGDG Postgres 18 on Ubuntu, to the workflow run as an
+artifact; they are not GitHub releases). To build one for another
+machine, use that server's `pg_config` (same Postgres major version, same
+platform). `PG_CONFIG` is required, and pgrx's own development Postgres
+(under `~/.pgrx`) is refused: a package built for it would unpack into
+`~/.pgrx/...` where no real server looks.
 
 ```sh
 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package
@@ -324,7 +328,7 @@ Tooling runs through [mise](https://mise.jdx.dev):
 mise run pgrx-init   # once: build the Postgres pgrx develops against
 mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump and upgrade scripts
 mise run regress     # pg_regress examples in tests/pg_regress (checks their fixtures first)
-mise run lint        # rustfmt, clippy -D warnings (all build configurations), rustdoc
+mise run lint        # CI/packaging checks, rustfmt, clippy -D warnings (all build configurations), rustdoc
 mise run ci          # lint + test + regress: what CI runs
 mise run concurrency # only: two real psql sessions merging into one row
 mise run notify      # only: a real LISTEN session receiving automerge_notify() payloads
@@ -334,7 +338,7 @@ mise run replication # logical replication in a scratch cluster (not part of tes
 mise run fuzz        # a long mutation-fuzzing session of the core (not part of test)
 mise run bench-expanded  # SQL timings on a release build (minutes)
 mise run bench-core  # Rust timings of load, normalize and the jsonb walk
-mise run package     # release package for the Postgres of $PG_CONFIG
+mise run package     # release package for the Postgres of $PG_CONFIG (required)
 mise run run         # install and open psql against the pgrx-managed Postgres
 ```
 

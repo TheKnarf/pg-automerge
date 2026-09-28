@@ -77,19 +77,13 @@ description = "Rust-level timings of load, normalize, save and the JSON walk on 
 run = "cargo run --release -q -p pg_automerge_core --example bench_core"
 
 [tasks.package]
-description = "Build a release package for Postgres 18 into target/release/pg_automerge-pg18/ and a tarball of it"
-shell = "bash -c"
-run = '''
-set -euo pipefail
-PG_CONFIG="${PG_CONFIG:-$(sed -n 's/^pg18 *= *"\(.*\)"/\1/p' "${PGRX_HOME:-$HOME/.pgrx}/config.toml")}"
-cargo pgrx package --pg-config "$PG_CONFIG"
-tar -C target/release/pg_automerge-pg18 -czf target/release/pg_automerge-pg18.tar.gz .
-echo "target/release/pg_automerge-pg18.tar.gz"
-'''
+description = "Build a release package for the Postgres 18 of $PG_CONFIG (required; not pgrx's own) into target/release/pg_automerge-pg18/ and a tarball of it"
+run = "bash scripts/package.sh"
 
 [tasks.lint]
-description = "rustfmt check, clippy -D warnings for each build configuration, rustdoc -D warnings"
+description = "CI/packaging checks, rustfmt check, clippy -D warnings for each build configuration, rustdoc -D warnings"
 run = [
+  "bash tests/check_ci.sh",
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
   "cargo clippy --workspace --all-targets --features 'pg18 pg_test' --no-default-features -- -D warnings",

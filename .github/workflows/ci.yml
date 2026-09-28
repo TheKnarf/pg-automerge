@@ -12,8 +12,11 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+# One group per event and ref: a newer push supersedes an older push run on
+# the same ref, but a push to main never cancels the nightly (schedule) run
+# with its benchmarks, nor the other way round.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -76,10 +79,35 @@ jobs:
           name: benchmarks
           path: bench-*.txt
 
+      # The package is built against the PGDG Postgres 18 (not pgrx's
+      # development Postgres in ~/.pgrx): `cargo pgrx package` mirrors the
+      # pg_config's install paths, so the tarball unpacks into
+      # /usr/lib/postgresql/18/lib and /usr/share/postgresql/18/extension.
+      - name: Install PGDG Postgres 18 (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          sudo apt-get install -y --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-18 postgresql-server-dev-18
+
       - name: Package (tags only)
         if: startsWith(github.ref, 'refs/tags/')
-        run: mise run package
+        run: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package
 
+      # Install the tarball the way the README says and create the
+      # extension in the PGDG server.
+      - name: Check the package installs (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          sudo tar -C / -xzf target/release/pg_automerge-pg18.tar.gz
+          sudo pg_ctlcluster 18 main start || sudo pg_createcluster 18 main --start
+          sudo -u postgres psql -p "$(pg_conftool -s 18 main show port)" -v ON_ERROR_STOP=1 \
+            -c 'CREATE EXTENSION pg_automerge' \
+            -c "SELECT automerge_to_jsonb(''::bytea::automerge)"
+
+      # Attached to the workflow run (Actions > run > Artifacts), not to a
+      # GitHub release.
       - name: Upload package (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4

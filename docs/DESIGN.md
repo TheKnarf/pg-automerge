@@ -1105,11 +1105,25 @@ What costs a load, per call:
   of [Performance](#performance) on three generated documents;
   `mise run bench-core` times the Rust primitives (`examples/bench_core.rs`).
 - CI (`.github/workflows/ci.yml`) runs `mise run ci` (lint, test, regress)
-  on every push and pull request, the benchmarks nightly (uploaded as an
-  artifact), and `mise run package` on tags.
-- The shell scripts share `tests/lib.sh`; they start the pgrx-managed
+  on every push and pull request, and the benchmarks nightly (uploaded as a
+  workflow-run artifact). Runs are grouped by event and ref, so a newer
+  push cancels an older push run on the same ref but never the nightly
+  run, and the other way round. On tags it installs the PGDG Postgres 18,
+  runs `PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package`,
+  unpacks the tarball into `/` and runs `CREATE EXTENSION` in that server,
+  then uploads the tarball as a workflow-run artifact (not a release).
+- `mise run package` (`scripts/package.sh`) requires `PG_CONFIG` and
+  refuses one under `$PGRX_HOME` (also through a symlink) or of another
+  major version: `cargo pgrx package` mirrors that pg_config's install
+  paths, so a package built for pgrx's development Postgres would unpack
+  into `~/.pgrx/...`. It then checks that the tarball holds
+  `pg_automerge.so` under `--pkglibdir` and the control file under
+  `--sharedir/extension`. `tests/check_ci.sh` (part of `mise run lint`)
+  checks these refusals and the workflow's concurrency group and package
+  step.
+- The multi-session shell scripts share `tests/lib.sh`; they start the pgrx-managed
   Postgres if it is not running and stop it again only if they started it.
-- `mise run lint`: rustfmt, clippy with `-D warnings` for the default, the
+- `mise run lint`: `tests/check_ci.sh`, rustfmt, clippy with `-D warnings` for the default, the
   `pg_test` and the core-only builds, and rustdoc with `-D warnings`.
 
 ## Versioning and upgrades
