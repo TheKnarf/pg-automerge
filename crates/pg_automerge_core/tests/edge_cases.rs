@@ -5,10 +5,12 @@
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, ChangeHash, ObjType, ROOT, ReadDoc, ScalarValue};
 use pg_automerge_core::json::MAX_DEPTH;
-use pg_automerge_core::{
-    Error, MergeAccumulator, Merged, contains, heads, merge, normalize, to_json,
-};
+use pg_automerge_core::{Error, MergeAccumulator, normalize};
 use serde_json::{Value, json};
+
+mod common;
+
+use common::{Merged, StoredAccumulator, contains, heads, merge, to_json};
 
 fn actor(n: u8) -> ActorId {
     ActorId::from([n; 16])

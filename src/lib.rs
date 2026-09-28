@@ -229,7 +229,7 @@ impl AutomergeArg {
     /// Whether the value has nothing that is not already in `since`: every
     /// head of the value is in `since`. Reads only the heads.
     fn nothing_since(&self, since: &[ChangeHash]) -> bool {
-        !since.is_empty() && am::is_subset(&self.heads().or_raise(), since)
+        am::history::nothing_since(&self.heads().or_raise(), since)
     }
 
     /// Whether this argument and `other` are the same expanded object
@@ -1504,7 +1504,7 @@ fn automerge_changes(
     let rows = if doc.nothing_since(&since) {
         Vec::new()
     } else {
-        doc.with_input(|input| loaded::with_doc(input, |d| am::history::changes_doc(d, &since)))
+        doc.with_input(|input| am::history::changes(input, &since))
             .or_raise()
     };
     let typoid = result_type(fcinfo);
@@ -1523,10 +1523,8 @@ fn automerge_changes_meta(
     let rows = if doc.nothing_since(&since) {
         Vec::new()
     } else {
-        doc.with_input(|input| {
-            loaded::with_doc(input, |d| am::history::changes_meta_doc(d, &since))
-        })
-        .or_raise()
+        doc.with_input(|input| am::history::changes_meta(input, &since))
+            .or_raise()
     };
     let typoid = result_type(fcinfo);
     SetOfIterator::new(rows.into_iter().map(move |row| change_tuple(typoid, row)))
@@ -1545,7 +1543,7 @@ fn automerge_changes_bytes(
     if doc.nothing_since(&since) {
         return Vec::new();
     }
-    doc.with_input(|input| loaded::with_doc(input, |d| am::history::changes_bytes_doc(d, &since)))
+    doc.with_input(|input| am::history::changes_bytes(input, &since))
         .or_raise()
 }
 
@@ -1559,7 +1557,7 @@ fn automerge_get_change(
 ) -> Option<pgrx::composite_type!('static, "automerge_change")> {
     let hash = am::history::parse_hash(hash).or_raise();
     let row = doc
-        .with_input(|input| loaded::with_doc(input, |d| am::history::change_doc(d, &hash)))
+        .with_input(|input| am::history::change(input, &hash))
         .or_raise()?;
     Some(change_tuple(result_type(fcinfo), row))
 }
@@ -1571,9 +1569,7 @@ fn automerge_get_change(
 fn automerge_change_count(doc: AutomergeArg) -> i64 {
     let n = match doc.read_prefix(header::change_count_from_prefix) {
         Some(n) => n,
-        None => doc
-            .with_input(|input| loaded::with_doc(input, |d| Ok(am::history::change_count_doc(d))))
-            .or_raise(),
+        None => doc.with_input(am::history::change_count).or_raise(),
     };
     to_i64(n)
 }
@@ -1584,7 +1580,7 @@ fn automerge_change_count(doc: AutomergeArg) -> i64 {
 fn automerge_to_jsonb_at(doc: AutomergeArg, heads: Vec<Option<String>>) -> JsonB {
     let heads = hashes_arg("heads", &heads);
     JsonB(
-        doc.with_input(|input| loaded::with_doc(input, |d| am::history::to_json_at_doc(d, &heads)))
+        doc.with_input(|input| am::history::to_json_at(input, &heads))
             .or_raise(),
     )
 }
@@ -1595,9 +1591,9 @@ mod tests {
     use pg_automerge_core as am;
     use pg_automerge_core::automerge::transaction::Transactable;
     use pg_automerge_core::automerge::{ActorId, AutoCommit, ObjType, ROOT};
+    use pg_automerge_core::serde_json::{self, json};
     use pgrx::prelude::*;
     use pgrx::{JsonB, datum::DatumWithOid};
-    use pg_automerge_core::serde_json::{self, json};
 
     fn actor(n: u8) -> ActorId {
         ActorId::from([n; 16])
@@ -1621,6 +1617,32 @@ mod tests {
         Spi::get_one_with_args::<T>(sql, args)
             .unwrap()
             .expect("non-null result")
+    }
+
+    /// The jsonb of stored bytes, computed in Rust.
+    fn stored_json(bytes: &[u8]) -> serde_json::Value {
+        am::loaded::with_doc(am::loaded::Input::Stored(bytes), am::json::doc_to_json).unwrap()
+    }
+
+    /// `merge(a, changes)` of stored bytes (`changes` must add something),
+    /// computed in Rust: the stored bytes of the result.
+    fn stored_merge_changes(a: &[u8], changes: &[u8]) -> Vec<u8> {
+        let doc = am::loaded::merge_changes(am::loaded::Input::Stored(a), changes)
+            .unwrap()
+            .expect("the changes add something");
+        doc.stored().unwrap().to_vec()
+    }
+
+    /// `merge_agg` of stored values, computed in Rust.
+    fn stored_merge_all(values: &[Vec<u8>]) -> Vec<u8> {
+        let mut acc = am::MergeAccumulator::new();
+        for v in values {
+            acc.add_input(am::loaded::Input::Stored(v)).unwrap();
+        }
+        match acc.finish_loaded().unwrap().expect("not empty") {
+            am::Accumulated::Stored(bytes) => bytes.to_vec(),
+            am::Accumulated::Loaded(doc) => doc.stored().unwrap().to_vec(),
+        }
     }
 
     #[pg_test]
@@ -1788,7 +1810,7 @@ mod tests {
         assert_eq!(json.0["b"], 1);
         // Same state as merging in Rust.
         let merged = pg_automerge_core::normalize(&a.save()).unwrap();
-        assert_eq!(json.0, pg_automerge_core::to_json(&merged).unwrap());
+        assert_eq!(json.0, stored_json(&merged));
         assert_eq!(json.0["list"].as_array().unwrap().len(), 3);
 
         // Idempotent, and merging an ancestor is a byte-for-byte no-op.
@@ -3762,9 +3784,7 @@ mod tests {
             writer.put(ROOT, format!("k{k}"), k as i64).unwrap();
             writer.commit();
             let c = writer.save_after(&heads);
-            let next = am::merge_changes(expected.last().unwrap(), &c)
-                .unwrap()
-                .unwrap();
+            let next = stored_merge_changes(expected.last().unwrap(), &c);
             changes.push(c);
             expected.push(next);
         }
@@ -4099,11 +4119,7 @@ mod tests {
             fork.put(ROOT, format!("fork{i}"), true).unwrap();
             forks.push(am::normalize(&fork.save()).unwrap());
         }
-        let mut acc = am::MergeAccumulator::new();
-        for f in &forks {
-            acc.add(f).unwrap();
-        }
-        let flat = acc.finish().unwrap().unwrap().into_owned();
+        let flat = stored_merge_all(&forks);
         Spi::run("CREATE TEMP TABLE ex_forks (doc automerge)").unwrap();
         for f in &forks {
             Spi::run_with_args(
@@ -4116,7 +4132,7 @@ mod tests {
             Spi::get_two("SELECT merge_agg(doc)::bytea, merge_agg(doc)::jsonb FROM ex_forks")
                 .unwrap();
         assert_eq!(bytes.unwrap(), flat);
-        assert_eq!(json.unwrap().0, am::to_json(&flat).unwrap());
+        assert_eq!(json.unwrap().0, stored_json(&flat));
         // merge_agg of expanded inputs (merge results: step k - 1 plus
         // change set k).
         let bytes: Vec<u8> = one(
@@ -4126,13 +4142,13 @@ mod tests {
              JOIN ex e USING (k)",
             &[],
         );
-        let mut acc = am::MergeAccumulator::new();
+        let mut steps = Vec::new();
         for (k, c) in changes.iter().enumerate() {
-            let step = am::merge_changes(&expected[k], c).unwrap().unwrap();
+            let step = stored_merge_changes(&expected[k], c);
             assert_eq!(step, expected[k + 1]);
-            acc.add(&step).unwrap();
+            steps.push(step);
         }
-        assert_eq!(bytes, acc.finish().unwrap().unwrap().into_owned());
+        assert_eq!(bytes, stored_merge_all(&steps));
     }
 
     #[pg_test]

@@ -41,14 +41,21 @@ pub fn from_hex_literal(input: &str) -> Result<Vec<u8>, Error> {
 }
 
 fn hex_value(c: u8) -> Result<u8, Error> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(Error::InvalidInput(format!(
+    hex_nibble(c).ok_or_else(|| {
+        Error::InvalidInput(format!(
             "invalid input syntax for type automerge: invalid hex digit {:?}",
             c as char
-        ))),
+        ))
+    })
+}
+
+/// The value of one hex digit, either case; `None` for anything else.
+pub(crate) fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 

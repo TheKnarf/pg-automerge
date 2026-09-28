@@ -8,12 +8,12 @@ mod common;
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, Automerge, ROOT};
 use pg_automerge_core::loaded::{self, Input, LoadedDoc, MergeOutcome};
-use pg_automerge_core::{Error, MergeAccumulator, Merged, merge, merge_changes, normalize};
+use pg_automerge_core::{Error, MergeAccumulator, normalize};
 
-use common::{Rng, random_replicas};
+use common::{Merged, Rng, StoredAccumulator, merge, merge_changes, random_replicas};
 
-/// What `merge(automerge, bytea)` stored before loaded documents existed:
-/// a strict load of `a ++ changes`, saved (None: heads unchanged).
+/// Reference for `merge(automerge, bytea)`: a strict load of `a ++ changes`,
+/// saved (None: heads unchanged).
 fn reference_apply(a: &[u8], changes: &[u8]) -> Option<Vec<u8>> {
     let mut combined = a.to_vec();
     combined.extend_from_slice(changes);
@@ -107,7 +107,7 @@ fn chains_of_change_sets_store_the_same_bytes_as_the_flat_path() {
         // (Not byte-equal to `full`'s save: a document chunk lists changes
         // in the order they were applied. Same state though.)
         assert_eq!(
-            pg_automerge_core::to_json(&flat).unwrap(),
+            common::to_json(&flat).unwrap(),
             pg_automerge_core::json::doc_to_json(&full).unwrap()
         );
         let mut heads = full.get_heads();
@@ -249,7 +249,7 @@ fn containment_agrees_between_stored_and_loaded() {
             let i = rng.below(changes.len() as u64 + 1) as usize;
             let j = i + rng.below((changes.len() - i) as u64 + 1) as usize;
             let slice = changes[i..j].concat();
-            let flat = pg_automerge_core::contains_changes(&base, &slice).unwrap();
+            let flat = common::contains_changes(&base, &slice).unwrap();
             let mem = loaded::contains_changes(Input::Loaded(&doc), &slice).unwrap();
             assert_eq!(flat, mem, "seed {seed}: {i}..{j} on {at}");
             // And merge agrees: a no-op exactly when contained (unless the
@@ -262,7 +262,7 @@ fn containment_agrees_between_stored_and_loaded() {
         }
         let other = prefix_doc(&changes, rng.below(changes.len() as u64 + 1) as usize);
         let other_doc = LoadedDoc::from_stored(&other).unwrap();
-        let flat = pg_automerge_core::contains(&base, &other).unwrap();
+        let flat = common::contains(&base, &other).unwrap();
         assert_eq!(
             loaded::contains(Input::Loaded(&doc), Input::Stored(&other)).unwrap(),
             flat

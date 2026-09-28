@@ -7,7 +7,6 @@
 //! `automerge` type: the output of [`Automerge::save_nocompress`] for a
 //! document without queued (dependency-less) changes.
 
-use std::borrow::Cow;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -94,17 +93,28 @@ pub(crate) fn guard_stored<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T,
     })
 }
 
+/// [`guard_input`] when the operation involves a document with unverified
+/// external changes (see [`loaded::LoadedDoc`]), whose failures are the
+/// client's; [`guard_stored`] otherwise.
+pub(crate) fn guard_for<T>(
+    unverified: bool,
+    f: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    if unverified {
+        guard_input(f)
+    } else {
+        guard_stored(f)
+    }
+}
+
 /// Load bytes arriving from outside (text input, binary recv, `bytea` cast).
 ///
 /// Accepts anything `Automerge::load` accepts: a document chunk, change
 /// chunks, compressed or not, concatenated. Rejects input whose changes have
 /// missing dependencies, so a stored value never carries orphaned changes.
-/// Empty input is the empty document.
-pub fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
-    guard_input(|| load_external_unguarded(bytes))
-}
-
-fn load_external_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
+/// Empty input is the empty document. Unguarded: callers run it inside
+/// [`guard_input`].
+fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
     let doc = Automerge::load(bytes).map_err(|e| match e {
         AutomergeError::MissingDeps => Error::InvalidInput(
             "invalid automerge document: changes are missing dependencies".into(),
@@ -133,30 +143,38 @@ fn load_external_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
 /// costs a second load on writes of non-canonical (e.g. compressed) saves.
 pub fn normalize(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     guard_input(|| {
-        let doc = load_external_unguarded(bytes)?;
+        let doc = load_external(bytes)?;
         let saved = doc.save_nocompress();
         if saved != bytes {
-            let reloaded = Automerge::load(&saved).map_err(|e| {
-                Error::InvalidInput(format!(
-                    "invalid automerge document: does not survive a save and load ({e})"
-                ))
-            })?;
-            if reloaded.get_heads() != doc.get_heads() {
-                return Err(Error::InvalidInput(
-                    "invalid automerge document: heads change after a save and load".into(),
-                ));
-            }
+            let mut heads = doc.get_heads();
+            heads.sort_unstable();
+            reload_check(&saved, &heads, "invalid automerge document")?;
         }
         Ok(saved)
     })
 }
 
-/// Load already-stored bytes. These were validated on the way in, so failure
-/// here means on-disk corruption (or a bug) and is reported as internal.
-pub fn load_stored(bytes: &[u8]) -> Result<Automerge, Error> {
-    guard_stored(|| load_stored_unguarded(bytes))
+/// The safeguard of [`normalize`] for a document built from external
+/// input: its save `saved` must load back and have the same `heads`
+/// (sorted). Otherwise [`Error::InvalidInput`], with messages starting with
+/// `what`.
+pub(crate) fn reload_check(saved: &[u8], heads: &[ChangeHash], what: &str) -> Result<(), Error> {
+    let reloaded = Automerge::load(saved).map_err(|e| {
+        Error::InvalidInput(format!("{what}: does not survive a save and load ({e})"))
+    })?;
+    let mut reloaded_heads = reloaded.get_heads();
+    reloaded_heads.sort_unstable();
+    if reloaded_heads != heads {
+        return Err(Error::InvalidInput(format!(
+            "{what}: heads change after a save and load"
+        )));
+    }
+    Ok(())
 }
 
+/// Load already-stored bytes (unguarded). These were validated on the way
+/// in, so failure here means on-disk corruption (or a bug) and is reported
+/// as internal.
 pub(crate) fn load_stored_unguarded(bytes: &[u8]) -> Result<Automerge, Error> {
     Automerge::load(bytes)
         .map_err(|e| Error::Internal(format!("corrupt stored automerge value: {e}")))
@@ -222,68 +240,6 @@ pub fn contains_by_heads(a: &[ChangeHash], b: &[ChangeHash]) -> Option<bool> {
         Some(false)
     } else {
         None
-    }
-}
-
-/// Which bytes `merge` produced. `Left`/`Right` mean one input already
-/// contained the other and is returned verbatim without a re-save.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Merged {
-    Left,
-    Right,
-    New(Vec<u8>),
-}
-
-impl Merged {
-    pub fn into_bytes<'a>(self, a: &'a [u8], b: &'a [u8]) -> Cow<'a, [u8]> {
-        match self {
-            Merged::Left => Cow::Borrowed(a),
-            Merged::Right => Cow::Borrowed(b),
-            Merged::New(bytes) => Cow::Owned(bytes),
-        }
-    }
-}
-
-/// CRDT merge of two stored values.
-///
-/// Commutative in state (heads and jsonb), not byte for byte: when neither
-/// input contains the other, the re-saved bytes depend on argument order.
-///
-/// No-op checks, cheapest first: identical bytes; heads read from the
-/// headers (no load); the history of the larger input (one load); the
-/// history of the other. Implemented by [`loaded::merge`], which also takes
-/// loaded documents.
-pub fn merge(a: &[u8], b: &[u8]) -> Result<Merged, Error> {
-    match loaded::merge(loaded::Input::Stored(a), loaded::Input::Stored(b))? {
-        loaded::MergeOutcome::Left => Ok(Merged::Left),
-        loaded::MergeOutcome::Right => Ok(Merged::Right),
-        loaded::MergeOutcome::New(doc) => Ok(Merged::New(doc.stored()?.to_vec())),
-    }
-}
-
-fn merge_into(target: &mut Automerge, other: &mut Automerge) -> Result<(), Error> {
-    loaded::merge_from(target, other)
-}
-
-/// Apply external bytes to a stored value: `merge(automerge, bytea)`.
-///
-/// `changes` may be anything Automerge can load incrementally: a full save
-/// (compressed or not, optionally followed by change chunks), or bare change
-/// chunks (`save_incremental()` / `save_after()` output), several of them
-/// concatenated. Chunks are applied on top of `a`, so bare changes may
-/// depend on changes `a` already has.
-///
-/// - Empty `changes`, or nothing new: `None` (use `a` as is, no re-save).
-/// - Changes whose dependencies are neither in `a` nor in `changes`:
-///   [`Error::InvalidInput`] naming the missing hashes. Nothing orphaned is
-///   ever stored.
-/// - Malformed bytes: [`Error::InvalidInput`], including decoder panics.
-/// - Otherwise `Some` normalized result, which (as in [`normalize`]) is
-///   loaded back once and must keep its heads.
-pub fn merge_changes(a: &[u8], changes: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-    match loaded::merge_changes(loaded::Input::Stored(a), changes)? {
-        None => Ok(None),
-        Some(doc) => Ok(Some(doc.stored()?.to_vec())),
     }
 }
 
@@ -401,44 +357,11 @@ pub fn contains_changes_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Opti
     }
 }
 
-/// Whether the stored value `a` already has every change in `changes`
-/// (external bytes, as for [`merge_changes`]), i.e. whether
-/// `merge(a, changes)` would return `a` unchanged.
-///
-/// Decided by [`contains_changes_by_heads`] when possible, otherwise by
-/// loading `a ++ changes` (one load, no save). Changes whose dependencies
-/// are in neither input are not in `a`: `false`, where `merge` raises an
-/// error. Malformed input on the loading path is [`Error::InvalidInput`].
-pub fn contains_changes(a: &[u8], changes: &[u8]) -> Result<bool, Error> {
-    loaded::contains_changes(loaded::Input::Stored(a), changes)
-}
-
-/// Current heads as sorted lowercase hex change hashes.
-pub fn heads(bytes: &[u8]) -> Result<Vec<String>, Error> {
-    Ok(heads_to_strings(stored_heads(bytes)?))
-}
-
 /// Sorted lowercase hex strings of `heads`.
 pub fn heads_to_strings(heads: Vec<ChangeHash>) -> Vec<String> {
     let mut heads: Vec<String> = heads.iter().map(ToString::to_string).collect();
     heads.sort();
     heads
-}
-
-/// Whether every change of `b` is already in `a` (so `merge(a, b)` is `a`).
-pub fn contains(a: &[u8], b: &[u8]) -> Result<bool, Error> {
-    loaded::contains(loaded::Input::Stored(a), loaded::Input::Stored(b))
-}
-
-/// Whether the stored value `a` has every change of the history ending at
-/// `heads_b`. Loads `a`.
-pub fn contains_loaded(a: &[u8], heads_b: &[ChangeHash]) -> Result<bool, Error> {
-    guard_stored(|| Ok(has_all(&load_stored_unguarded(a)?, heads_b)))
-}
-
-/// Stored bytes to JSON.
-pub fn to_json(bytes: &[u8]) -> Result<serde_json::Value, Error> {
-    guard_stored(|| json::doc_to_json(&load_stored_unguarded(bytes)?))
 }
 
 /// Running state of the `merge_agg` aggregate. Each input is loaded once and
@@ -467,20 +390,9 @@ impl MergeAccumulator {
         Self::default()
     }
 
-    /// Add a stored value.
-    pub fn add(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.add_input(loaded::Input::Stored(bytes))
-    }
-
     /// Add a stored value or a loaded document.
     pub fn add_input(&mut self, input: loaded::Input<'_>) -> Result<(), Error> {
-        let unverified = matches!(input, loaded::Input::Loaded(doc) if doc.is_unverified());
-        let run = || self.add_unguarded(input);
-        if unverified {
-            guard_input(run)
-        } else {
-            guard_stored(run)
-        }
+        guard_for(input.unverified(), || self.add_unguarded(input))
     }
 
     fn add_unguarded(&mut self, input: loaded::Input<'_>) -> Result<(), Error> {
@@ -508,8 +420,7 @@ impl MergeAccumulator {
                 if has_all(doc, &stored_heads_unguarded(bytes)?) {
                     return Ok(());
                 }
-                let mut other = load_stored_unguarded(bytes)?;
-                merge_into(doc, &mut other)?;
+                loaded::merge_from(doc, &load_stored_unguarded(bytes)?)?;
             }
             loaded::Input::Loaded(loaded) => {
                 if has_all(doc, loaded.heads()) {
@@ -521,15 +432,6 @@ impl MergeAccumulator {
         }
         self.unchanged_first = None;
         Ok(())
-    }
-
-    /// The merged stored bytes, or `None` if nothing was added.
-    pub fn finish(&self) -> Result<Option<Cow<'_, [u8]>>, Error> {
-        Ok(match self.finish_loaded()? {
-            None => None,
-            Some(Accumulated::Stored(bytes)) => Some(Cow::Borrowed(bytes)),
-            Some(Accumulated::Loaded(doc)) => Some(Cow::Owned(doc.stored()?.to_vec())),
-        })
     }
 
     /// The result without saving it: the first input's stored bytes when
@@ -544,129 +446,5 @@ impl MergeAccumulator {
             )))),
             (None, None) => Ok(None),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use automerge::transaction::Transactable;
-    use automerge::{ActorId, AutoCommit, ROOT};
-    use serde_json::json;
-
-    fn actor(n: u8) -> ActorId {
-        ActorId::from([n; 16])
-    }
-
-    /// A base document and two forks with concurrent edits, all as stored bytes.
-    fn forked() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let mut base = AutoCommit::new().with_actor(actor(1));
-        base.put(ROOT, "title", "base").unwrap();
-        base.put(ROOT, "n", 1i64).unwrap();
-        let mut a = base.fork().with_actor(actor(2));
-        let mut b = base.fork().with_actor(actor(3));
-        a.put(ROOT, "a", true).unwrap();
-        a.put(ROOT, "title", "from a").unwrap();
-        b.put(ROOT, "b", true).unwrap();
-        b.delete(ROOT, "n").unwrap();
-        (
-            normalize(&base.save()).unwrap(),
-            normalize(&a.save()).unwrap(),
-            normalize(&b.save()).unwrap(),
-        )
-    }
-
-    #[test]
-    fn normalize_is_idempotent_and_uncompressed() {
-        let (_, a, _) = forked();
-        assert_eq!(normalize(&a).unwrap(), a);
-        let doc = load_stored(&a).unwrap();
-        assert_eq!(doc.save_nocompress(), a);
-    }
-
-    #[test]
-    fn normalize_accepts_compressed_and_incremental_saves() {
-        let mut doc = AutoCommit::new().with_actor(actor(1));
-        doc.put(ROOT, "x", 1i64).unwrap();
-        let first = doc.save();
-        let heads = doc.get_heads();
-        doc.put(ROOT, "y", "long enough to maybe compress ".repeat(20))
-            .unwrap();
-        let mut bytes = first.clone();
-        bytes.extend(doc.save_after(&heads));
-        let expected = doc.document().save_nocompress();
-        assert_eq!(normalize(&bytes).unwrap(), expected);
-        assert_eq!(normalize(&doc.save()).unwrap(), expected);
-        // Changes alone (no document chunk) load too.
-        assert_eq!(normalize(&doc.save_after(&[])).unwrap(), expected);
-    }
-
-    #[test]
-    fn normalize_rejects_garbage_and_orphans() {
-        assert!(matches!(
-            normalize(b"not automerge"),
-            Err(Error::InvalidInput(_))
-        ));
-        let mut doc = AutoCommit::new();
-        doc.put(ROOT, "x", 1i64).unwrap();
-        let heads = doc.get_heads();
-        doc.put(ROOT, "y", 2i64).unwrap();
-        // A change whose parent is absent.
-        let orphan = doc.save_after(&heads);
-        let err = normalize(&orphan).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidInput(ref m) if m.contains("depend")),
-            "{err:?}"
-        );
-        // Same, trailing a document chunk that lacks the parent.
-        let mut other = AutoCommit::new();
-        other.put(ROOT, "z", 1i64).unwrap();
-        let mut bytes = other.save();
-        bytes.extend(orphan);
-        assert!(matches!(normalize(&bytes), Err(Error::InvalidInput(_))));
-    }
-
-    #[test]
-    fn empty_input_is_empty_document() {
-        let bytes = normalize(&[]).unwrap();
-        assert!(!bytes.is_empty());
-        assert_eq!(to_json(&bytes).unwrap(), json!({}));
-        assert!(heads(&bytes).unwrap().is_empty());
-    }
-
-    #[test]
-    fn merge_is_commutative_and_idempotent() {
-        let (base, a, b) = forked();
-        let ab = merge(&a, &b).unwrap().into_bytes(&a, &b).into_owned();
-        let ba = merge(&b, &a).unwrap().into_bytes(&b, &a).into_owned();
-        assert_eq!(heads(&ab).unwrap(), heads(&ba).unwrap());
-        assert_eq!(heads(&ab).unwrap().len(), 2);
-        let json = to_json(&ab).unwrap();
-        assert_eq!(json, to_json(&ba).unwrap());
-        assert_eq!(json, json!({ "title": "from a", "a": true, "b": true }));
-
-        assert_eq!(merge(&ab, &ab).unwrap(), Merged::Left);
-        assert_eq!(merge(&ab, &a).unwrap(), Merged::Left);
-        assert_eq!(merge(&base, &ab).unwrap(), Merged::Right);
-        assert!(contains(&ab, &a).unwrap());
-        assert!(contains(&ab, &base).unwrap());
-        assert!(!contains(&a, &b).unwrap());
-        assert!(!contains(&base, &a).unwrap());
-    }
-
-    #[test]
-    fn accumulator() {
-        let (base, a, b) = forked();
-        let mut acc = MergeAccumulator::new();
-        assert!(acc.finish().unwrap().is_none());
-        acc.add(&base).unwrap();
-        acc.add(&base).unwrap();
-        assert_eq!(acc.finish().unwrap().unwrap().as_ref(), base.as_slice());
-        acc.add(&a).unwrap();
-        acc.add(&b).unwrap();
-        let merged = acc.finish().unwrap().unwrap().into_owned();
-        let expected = merge(&a, &b).unwrap().into_bytes(&a, &b).into_owned();
-        assert_eq!(heads(&merged).unwrap(), heads(&expected).unwrap());
-        assert_eq!(to_json(&merged).unwrap(), to_json(&expected).unwrap());
     }
 }

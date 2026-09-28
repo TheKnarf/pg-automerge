@@ -3,8 +3,12 @@
 
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, Automerge, ChangeHash, ROOT};
-use pg_automerge_core::{Error, heads, merge_changes, normalize, to_json};
+use pg_automerge_core::{Error, contains_changes_by_heads, normalize, stored_heads};
 use serde_json::json;
+
+mod common;
+
+use common::{contains_changes, heads, merge_changes, to_json};
 
 fn actor(n: u8) -> ActorId {
     ActorId::from([n; 16])
@@ -222,10 +226,6 @@ fn reused_actor_id_is_an_error() {
     let msg = invalid(merge_changes(&stored(&mut a), &b.save()));
     assert!(msg.contains("duplicate seq"), "{msg}");
 }
-
-mod common;
-
-use pg_automerge_core::{contains_changes, contains_changes_by_heads, stored_heads};
 
 #[test]
 fn contains_changes_common_cases_need_no_load() {

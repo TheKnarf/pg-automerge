@@ -5,14 +5,11 @@
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, Automerge, ChangeHash, ROOT, ReadDoc};
 use pg_automerge_core::header::{HeadsPrefix, heads_from_bytes, heads_from_prefix};
-use pg_automerge_core::{
-    MergeAccumulator, Merged, contains, contains_by_heads, contains_loaded, heads, merge,
-    normalize, stored_heads,
-};
+use pg_automerge_core::{MergeAccumulator, contains_by_heads, normalize, stored_heads};
 
 mod common;
 
-use common::random_replicas;
+use common::{Merged, StoredAccumulator, contains, contains_loaded, heads, merge, random_replicas};
 
 fn load_heads(bytes: &[u8]) -> Vec<ChangeHash> {
     let mut h = Automerge::load(bytes).unwrap().get_heads();

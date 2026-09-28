@@ -26,7 +26,8 @@ use std::collections::{BinaryHeap, HashMap};
 
 use automerge::{Automerge, Change, ChangeHash, ReadDoc};
 
-use crate::{Error, guard_stored, is_subset, load_stored_unguarded, stored_heads_unguarded};
+use crate::loaded::{Input, with_doc};
+use crate::{Error, is_subset};
 
 /// One change of a document, as returned by the history functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,19 +97,12 @@ pub fn parse_hash(text: &str) -> Result<ChangeHash, Error> {
             "invalid automerge change hash \"{shown}{ellipsis}\": expected 64 hexadecimal digits"
         )));
     }
+    let nibble = |c: u8| crate::encoding::hex_nibble(c).expect("checked above");
     let mut out = [0u8; 32];
     for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
-        out[i] = (hex_value(pair[0]) << 4) | hex_value(pair[1]);
+        out[i] = (nibble(pair[0]) << 4) | nibble(pair[1]);
     }
     Ok(ChangeHash(out))
-}
-
-fn hex_value(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        _ => c - b'A' + 10,
-    }
 }
 
 /// Parse a list of change hashes, dropping duplicates. The order of the
@@ -123,10 +117,26 @@ pub fn parse_hashes<S: AsRef<str>>(texts: &[S]) -> Result<Vec<ChangeHash>, Error
     Ok(hashes)
 }
 
-/// Whether nothing in the stored value can be new relative to `since`:
-/// every head of the value is one of `since`. Read from the header, no load.
-fn nothing_since(bytes: &[u8], since: &[ChangeHash]) -> Result<bool, Error> {
-    Ok(!since.is_empty() && is_subset(&stored_heads_unguarded(bytes)?, since))
+/// Whether a document with heads `heads` has nothing that is not already
+/// in `since`: every head is one of `since` (and `since` is not empty, which
+/// means "everything"). Then every "since" function returns nothing,
+/// without looking at the history.
+pub fn nothing_since(heads: &[ChangeHash], since: &[ChangeHash]) -> bool {
+    !since.is_empty() && is_subset(heads, since)
+}
+
+/// Run `f` on the document of `input`, unless [`nothing_since`] says that
+/// there is nothing since `since` (then `T::default()`). The heads of a
+/// stored input are read from its header, so that case loads nothing.
+fn since<T: Default>(
+    input: Input<'_>,
+    since: &[ChangeHash],
+    f: impl FnOnce(&Automerge) -> Result<T, Error>,
+) -> Result<T, Error> {
+    if nothing_since(&input.heads()?, since) {
+        return Ok(T::default());
+    }
+    with_doc(input, f)
 }
 
 /// Order `changes` causally: every change after all of its deps that are in
@@ -182,37 +192,31 @@ fn causal_order(changes: Vec<ChangeInfo>) -> Result<Vec<ChangeInfo>, Error> {
 /// Metadata of every change not reachable from `since` (all changes when
 /// `since` is empty), in causal order, from the change graph: no change is
 /// rebuilt. `bytes` is `None` in every row.
-pub fn changes_meta(stored: &[u8], since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
-    guard_stored(|| {
-        if nothing_since(stored, since)? {
-            return Ok(Vec::new());
-        }
-        changes_meta_doc(&load_stored_unguarded(stored)?, since)
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored `input` does not load.
+pub fn changes_meta(input: Input<'_>, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
+    self::since(input, since, |doc| {
+        let rows = doc
+            .get_changes_meta(since)
+            .iter()
+            .map(ChangeInfo::from_meta)
+            .collect();
+        causal_order(rows)
     })
-}
-
-/// [`changes_meta`] of a loaded document.
-pub fn changes_meta_doc(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
-    let rows = doc
-        .get_changes_meta(since)
-        .iter()
-        .map(ChangeInfo::from_meta)
-        .collect();
-    causal_order(rows)
 }
 
 /// Like [`changes_meta`], with each change's bytes (rebuilt from the op set).
-pub fn changes(stored: &[u8], since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
-    guard_stored(|| {
-        if nothing_since(stored, since)? {
-            return Ok(Vec::new());
-        }
-        changes_doc(&load_stored_unguarded(stored)?, since)
-    })
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored `input` does not load.
+pub fn changes(input: Input<'_>, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
+    self::since(input, since, |doc| changes_of(doc, since))
 }
 
-/// [`changes`] of a loaded document.
-pub fn changes_doc(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
+fn changes_of(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<ChangeInfo>, Error> {
     let rows = doc
         .get_changes(since)
         .iter()
@@ -225,88 +229,83 @@ pub fn changes_doc(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<ChangeIn
 /// causal order (`save_after(since)` content): what a replica at `since`
 /// needs, loadable with `load_incremental` / `apply_changes`, or with
 /// `merge(automerge, bytea)`. Empty when there is nothing new.
-pub fn changes_bytes(stored: &[u8], since: &[ChangeHash]) -> Result<Vec<u8>, Error> {
-    guard_stored(|| {
-        if nothing_since(stored, since)? {
-            return Ok(Vec::new());
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored `input` does not load.
+pub fn changes_bytes(input: Input<'_>, since: &[ChangeHash]) -> Result<Vec<u8>, Error> {
+    self::since(input, since, |doc| {
+        let rows = changes_of(doc, since)?;
+        let mut out = Vec::with_capacity(
+            rows.iter()
+                .map(|r| r.bytes.as_ref().map_or(0, Vec::len))
+                .sum(),
+        );
+        for row in rows {
+            out.extend(row.bytes.expect("changes_of() fills bytes"));
         }
-        changes_bytes_doc(&load_stored_unguarded(stored)?, since)
+        Ok(out)
     })
-}
-
-/// [`changes_bytes`] of a loaded document.
-pub fn changes_bytes_doc(doc: &Automerge, since: &[ChangeHash]) -> Result<Vec<u8>, Error> {
-    let rows = changes_doc(doc, since)?;
-    let mut out = Vec::with_capacity(
-        rows.iter()
-            .map(|r| r.bytes.as_ref().map_or(0, Vec::len))
-            .sum(),
-    );
-    for row in rows {
-        out.extend(row.bytes.expect("changes() fills bytes"));
-    }
-    Ok(out)
 }
 
 /// The change with hash `hash`, with its bytes, or `None` if the document
 /// does not have it.
-pub fn change(stored: &[u8], hash: &ChangeHash) -> Result<Option<ChangeInfo>, Error> {
-    guard_stored(|| change_doc(&load_stored_unguarded(stored)?, hash))
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored `input` does not load.
+pub fn change(input: Input<'_>, hash: &ChangeHash) -> Result<Option<ChangeInfo>, Error> {
+    with_doc(input, |doc| {
+        if doc.get_change_meta_by_hash(hash).is_none() {
+            return Ok(None);
+        }
+        Ok(doc
+            .get_change_by_hash(hash)
+            .as_ref()
+            .map(ChangeInfo::from_change))
+    })
 }
 
-/// [`change`] of a loaded document.
-pub fn change_doc(doc: &Automerge, hash: &ChangeHash) -> Result<Option<ChangeInfo>, Error> {
-    if doc.get_change_meta_by_hash(hash).is_none() {
-        return Ok(None);
-    }
-    Ok(doc
-        .get_change_by_hash(hash)
-        .as_ref()
-        .map(ChangeInfo::from_change))
-}
-
-/// Number of changes in the stored value: read from the header and the
-/// change actor column when possible (see
+/// Number of changes in the document. For a stored input read from the
+/// header and the change actor column when possible (see
 /// [`header::change_count_from_bytes`](crate::header::change_count_from_bytes)),
-/// otherwise from the change graph of the loaded document.
-pub fn change_count(stored: &[u8]) -> Result<u64, Error> {
-    if let Some(n) = crate::header::change_count_from_bytes(stored) {
+/// otherwise from the change graph of the (loaded) document.
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored `input` has to be loaded and does not
+/// load.
+pub fn change_count(input: Input<'_>) -> Result<u64, Error> {
+    if let Input::Stored(bytes) = input
+        && let Some(n) = crate::header::change_count_from_bytes(bytes)
+    {
         return Ok(n);
     }
-    change_count_loaded(stored)
-}
-
-/// [`change_count`] by loading the document.
-pub fn change_count_loaded(stored: &[u8]) -> Result<u64, Error> {
-    guard_stored(|| Ok(change_count_doc(&load_stored_unguarded(stored)?)))
-}
-
-/// [`change_count`] of a loaded document.
-pub fn change_count_doc(doc: &Automerge) -> u64 {
-    doc.stats().num_changes
+    with_doc(input, |doc| Ok(doc.stats().num_changes))
 }
 
 /// The document's state as of `heads` as JSON (see [`crate::json`]).
 ///
-/// Every hash in `heads` must be a change of the document, otherwise
-/// [`Error::InvalidParameter`] naming the first missing one (sorted). Empty
-/// `heads` is the state before any change: `{}`.
-pub fn to_json_at(stored: &[u8], heads: &[ChangeHash]) -> Result<serde_json::Value, Error> {
-    guard_stored(|| to_json_at_doc(&load_stored_unguarded(stored)?, heads))
-}
-
-/// [`to_json_at`] of a loaded document.
-pub fn to_json_at_doc(doc: &Automerge, heads: &[ChangeHash]) -> Result<serde_json::Value, Error> {
-    check_heads(doc, heads)?;
-    let mut current = doc.get_heads();
-    current.sort_unstable();
-    let mut wanted = heads.to_vec();
-    wanted.sort_unstable();
-    wanted.dedup();
-    if wanted == current {
-        return crate::json::doc_to_json(doc);
-    }
-    crate::json::doc_to_json_at(doc, Some(&wanted))
+/// Every hash in `heads` must be a change of the document. Empty `heads`
+/// is the state before any change: `{}`.
+///
+/// # Errors
+///
+/// [`Error::InvalidParameter`] naming the first missing head (sorted);
+/// [`Error::Internal`] if a stored `input` does not load.
+pub fn to_json_at(input: Input<'_>, heads: &[ChangeHash]) -> Result<serde_json::Value, Error> {
+    with_doc(input, |doc| {
+        check_heads(doc, heads)?;
+        let mut current = doc.get_heads();
+        current.sort_unstable();
+        let mut wanted = heads.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted == current {
+            return crate::json::doc_to_json(doc);
+        }
+        crate::json::doc_to_json_at(doc, Some(&wanted))
+    })
 }
 
 fn check_heads(doc: &Automerge, heads: &[ChangeHash]) -> Result<(), Error> {

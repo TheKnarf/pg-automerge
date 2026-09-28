@@ -7,16 +7,16 @@ use std::collections::{HashMap, HashSet};
 use automerge::transaction::{CommitOptions, Transactable};
 use automerge::{ActorId, AutoCommit, Automerge, Change, ChangeHash, ROOT, ReadDoc};
 use pg_automerge_core::header::{Prefix, change_count_from_bytes, change_count_from_prefix};
-use pg_automerge_core::history::{
-    ChangeInfo, change, change_count, change_count_loaded, changes, changes_bytes, changes_meta,
-    parse_hash, to_json_at,
-};
-use pg_automerge_core::{Error, heads, merge_changes, normalize, to_json};
+use pg_automerge_core::history::{ChangeInfo, parse_hash};
+use pg_automerge_core::{Error, normalize};
 use serde_json::json;
 
 mod common;
 
-use common::{Rng, random_replicas};
+use common::history::{
+    change, change_count, change_count_loaded, changes, changes_bytes, changes_meta, to_json_at,
+};
+use common::{Rng, heads, merge_changes, random_replicas, to_json};
 
 fn hash(s: &str) -> ChangeHash {
     parse_hash(s).unwrap()
