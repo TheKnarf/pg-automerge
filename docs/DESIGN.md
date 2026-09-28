@@ -85,16 +85,19 @@ Two crates:
   `merge_changes`, `contains`, `contains_changes`), the `merge_agg` state
   (`MergeAccumulator`), the stored-header parser behind the heads fast path
   and the change-chunk splitter (`header`), the history functions
-  (`history`), the jsonb mapping (`json`), the notification payload builder
-  (`notify`) and text encodings (`encoding`). Every Automerge call runs
-  under a panic guard (see [Errors](#errors-and-panics)).
+  (`history`), the jsonb mapping as a walk into a `JsonSink` (`json`), the
+  notification payload builder (`notify`), text encodings (`encoding`) and,
+  with the `test-hooks` feature, test instrumentation (`test_hooks`).
+  Every Automerge call runs under a panic guard (see
+  [Errors](#errors-and-panics)).
 - The root crate (`src/`): the pgrx glue, one module per SQL area:
   `datum.rs` (the Rust types of `automerge` arguments and results, and the
   prefix reads), `expanded.rs` (expanded values), `io.rs` (the type's SQL,
   I/O functions and casts), `merge.rs` (`merge`, `||`, `merge_agg`, the
   support function), `introspect.rs` (`automerge_heads`,
-  `automerge_contains`), `history.rs`, `notify.rs` (the trigger) and
-  `error.rs` (raising errors). The glue converts datums, calls the core,
+  `automerge_contains`), `history.rs`, `notify.rs` (the trigger),
+  `jsonb.rs` (building jsonb from the core's walk) and `error.rs` (raising
+  errors). The glue converts datums, calls the core,
   and raises core errors with their SQLSTATE.
 
 Data flow:
@@ -135,13 +138,34 @@ Data flow:
 - **Validated.** Input that does not load is rejected (`22P02`), and so is
   input whose changes have missing dependencies: no orphaned changes are
   stored.
-- **Nothing unloadable is stored.** Unless the input already was the
-  canonical encoding, the normalized result is loaded back once and must
-  have the same heads. Malformed input with valid checksums can load into a
-  document whose re-save does not load (found by fuzzing: "mismatching
-  heads"); storing it would leave an unreadable value, so it is rejected as
-  invalid input. The same check applies to results of
-  `merge(automerge, bytea)`, when they are first flattened (see
+- **Nothing unloadable is stored.** The normalized result is loaded back
+  once and must have the same heads, unless that load provably reads the
+  bytes the first load already accepted:
+  - the input already was the canonical encoding, or
+  - the input is one document chunk with deflated columns (a compressed
+    `save()`) and inflating it gives exactly the canonical encoding.
+    Automerge inflates such a chunk before it parses it (copying the
+    actors and heads, rewriting the column metadata with the deflate bit
+    cleared, inflating each column with `flate2`, copying the head
+    indices); `header::inflate_document` does the same with the same
+    `flate2` crate and backend (Cargo unifies them) and adds the chunk
+    header. If that equals `save_nocompress()` of the loaded document,
+    loading the save parses the very bytes that `Automerge::load(input)`
+    already parsed with `VerificationMode::Check`, so it cannot fail or
+    change the heads. The core tests compare this path with the full
+    load-save-load on generated documents, trailing changes, corrupt and
+    non-canonical deflate streams, and the fuzz harness checks it on every
+    input.
+
+  Malformed input with valid checksums can load into a document whose
+  re-save does not load ("mismatching heads", found by the fuzz harness);
+  storing it would leave an unreadable value, so it is rejected as invalid
+  input.
+  Such input never takes the shortcut (its re-save differs from what was
+  loaded). Anything else (bare change chunks, a document plus trailing
+  changes, a document encoded by another implementation) pays the second
+  load. The same check applies to results of `merge(automerge, bytea)`,
+  when they are first flattened (see
   [The deferred verification](#the-deferred-verification)).
 - **Immutable.** Nothing modifies a stored value in place: `merge` returns
   a new value, and an expanded value's document is only ever replaced as a
@@ -183,9 +207,16 @@ that fail are `XX000`.
 The automerge decoder is not panic-free: input whose chunk checksums are
 valid but whose column data is malformed can hit `unwrap`s, index panics
 and assertions inside `Automerge::load` (found by fuzzing with recomputed
-checksums). The core crate therefore runs every Automerge call under
-`catch_unwind` and maps a panic to `22P02` for external input and `XX000`
-for stored values.
+checksums; `crates/pg_automerge_core/tests/fuzz.rs` finds about one per 60
+mutated inputs, and `tests/corpus/` keeps one of each kind). The core crate
+therefore runs every Automerge call under `catch_unwind` and maps a panic
+to `22P02` for external input and `XX000` for stored values. Only panics
+with a string payload (what `panic!` and failed assertions raise) are
+converted; any other payload is resumed untouched. In a backend that is a
+Postgres ERROR raised inside the guarded code (a query cancel from the
+interrupt checks, an error from a jsonb function the walk calls), which
+pgrx carries as a panic with its own payload type and must re-raise as
+is, not relabel as `22P02`/`XX000`.
 
 Messages are short and lowercase; supporting data goes in the DETAIL
 (e.g. the hashes of missing dependencies) and advice in the HINT (e.g. how
@@ -308,7 +339,8 @@ implicit).
 ### Reading
 
 - `automerge_to_jsonb(automerge) → jsonb`: the cast function (see
-  [jsonb mapping](#jsonb-mapping)). Each call loads the document.
+  [jsonb mapping](#jsonb-mapping)). Each call loads the document (an
+  expanded value is used in place).
 - `automerge_heads(automerge) → text[]`: current heads as sorted lowercase hex
   change hashes. Read from the header without loading the document (see
   [Heads fast path](#heads-fast-path)).
@@ -743,6 +775,15 @@ not catch it. Every other bad input (framing, checksums, change columns,
 missing dependencies, duplicate seq, decoder panics) fails inside `merge`.
 Verifying eagerly would cost a load per merge and undo most of the gain.
 
+The failure path is tested with a test-only hook
+(`test_hooks::set_fail_reload_check`, feature `test-hooks`) that makes the
+check fail: `merge(...)` and reads of its result succeed and run no check;
+`UPDATE`/`INSERT` of it, `::bytea` and `automerge_send` fail with `22P02`;
+the row is unchanged; a PL/pgSQL variable holding the result stays usable
+after the failed `UPDATE` and stores fine once the check passes; on input,
+canonical bytes and compressed saves take no check while other input
+fails.
+
 #### Pitfalls avoided (supabase/pg_crdt's expanded automerge)
 
 1. Mutating through a read-only pointer: only `VARTAG_EXPANDED_RW` allows
@@ -781,12 +822,38 @@ conflicting concurrent values, Automerge's winner is used (what `get` returns).
 | Bytes | string, standard base64 with padding |
 | Unknown | null |
 
-The conversion builds a `serde_json::Value` with exact `Number`s (u64 and
-i64 never go through f64) and hands its text to `jsonb_in`.
+The conversion builds the jsonb value directly: the core's walk
+(`json::write_json_at`) emits events into a `JsonSink`, and the glue's
+`JsonbBuilder` feeds them to `pushJsonbValue` and finishes with
+`JsonbValueToJsonb`, the calls `jsonb_in` makes while parsing, with the
+same values: strings and keys copied into palloc'd memory (with
+`jsonb_in`'s 256 MB string limit), `i64` through `int64_to_numeric`, and
+`u64` above `i64::MAX` and floats through `numeric_in` on the text
+`serde_json` writes for them (the shortest round-trip form), exactly what
+the text path parsed. So the result is byte for byte what the earlier
+`serde_json::Value` → text → `jsonb_in` path produced; a pg_test compares
+the two on every scalar edge case, conflicts, duplicate keys after NUL
+replacement, historical states and generated documents. Postgres errors
+inside those calls unwind through the walk untouched (see
+[Errors and panics](#errors-and-panics)).
 
-The document walk uses an explicit stack, but nesting is capped at 1000
-levels (error `XX000`) to bound recursion when serializing/dropping the
-`serde_json::Value`.
+The walk makes one sweep over the document with Automerge's document
+iterator (`ReadDoc::iter_at`), buffering each object's visible entries
+(borrowed from the document), then emits them depth first from the root.
+One sweep avoids setting up a `map_range`/`list_range` iterator per object
+(about 5 µs each). Text comes from the sweep's spans: string runs, and
+U+FFFC for each block marker, which is exactly what `text()` returns (both
+emit U+FFFC for anything in a text that is not a string and nothing for
+marks). The previous per-object walk (`json::write_json_per_object`) is
+kept for documents with legacy `Table` objects, which the sweep would read
+as lists, and as the reference: a core test checks that both emit exactly
+the same events for current and historical states of generated documents,
+text with blocks, marks and non-string elements, unreachable objects,
+conflicts and deep nesting.
+
+Nesting is capped at 1000 levels (error `XX000`): the walk itself uses an
+explicit stack, but `convertToJsonb` recurses (it checks the stack depth,
+the cap gives a clear error instead).
 
 ## Error codes
 
@@ -807,13 +874,19 @@ levels (error `XX000`) to bound recursion when serializing/dropping the
 Loading dominates: `Automerge::load` rebuilds and hashes every change,
 while saving, cloning and applying small changes are cheap. Cost of the
 primitives (Rust, release build; `load` is `Automerge::load` of the stored
-bytes, `apply` one small change set to a clone):
+bytes, `apply` one small change set to a clone, `walk` the jsonb walk of a
+loaded document into a sink that discards the events; `mise run
+bench-core` measures load, normalize, save and walk):
 
-| Document | Stored | load | save_nocompress | clone | clone + apply | to_json (loaded) |
+| Document | Stored | load | save_nocompress | clone | clone + apply | walk |
 |---|---|---|---|---|---|---|
-| 3,000,000-character text, 1 change | 3.0 MB | 2591 ms | 7.7 ms | 0.7 ms | 1.6 ms | 197 ms |
-| 20,000 list items, 401 changes | 877 kB | 155 ms | 3.6 ms | 1.3 ms | 1.8 ms | 165 ms |
-| 2,000 list items, 41 changes | 83 kB | 15 ms | 0.3 ms | 0.1 ms | 0.3 ms | 15 ms |
+| 3,000,000-character text, 1 change | 3.0 MB | 2465 ms | 7.1 ms | 0.7 ms | 1.6 ms | 247 ms |
+| 20,000 list items, 401 changes | 877 kB | 161 ms | 3.5 ms | 1.3 ms | 1.8 ms | 72 ms |
+| 2,000 list items, 41 changes | 83 kB | 16 ms | 0.3 ms | 0.1 ms | 0.3 ms | 6.4 ms |
+
+Building the jsonb value from the walk's events costs about as much again
+as the walk on the list documents (a `serde_json::Value`, for
+comparison: 89 ms and 8 ms in total).
 
 What costs a load, per call:
 
@@ -841,11 +914,13 @@ What costs a load, per call:
   `merge(doc, ''::bytea::automerge)` 16 ms (detoasting the 3 MB argument);
   `merge` with a newer version of it, in either argument order, one load
   (2.6 s), as is a `merge_agg` over both.
-- Writing a value: input that already is the canonical encoding (what
-  `automerge_changes_bytes`, `doc::bytea` or another stored value give) is
-  loaded once to validate it; any other input, e.g. a compressed
-  `Automerge.save()`, costs two loads (validate, then verify the
-  normalized re-save).
+- Writing a value: a full save, canonical (what `doc::bytea` or another
+  stored value give) or compressed (`Automerge.save()`, when it inflates
+  to the canonical encoding, which it does for saves by this Automerge
+  version) is loaded once to validate it (3 MB: 2.6 s; 877 kB: 180 ms;
+  83 kB: 20 ms). Any other input (a save plus trailing change chunks, a
+  save by an implementation whose encoding differs) costs two loads
+  (validate, then verify the normalized re-save).
 - `merge(doc, $changes::bytea)` sends and parses only the new changes, but
   on a stored `doc` still loads it, saves the result and loads it once more
   to verify it (on the 3 MB document: 5.3 s for a one-change update, 2.6 s
@@ -871,21 +946,25 @@ What costs a load, per call:
 - Merge results are expanded values: nested merges, `merge(...)::jsonb`,
   `merge_agg(...)::jsonb` and PL/pgSQL loops doing `d := merge(d, x)` keep
   the document loaded between steps. Measured with `mise run
-  bench-expanded` (release build, warm cache, milliseconds; change sets
-  are one small commit each, `merge_agg` over the document and 8
-  concurrent forks):
+  bench-expanded` (release build, warm cache, mean of three runs,
+  milliseconds; change sets are one small commit each, `merge_agg` over
+  the document and 8 concurrent forks; the first rows are writes and a
+  plain read for comparison):
 
   | Workload | 3.0 MB | 877 kB | 83 kB |
   |---|---|---|---|
-  | `UPDATE .. SET doc = merge(doc, c1)` | 5452 | 379 | 42 |
-  | `automerge_heads(merge(doc, c1))` | 2642 | 180 | 23 |
-  | `merge(doc, c1)::jsonb->>'status'` | 2895 | 448 | 48 |
-  | `automerge_heads(merge(merge(merge(doc, c1), c2), c3))` | 2645 | 187 | 24 |
-  | PL/pgSQL `d := merge(d, c)`, 20 change sets | 2697 | 217 | 31 |
-  | the same, each merge in a `BEGIN .. EXCEPTION` block | 2693 | 229 | 30 |
-  | the same, then `UPDATE .. SET doc = d` | 5584 | 425 | 52 |
-  | 2 merges into `d`, then 10 reads `d->>'status'` | 5154 | 2805 | 271 |
-  | `merge_agg(doc)::jsonb` over 9 versions | 24111 | 1759 | 179 |
+  | `bytea` → `automerge` of a compressed save | 2617 | 182 | 20 |
+  | `bytea` → `automerge` of stored bytes | 2581 | 178 | 21 |
+  | `doc->>'status'` (a stored row) | 2816 | 314 | 33 |
+  | `UPDATE .. SET doc = merge(doc, c1)` | 5246 | 377 | 41 |
+  | `automerge_heads(merge(doc, c1))` | 2543 | 178 | 21 |
+  | `merge(doc, c1)::jsonb->>'status'` | 2827 | 320 | 34 |
+  | `automerge_heads(merge(merge(merge(doc, c1), c2), c3))` | 2552 | 181 | 22 |
+  | PL/pgSQL `d := merge(d, c)`, 20 change sets | 2584 | 217 | 28 |
+  | the same, each merge in a `BEGIN .. EXCEPTION` block | 2596 | 216 | 28 |
+  | the same, then `UPDATE .. SET doc = d` | 5356 | 413 | 50 |
+  | 2 merges into `d`, then 10 reads `d->>'status'` | 5209 | 1541 | 153 |
+  | `merge_agg(doc)::jsonb` over 9 versions | 23136 | 1629 | 168 |
 
   A loop costs one load in total (plus one save and one verification load
   when the result is stored). A per-backend cache of documents loaded
@@ -914,9 +993,19 @@ What costs a load, per call:
   or a `PgError` (code, message, optional DETAIL and HINT). `raise` and
   `or_raise()` are `#[track_caller]`, so the error's LOCATION is the line
   that raised it.
-- Interrupts: single Automerge calls (load, merge, save, jsonb conversion)
-  don't check for interrupts, so cancel/`statement_timeout` wait for the call
-  to return. Only `merge_agg_trans` checks between inputs.
+- Interrupts: the core's long loops (the jsonb walk, building history rows
+  and ordering them) call an interrupt check every 1024 steps, which the
+  extension registers in `_PG_init` as `CHECK_FOR_INTERRUPTS()`
+  (`set_interrupt_check`); `merge_agg_trans` checks between inputs. A
+  cancel or `statement_timeout` raises its ERROR there, which unwinds
+  through the core's guard untouched. Single Automerge calls (a load, a
+  merge, a save, `text()`) have no hook, so a cancel waits for the one
+  running to return (for a 3 MB document, a load takes 2.5 s). Running
+  them on a helper thread would make them abandonable, but that is a
+  larger design change and not done.
+- Release profile: `panic = "unwind"` is mandatory (pgrx turns panics into
+  ERRORs by unwinding, and the guard catches decoder panics); `strip =
+  "debuginfo"` keeps the symbol table for backtraces and profiles.
 - Extension objects that pgrx does not generate (the type, casts,
   operators, aggregate, trigger function and every `COMMENT`) are written
   in `extension_sql!` blocks next to the Rust code they belong to; the
@@ -971,9 +1060,53 @@ What costs a load, per call:
   inside one transaction that is rolled back, so NOTIFY never delivers
   there (the pg_tests instead read what the trigger sent from a test-only
   per-backend list).
+- `tests/dump.sh` (`mise run dump`, part of `mise run test`): plain and
+  custom-format `pg_dump`/`pg_restore --exit-on-error` of a database with
+  the extension in its own schema (not on the restore's `search_path`), a
+  stored generated `doc::jsonb` column, GIN and btree expression indexes,
+  an `automerge_notify()` trigger, a check constraint, views with `merge`,
+  `||` and `merge_agg`, and a TOASTed value; checks fingerprints (bytes,
+  heads, jsonb), that the indexes are valid and used and that the trigger
+  fires after the restore; binary and text `COPY` round trips, and a
+  corrupt value failing `COPY FROM` with `22P02`. A restore and `COPY
+  FROM` validate every value (one load each; the generated column is
+  recomputed, one more conversion).
+- `tests/upgrade.sh` (`mise run upgrade`, part of `mise run test`): see
+  [Versioning and upgrades](#versioning-and-upgrades).
+- `tests/replication.sh` (`mise run replication`, not part of `mise run
+  test`: it runs its own scratch cluster with `wal_level = logical`):
+  logical replication in text and binary mode (see the README's
+  limitations).
+- Fuzzing: `crates/pg_automerge_core/tests/fuzz.rs` mutates real
+  Automerge output at the chunk level (bits, bytes, insertions, deletions,
+  dropped, duplicated and reordered chunks) and recomputes lengths and
+  checksums, so the mutations reach the decoders. For every input:
+  nothing panics out of the core, `normalize` agrees exactly with a plain
+  load-save-load, its results are stored values (load, header heads,
+  idempotent), and `merge(automerge, bytea)` results load back with their
+  heads. 1,500 inputs per `cargo test`; `mise run fuzz` runs 200,000 (or
+  `FUZZ_ITERS`) and can save findings (`FUZZ_SAVE_DIR`) for
+  `tests/corpus/`, which runs first. In 300,000 inputs it caught 4,903
+  decoder panics (all `22P02`) and 19 inputs that load but whose re-save
+  does not ("mismatching heads" on the reload; all of them several
+  chunks, so never candidates for the compressed-input shortcut), all
+  rejected by the save-and-load check, and found no property violation.
+  Two of the latter are in the corpus; the deferred check of `merge`
+  results is tested with the test hook (see
+  [The deferred verification](#the-deferred-verification)).
+- `tests/json_walk.rs`: the one-sweep jsonb walk against the per-object
+  walk; `tests/normalize.rs`: the compressed-input shortcut against the
+  full check; `tests/interrupts.rs`: the interrupt hook runs in the loops
+  and its errors pass the guard; `tests/format_fixtures.rs`: values saved
+  by every shipped automerge version (see
+  [Versioning and upgrades](#versioning-and-upgrades)).
 - `tests/bench_expanded.sh` (`mise run bench-expanded`, not part of
-  `mise run test`) installs a release build and times the merge workloads
-  of [Performance](#performance) on three generated documents.
+  `mise run test`) installs a release build and times the SQL workloads
+  of [Performance](#performance) on three generated documents;
+  `mise run bench-core` times the Rust primitives (`examples/bench_core.rs`).
+- CI (`.github/workflows/ci.yml`) runs `mise run ci` (lint, test, regress)
+  on every push and pull request, the benchmarks nightly (uploaded as an
+  artifact), and `mise run package` on tags.
 - The shell scripts share `tests/lib.sh`; they start the pgrx-managed
   Postgres if it is not running and stop it again only if they started it.
 - `mise run lint`: rustfmt, clippy with `-D warnings` for the default, the
@@ -983,11 +1116,49 @@ What costs a load, per call:
 
 The extension version is the crate version (`default_version =
 '@CARGO_VERSION@'` in `pg_automerge.control`), currently 0.1.0; pgrx
-generates the install script `pg_automerge--0.1.0.sql`. There are no
-upgrade scripts yet: to move between development builds, `DROP EXTENSION
-pg_automerge CASCADE` and create it again (dump and restore the data, whose
-text form is stable). Public SQL API changes are deliberate and documented
-here and in the README.
+generates the install script `pg_automerge--X.Y.Z.sql` for the build.
+
+Policy:
+
+- After each release, its generated script is committed as
+  `sql/snapshots/pg_automerge--X.Y.Z.sql` (`cargo pgrx schema pg18 -o
+  ...`) and never edited again. 0.1.0 is the first.
+- Any change to the SQL surface afterwards bumps the version, and comes
+  with a hand-written `sql/pg_automerge--A--B.sql` from the previous
+  version (`cargo pgrx install` and `package` ship every
+  `sql/pg_automerge--*--*.sql`). C symbols that an older version's script
+  references stay exported (the upgrade test installs the old script
+  against the new library).
+- `tests/upgrade.sh` (part of `mise run test`) installs every snapshot
+  under a scratch version name, stores documents, runs `ALTER EXTENSION
+  pg_automerge UPDATE`, and compares the extension's catalog (member
+  objects and their comments, function definitions with their labels and
+  symbols, aggregates, types, casts, operators) with a fresh `CREATE
+  EXTENSION`, and the stored documents' fingerprints before and after. A
+  snapshot of the current version is compared as is, so an SQL change
+  without a version bump fails.
+
+Data compatibility:
+
+- Stored values are Automerge's `save_nocompress()` format, which any
+  later Automerge must load. `crates/pg_automerge_core/tests/fixtures/
+  automerge-<version>/` holds documents saved by each automerge version
+  the extension shipped with (written by `examples/gen_format_fixtures.rs`;
+  0.12.0 now), and `tests/format_fixtures.rs` checks that they still load
+  with the same heads and jsonb, and that normalizing them still gives the
+  same bytes.
+- The automerge crate is pinned (`=0.12.0`). Upgrading it, or changing the
+  jsonb mapping, must be called out in the release notes:
+  - A different jsonb result for the same document changes what the
+    `IMMUTABLE` cast returns, so expression indexes on `doc::jsonb` must
+    be rebuilt (`REINDEX`) and stored generated columns rewritten (e.g.
+    `UPDATE t SET doc = doc`), or they disagree with fresh computations.
+  - A different canonical encoding (the format fixture test fails) means
+    re-saved values differ from stored ones: `doc::bytea` of old rows
+    stops matching new saves of the same history (heads do not change),
+    and each row is re-encoded on its next write.
+- Text output (`\x` + hex of the stored bytes) is the dump format and is
+  stable, so dump and restore works across versions.
 
 ## Appendix: benchmarks
 
@@ -1013,3 +1184,38 @@ full load for every call): `automerge_heads` 2745 ms → 0.3 ms;
 `automerge_contains(doc, ''::bytea::automerge)` 2738 ms → 0.5 ms;
 `merge(doc, ''::bytea::automerge)` 2743 ms → 16 ms; `merge` of the document
 with a newer version of it 5.3 s → 2.6 s.
+
+### Hardening and performance stage (2026-09-28)
+
+Measured before (commit e4eeb26) and after, same machine, release builds.
+`mise run bench-core` (Rust, median of five, milliseconds):
+
+| Operation | 3.0 MB text before | after | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|---|---|
+| `normalize` of a compressed save | 5280 | 2530 | 324 | 169 | 32.7 | 16.7 |
+| `normalize` of stored bytes | 2637 | 2488 | 163 | 164 | 16.2 | 16.1 |
+| jsonb walk (no-op sink) | 194 (per object) | 247 (one sweep) | 144 | 72 | 13.4 | 6.4 |
+
+(5,000 one-character changes, 5 kB: `normalize` of a compressed save
+45.5 → 22.5 ms.) The compressed-save shortcut halves writes of
+`Automerge.save()` output; the one-sweep walk halves the walk of
+documents made of many small objects and is a quarter slower on one huge
+text.
+
+`mise run bench-expanded` (SQL, mean of three runs, milliseconds):
+
+| Workload | 3.0 MB before | after | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|---|---|
+| `bytea` → `automerge` of a compressed save | 5199 | 2617 | 341 | 182 | 36.0 | 20.4 |
+| `bytea` → `automerge` of stored bytes | 2594 | 2581 | 178 | 178 | 19.8 | 20.6 |
+| `doc->>'status'` | 2845 | 2816 | 439 | 314 | 44.3 | 32.6 |
+| `jsonb_array_length(doc->'items')` | 2830 | 2840 | 451 | 317 | 46.1 | 32.7 |
+| `merge(doc, c1)::jsonb->>'status'` | 2837 | 2827 | 446 | 320 | 45.5 | 33.9 |
+| 2 merges into `d`, then 10 reads `d->>'status'` | 5117 | 5209 | 2816 | 1541 | 278 | 153 |
+| `merge_agg(doc)::jsonb` over 9 versions | 23583 | 23136 | 1755 | 1629 | 179 | 168 |
+| `UPDATE .. SET doc = merge(doc, c1)` | 5320 | 5246 | 374 | 377 | 39.8 | 41.2 |
+
+The jsonb reads gain from building jsonb directly (no JSON text and
+`jsonb_in`: about 60 ms on the 3 MB and 877 kB documents) and, on the
+list documents, from the one-sweep walk; on the 3 MB text the two
+roughly cancel out.

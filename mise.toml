@@ -18,15 +18,17 @@ description = "Download and build the Postgres version pgrx develops against (~/
 run = "cargo pgrx init --pg{{env.PG_VERSION}} download"
 
 [tasks.test]
-description = "Run core unit tests, #[pg_test] tests in a pgrx-managed Postgres, then the two-session concurrency and LISTEN/NOTIFY tests"
+description = "Run core unit tests, #[pg_test] tests in a pgrx-managed Postgres, then the multi-session scripts (concurrency, LISTEN/NOTIFY, dump/restore, upgrade)"
 # The extension is installed once (a dev build without the pg_test
-# instrumentation) for both multi-session scripts.
+# instrumentation) for all multi-session scripts.
 run = [
   "cargo test -p pg_automerge_core",
   "cargo pgrx test pg{{env.PG_VERSION}}",
   "bash -c 'source tests/lib.sh && install_extension'",
   "PG_AUTOMERGE_INSTALLED=1 bash tests/concurrency.sh",
   "PG_AUTOMERGE_INSTALLED=1 bash tests/notify.sh",
+  "PG_AUTOMERGE_INSTALLED=1 bash tests/dump.sh",
+  "PG_AUTOMERGE_INSTALLED=1 bash tests/upgrade.sh",
 ]
 
 [tasks.regress]
@@ -50,9 +52,40 @@ run = "bash tests/notify.sh"
 description = "Two concurrent psql sessions merging into one row (installs + starts the pgrx Postgres)"
 run = "bash tests/concurrency.sh"
 
+[tasks.dump]
+description = "pg_dump/pg_restore (plain and custom format) and COPY round trips of every object kind (installs + starts the pgrx Postgres)"
+run = "bash tests/dump.sh"
+
+[tasks.upgrade]
+description = "Install every released version's snapshot, ALTER EXTENSION UPDATE, compare the catalog with a fresh install (installs + starts the pgrx Postgres)"
+run = "bash tests/upgrade.sh"
+
+[tasks.replication]
+description = "Logical replication (text and binary) between two databases of a scratch cluster; not part of test"
+run = "bash tests/replication.sh"
+
+[tasks.fuzz]
+description = "Long mutation-fuzzing session of the core entry points (release build); FUZZ_ITERS, FUZZ_SEED, FUZZ_SAVE_DIR"
+run = "FUZZ_ITERS=${FUZZ_ITERS:-200000} cargo test --release -p pg_automerge_core --test fuzz -- --nocapture"
+
 [tasks.bench-expanded]
-description = "Benchmark merge-heavy workloads (PL/pgSQL loops, nested merges, merge_agg) on a release build; not part of test"
+description = "Benchmark SQL workloads (writes, jsonb reads, merges, PL/pgSQL loops, merge_agg) on a release build; not part of test"
 run = "bash tests/bench_expanded.sh"
+
+[tasks.bench-core]
+description = "Rust-level timings of load, normalize, save and the JSON walk on the benchmark documents (release build); not part of test"
+run = "cargo run --release -q -p pg_automerge_core --example bench_core"
+
+[tasks.package]
+description = "Build a release package for Postgres 18 into target/release/pg_automerge-pg18/ and a tarball of it"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+PG_CONFIG="${PG_CONFIG:-$(sed -n 's/^pg18 *= *"\(.*\)"/\1/p' "${PGRX_HOME:-$HOME/.pgrx}/config.toml")}"
+cargo pgrx package --pg-config "$PG_CONFIG"
+tar -C target/release/pg_automerge-pg18 -czf target/release/pg_automerge-pg18.tar.gz .
+echo "target/release/pg_automerge-pg18.tar.gz"
+'''
 
 [tasks.lint]
 description = "rustfmt check, clippy -D warnings for each build configuration, rustdoc -D warnings"
@@ -62,4 +95,12 @@ run = [
   "cargo clippy --workspace --all-targets --features 'pg18 pg_test' --no-default-features -- -D warnings",
   "cargo clippy -p pg_automerge_core --all-targets -- -D warnings",
   "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --workspace --document-private-items",
+]
+
+[tasks.ci]
+description = "Everything CI runs: lint, test (all suites), regress"
+run = [
+  "mise run lint",
+  "mise run test",
+  "mise run regress",
 ]

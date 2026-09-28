@@ -1,0 +1,88 @@
+# Runs exactly what `mise run ci` runs locally: lint, all test suites and
+# the regress tests, against the pgrx-managed Postgres 18.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    # Nightly: also run the benchmarks.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # pgrx builds Postgres from source into ~/.pgrx.
+  PGRX_HOME: /home/runner/.pgrx
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Postgres build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libreadline-dev zlib1g-dev flex bison libicu-dev \
+            libclang-dev clang pkg-config libssl-dev libxml2-dev libxslt1-dev
+          # The runner's own Postgres would take the default port; pgrx
+          # uses 28818, but make sure nothing interferes.
+          sudo systemctl stop postgresql || true
+
+      # Rust (with rustfmt and clippy) and cargo-pgrx, as pinned in
+      # mise.toml. mise.toml puts /usr/bin first on PATH (see its comment).
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+
+      - name: Cache cargo registry, target and the pgrx Postgres
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/.pgrx
+          key: ${{ runner.os }}-pgrx0.19.3-pg18-${{ hashFiles('Cargo.lock', 'mise.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pgrx0.19.3-pg18-
+
+      - name: Initialize pgrx (builds Postgres 18 unless cached)
+        run: |
+          if [ ! -f "$PGRX_HOME/config.toml" ]; then mise run pgrx-init; fi
+
+      - name: Lint, test, regress
+        run: mise run ci
+
+      - name: Benchmarks (nightly only)
+        if: github.event_name == 'schedule'
+        run: |
+          mise run bench-core | tee bench-core.txt
+          BENCH_REPS=2 mise run bench-expanded | tee bench-expanded.txt
+
+      - name: Upload benchmark tables
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: bench-*.txt
+
+      - name: Package (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: mise run package
+
+      - name: Upload package (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_automerge-pg18
+          path: target/release/pg_automerge-pg18.tar.gz

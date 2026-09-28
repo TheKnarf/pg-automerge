@@ -40,7 +40,21 @@ needed. Then, in each database:
 CREATE EXTENSION pg_automerge;
 ```
 
-There are no prebuilt packages yet.
+There are no published packages yet. To build one for another machine,
+use that server's `pg_config` (same Postgres major version, same
+platform):
+
+```sh
+PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package
+# target/release/pg_automerge-pg18.tar.gz mirrors that server's paths
+# (pg_config --pkglibdir and --sharedir/extension), so on the server:
+sudo tar -C / -xzf pg_automerge-pg18.tar.gz
+```
+
+The tarball holds `pg_automerge.so`, `pg_automerge.control`, the install
+script `pg_automerge--<version>.sql` and any upgrade scripts. After
+installing a newer version, run `ALTER EXTENSION pg_automerge UPDATE` in
+each database.
 
 ## Quick start
 
@@ -150,7 +164,7 @@ END;
 ```
 
 On a 3 MB document, merging 20 change sets this way and storing the result
-takes 5.6 s, about two loads of the document in total;
+takes 5.4 s, about two loads of the document in total;
 `merge(merge(merge(doc, a), b), c)`, `merge(...)::jsonb` and
 `merge_agg(...)::jsonb` also skip the intermediate saves and loads. A
 single `UPDATE .. SET doc = merge(doc, $1)` gains nothing (the column
@@ -201,11 +215,11 @@ concurrent values show Automerge's winner. Details in
   `FROM docs, LATERAL (SELECT doc::jsonb AS j OFFSET 0) x` and read
   `x.j->>'a'` (the `OFFSET 0` stops the planner from inlining the cast
   back), or keep the generated jsonb column shown above.
-- **Compressed input costs two loads.** A value that is not already in the
-  stored form (e.g. a compressed `Automerge.save()`) is loaded, re-saved
-  and loaded again to verify it; input in the stored form
-  (`save_nocompress()`, `automerge_changes_bytes`, `doc::bytea`) is loaded
-  once.
+- **Some input costs two loads.** A full save, compressed
+  (`Automerge.save()`) or not (`saveNoCompress()`, `doc::bytea`), is loaded
+  once to validate it. Other input (a save followed by change chunks, a
+  document saved by a different Automerge implementation or version whose
+  encoding differs) is loaded, re-saved and loaded again to verify it.
 - `merge(doc, $1)` with a parameter the driver types as `bytea` uses
   `merge(automerge, bytea)`, which accepts full saves and bare change
   chunks. An *untyped* literal or parameter (`merge(doc, '\x..')`) resolves
@@ -233,11 +247,11 @@ concurrent values show Automerge's winner. Details in
   for a grouped `merge_agg` over many large documents check `EXPLAIN` and
   use `SET enable_hashagg = off` if needed. In-memory merge results (the
   PL/pgSQL example above) are likewise not counted.
-- **Loads are not interruptible.** Loading, merging and converting a
-  single document runs without interrupt checks, so a cancel or
-  `statement_timeout` takes effect only once that call returns (for
-  `merge_agg`, at the next input row). With documents of tens of MB a
-  single call can take a noticeable time.
+- **A load is not interruptible.** The jsonb conversion and the history
+  functions check for interrupts as they go (and `merge_agg` between
+  rows), but a single Automerge load, merge or save runs to the end
+  before a cancel or `statement_timeout` takes effect: 2.5 s for a 3 MB
+  document, longer for documents of tens of MB.
 - Malformed input is always SQLSTATE `22P02` (`invalid automerge document`),
   including input that passes Automerge's checksums but panics its decoder.
   One rare case is reported late: a result of `merge(doc, bytea)` is checked
@@ -263,12 +277,24 @@ concurrent values show Automerge's winner. Details in
   `LIMIT` does not make them cheaper.
 - **Replication.** Physical replication and backups carry the values as
   ordinary bytes, and a hot standby answers every read, but `LISTEN` is not
-  available on a standby: listeners connect to the primary. With logical
-  replication the subscriber needs the extension too; it validates every
-  replicated value again on the way in (one load each), and
-  `automerge_notify()` does not fire there for replicated rows unless the
-  trigger is enabled with `ALTER TABLE .. ENABLE ALWAYS TRIGGER` (or
-  `ENABLE REPLICA`).
+  available on a standby: listeners connect to the primary. Logical
+  replication works in text and binary mode (`tests/replication.sh`) with
+  these caveats:
+  - The subscriber needs the extension, and validates every replicated
+    value again on the way in: one load per row and column (2.5 s for a 3
+    MB document), whichever mode.
+  - Use a primary key (or unique index) as the replica identity. With
+    `REPLICA IDENTITY FULL` the subscriber cannot match rows for `UPDATE`
+    and `DELETE` ("could not identify an equality operator for type
+    automerge": the type has none), and the apply worker fails and retries
+    until the subscription is fixed.
+  - `automerge_notify()` does not fire on the subscriber for replicated
+    rows unless the trigger is enabled with `ALTER TABLE .. ENABLE ALWAYS
+    TRIGGER` (or `ENABLE REPLICA`).
+- **Dump and restore** (`tests/dump.sh`): plain and custom-format dumps
+  restore with the extension in any schema; a restore and `COPY FROM`
+  validate every value (one load each) and recompute stored generated
+  columns (one more conversion each).
 
 ## Performance
 
@@ -277,15 +303,17 @@ document (3,000,000-character text; release build, warm cache):
 
 | Operation | Time |
 |---|---|
-| `Automerge::load` (what `doc::jsonb`, history and most merges pay) | 2.6 s |
+| `Automerge::load` (what `doc::jsonb`, history and most merges pay) | 2.5 s |
+| Writing a save, compressed or not (`$1::automerge`: validation) | 2.6 s (one load) |
+| `doc->>'status'` (load, then jsonb) | 2.8 s |
 | `automerge_heads`, `automerge_change_count` (header only) | 0.3 ms, 2 ms |
 | `merge(doc, x)` when `x` adds nothing | 16 ms (detoasting) |
-| `UPDATE .. SET doc = merge(doc, one change set)` | 5.5 s (load, save, verification load) |
-| PL/pgSQL: merge 20 change sets into a variable, then store | 5.6 s |
+| `UPDATE .. SET doc = merge(doc, one change set)` | 5.2 s (load, save, verification load) |
+| PL/pgSQL: merge 20 change sets into a variable, then store | 5.4 s |
 | `automerge_changes_meta(doc)` / `automerge_changes(doc)` (201 changes) | 2.8 s / 5.1 s |
 
 On an 83 kB document (2,000 list items) the same single-change `UPDATE`
-takes 42 ms. More numbers, and what each function loads, in
+takes 41 ms, and `doc->>'status'` 33 ms. More numbers, and what each function loads, in
 [DESIGN.md](docs/DESIGN.md#performance).
 
 ## Development
@@ -294,12 +322,19 @@ Tooling runs through [mise](https://mise.jdx.dev):
 
 ```sh
 mise run pgrx-init   # once: build the Postgres pgrx develops against
-mise run test        # core unit tests + #[pg_test] tests + the concurrency and notify tests
+mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump and upgrade scripts
 mise run regress     # pg_regress examples in tests/pg_regress (checks their fixtures first)
 mise run lint        # rustfmt, clippy -D warnings (all build configurations), rustdoc
-mise run concurrency # only: two real psql sessions merging into one row, pg_dump round trip
+mise run ci          # lint + test + regress: what CI runs
+mise run concurrency # only: two real psql sessions merging into one row
 mise run notify      # only: a real LISTEN session receiving automerge_notify() payloads
-mise run bench-expanded  # timings of merge-heavy workloads on a release build (minutes)
+mise run dump        # only: pg_dump/pg_restore and COPY round trips of every object kind
+mise run upgrade     # only: ALTER EXTENSION UPDATE from every released version
+mise run replication # logical replication in a scratch cluster (not part of test)
+mise run fuzz        # a long mutation-fuzzing session of the core (not part of test)
+mise run bench-expanded  # SQL timings on a release build (minutes)
+mise run bench-core  # Rust timings of load, normalize and the jsonb walk
+mise run package     # release package for the Postgres of $PG_CONFIG
 mise run run         # install and open psql against the pgrx-managed Postgres
 ```
 

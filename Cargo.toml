@@ -33,6 +33,11 @@ pgrx-tests = "=0.19.3"
 # `cargo test` builds the pg_tests too (cfg(test)); they use its hooks.
 pg_automerge_core = { path = "crates/pg_automerge_core", features = ["test-hooks"] }
 
+# panic = "unwind" is mandatory in every profile: pgrx turns Rust panics
+# into Postgres ERRORs by unwinding to its FFI boundary, and the core's
+# guard() catches Automerge's decoder panics with catch_unwind to report
+# corrupt input as 22P02. With panic = "abort" any panic would kill the
+# backend (and with it the whole server's shared state: a crash restart).
 [profile.dev]
 panic = "unwind"
 
@@ -54,7 +59,12 @@ overflow-checks = false
 debug-assertions = false
 
 [profile.release]
-panic = "unwind"
+panic = "unwind" # mandatory, see [profile.dev]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+# No DWARF debug info in the shipped library (also Cargo's default when
+# `debug` is off; explicit so that turning on `debug` for profiling does not
+# silently ship it), but keep the symbol table ("symbols" would drop it) so
+# backtraces and perf profiles of a production backend stay readable.
+strip = "debuginfo"
