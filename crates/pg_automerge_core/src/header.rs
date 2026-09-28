@@ -323,7 +323,9 @@ const CHANGE_CHUNK: u8 = 1;
 /// its dependencies, read without decoding the change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeChunk {
+    /// The change's hash.
     pub hash: ChangeHash,
+    /// The hashes of the changes it depends on.
     pub deps: Vec<ChangeHash>,
     /// Where the chunk (from its magic bytes to the end of its data) sits
     /// in the input.

@@ -81,6 +81,10 @@ impl LoadedDoc {
 
     /// Load a stored value (validated on its way in); its bytes are kept as
     /// the cached stored bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] if the bytes do not load (a corrupt stored value).
     pub fn from_stored(bytes: &[u8]) -> Result<Self, Error> {
         guard_stored(|| {
             Ok(Self::new(
@@ -94,10 +98,15 @@ impl LoadedDoc {
     /// A document built in memory (its stored bytes are computed when
     /// needed). `unverified`: it contains external changes, see
     /// [`LoadedDoc::stored`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] if Automerge fails reading the document.
     pub fn from_doc(doc: Automerge, unverified: bool) -> Result<Self, Error> {
         guard_stored(|| Ok(Self::new(doc, None, unverified)))
     }
 
+    /// The Automerge document (read-only: a `LoadedDoc` never changes).
     pub fn doc(&self) -> &Automerge {
         &self.doc
     }
@@ -122,6 +131,12 @@ impl LoadedDoc {
     /// once and must keep the heads, otherwise [`Error::InvalidInput`]: the
     /// safeguard of [`crate::normalize`], applied when the bytes are first
     /// needed (to store or send the value) rather than at every merge.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] if a document with unverified external changes
+    /// does not survive the save and load; [`Error::Internal`] if saving
+    /// fails.
     pub fn stored(&self) -> Result<&[u8], Error> {
         if let Some(bytes) = self.stored.get() {
             return Ok(bytes);
@@ -140,7 +155,10 @@ impl LoadedDoc {
 /// An `automerge` argument: stored bytes, or a document already loaded.
 #[derive(Clone, Copy)]
 pub enum Input<'a> {
+    /// Stored bytes (the canonical representation, validated on the way
+    /// in).
     Stored(&'a [u8]),
+    /// A document kept loaded (an expanded value).
     Loaded(&'a LoadedDoc),
 }
 
@@ -155,6 +173,11 @@ impl<'a> Input<'a> {
 
     /// Current heads: from the header of a stored value (no load when it
     /// is a single document chunk), from memory for a loaded one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] if a stored value has to be loaded and does not
+    /// load.
     pub fn heads(&self) -> Result<Cow<'a, [ChangeHash]>, Error> {
         guard_stored(|| self.heads_unguarded())
     }
@@ -189,8 +212,11 @@ impl<'a> Input<'a> {
 /// Result of [`merge`]: one of the inputs unchanged (it already contains
 /// the other), or a new document.
 pub enum MergeOutcome {
+    /// `a` already contains `b`: the result is `a`.
     Left,
+    /// `b` already contains `a`: the result is `b`.
     Right,
+    /// A new document with the changes of both.
     New(Box<LoadedDoc>),
 }
 
@@ -207,6 +233,12 @@ pub enum MergeOutcome {
 /// `a`'s document (a clone of it when `a` is loaded) with `b`'s missing
 /// changes applied, so its stored bytes do not depend on whether the
 /// inputs were stored or loaded.
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored input does not load or applying the
+/// changes fails ([`Error::InvalidInput`] instead when an input holds
+/// unverified external changes).
 pub fn merge(a: Input<'_>, b: Input<'_>) -> Result<MergeOutcome, Error> {
     if a.same(&b) {
         return Ok(MergeOutcome::Left);
@@ -300,10 +332,8 @@ pub(crate) fn merge_from(target: &mut Automerge, other: &Automerge) -> Result<()
 /// may depend on changes `a` already has.
 ///
 /// - Empty `changes`, or nothing new: `None` (use `a` as is).
-/// - Changes whose dependencies are neither in `a` nor in `changes`:
-///   [`Error::InvalidInput`] naming the missing hashes. Nothing orphaned is
-///   ever stored.
-/// - Malformed bytes: [`Error::InvalidInput`], including decoder panics.
+/// - Changes whose dependencies are neither in `a` nor in `changes`: an
+///   error naming the missing hashes. Nothing orphaned is ever stored.
 ///
 /// Bare uncompressed change chunks (what `save_incremental()` /
 /// `save_after()` produce) are parsed one by one (every chunk must parse:
@@ -312,6 +342,12 @@ pub(crate) fn merge_from(target: &mut Automerge, other: &Automerge) -> Result<()
 /// `a ++ changes` takes. Anything else (a save, compressed chunks) is
 /// loaded as `a ++ changes`. Either way the result is marked unverified:
 /// its stored bytes get the save-and-load check when first requested.
+///
+/// # Errors
+///
+/// [`Error::MissingDependencies`] for changes whose dependencies are in
+/// neither `a` nor `changes`; [`Error::InvalidInput`] for malformed bytes
+/// (including decoder panics) and changes Automerge rejects.
 pub fn merge_changes(a: Input<'_>, changes: &[u8]) -> Result<Option<LoadedDoc>, Error> {
     if changes.is_empty() {
         return Ok(None);
@@ -374,7 +410,11 @@ fn has_change(doc: &Automerge, hash: &ChangeHash) -> bool {
 /// change with that hash has exactly those bytes); otherwise by loading
 /// `a ++ changes` (one load, no save). Changes whose dependencies are in
 /// neither input are not in `a`: `false`, where `merge` raises an error.
-/// Malformed input on the loading path is [`Error::InvalidInput`].
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] for malformed `changes` on the loading path;
+/// [`Error::Internal`] if a stored `a` has to be loaded and does not load.
 pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
     if changes.is_empty() {
         return Ok(true);
@@ -397,6 +437,10 @@ pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
 /// Whether `a` has every change of `b` (so `merge(a, b)` is `a`):
 /// `automerge_contains(a, b)`. Decided from the heads when possible,
 /// otherwise from `a`'s history (loading a stored `a`).
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored `a` has to be loaded and does not load.
 pub fn contains(a: Input<'_>, b: Input<'_>) -> Result<bool, Error> {
     if a.same(&b) {
         return Ok(true);
@@ -416,6 +460,10 @@ pub fn contains(a: Input<'_>, b: Input<'_>) -> Result<bool, Error> {
 
 /// Whether `a` has every change of the history ending at `heads` (loads a
 /// stored `a`).
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored `a` does not load.
 pub fn contains_heads(a: Input<'_>, heads: &[ChangeHash]) -> Result<bool, Error> {
     with_doc(a, |doc| Ok(has_all(doc, heads)))
 }
@@ -423,6 +471,11 @@ pub fn contains_heads(a: Input<'_>, heads: &[ChangeHash]) -> Result<bool, Error>
 /// Run `f` on the document of `input`: in place when loaded, otherwise
 /// after loading the stored bytes (errors of `f` on stored values are
 /// internal, as for every read of a stored value).
+///
+/// # Errors
+///
+/// [`Error::Internal`] if a stored `input` does not load, and the errors of
+/// `f`; a panic inside is [`Error::Internal`].
 pub fn with_doc<T>(
     input: Input<'_>,
     f: impl FnOnce(&Automerge) -> Result<T, Error>,

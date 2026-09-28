@@ -36,13 +36,16 @@ pub struct ChangeInfo {
     pub hash: String,
     /// Lowercase hex actor id.
     pub actor: String,
+    /// Sequence number of the change among its actor's changes (1, 2, ...).
     pub seq: u64,
+    /// Counter of the change's first op.
     pub start_op: u64,
     /// Number of ops in the change (0 for an empty change).
     pub op_count: u64,
     /// The change's timestamp as stored: Unix seconds by Automerge's
     /// convention (`CommitOptions::with_time`), 0 when none was set.
     pub time: i64,
+    /// The commit message, if any.
     pub message: Option<String>,
     /// Sorted lowercase hex hashes of the changes this one depends on.
     pub deps: Vec<String>,
@@ -88,6 +91,10 @@ impl ChangeInfo {
 
 /// Parse a change hash given as text: exactly 64 hexadecimal digits, either
 /// case. Anything else is [`Error::InvalidInput`].
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] for anything but 64 hex digits.
 pub fn parse_hash(text: &str) -> Result<ChangeHash, Error> {
     let bytes = text.as_bytes();
     if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
@@ -107,6 +114,10 @@ pub fn parse_hash(text: &str) -> Result<ChangeHash, Error> {
 
 /// Parse a list of change hashes, dropping duplicates. The order of the
 /// result is unspecified.
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] if any text is not 64 hex digits.
 pub fn parse_hashes<S: AsRef<str>>(texts: &[S]) -> Result<Vec<ChangeHash>, Error> {
     let mut hashes = texts
         .iter()

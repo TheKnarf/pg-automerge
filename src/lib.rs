@@ -3,14 +3,18 @@
 //! This crate is the pgrx glue; all Automerge logic lives in
 //! `pg_automerge_core`. See docs/DESIGN.md for the SQL surface and semantics.
 //!
-//! - [`datum`]: the Rust types of `automerge` arguments and results.
-//! - [`expanded`]: expanded (in-memory) `automerge` values.
-//! - [`error`]: raising Postgres errors.
-//! - [`io`]: the type's I/O functions, its SQL, and the casts.
-//! - [`merge`]: `merge`, `||` and `merge_agg`.
-//! - [`introspect`]: `automerge_heads` and `automerge_contains`.
-//! - [`history`]: the change types and history functions.
-//! - [`notify`]: the `automerge_notify()` trigger.
+//! - `datum`: the Rust types of `automerge` arguments and results.
+//! - `expanded`: expanded (in-memory) `automerge` values.
+//! - `error`: raising Postgres errors.
+//! - `io`: the type's I/O functions, its SQL, and the casts.
+//! - `merge`: `merge`, `||` and `merge_agg`.
+//! - `introspect`: `automerge_heads` and `automerge_contains`.
+//! - `history`: the change types and history functions.
+//! - `notify`: the `automerge_notify()` trigger.
+
+// A cdylib: its docs are for developers (built with
+// --document-private-items), so links to private items are fine.
+#![allow(rustdoc::private_intra_doc_links)]
 
 pub mod datum;
 mod error;

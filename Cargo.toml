@@ -30,6 +30,8 @@ pg_automerge_core = { path = "crates/pg_automerge_core" }
 
 [dev-dependencies]
 pgrx-tests = "=0.19.3"
+# `cargo test` builds the pg_tests too (cfg(test)); they use its hooks.
+pg_automerge_core = { path = "crates/pg_automerge_core", features = ["test-hooks"] }
 
 [profile.dev]
 panic = "unwind"

@@ -7,6 +7,8 @@
 //! `automerge` type: the output of [`Automerge::save_nocompress`] for a
 //! document without queued (dependency-less) changes.
 
+#![warn(missing_docs)]
+
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -201,6 +203,13 @@ fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
 /// (seen in fuzzing: "mismatching heads"); storing that would make the value
 /// unreadable forever, so it is rejected here as invalid input instead. This
 /// costs a second load on writes of non-canonical (e.g. compressed) saves.
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] for anything that is not a loadable Automerge
+/// save or change sequence (including decoder panics), for changes with
+/// missing dependencies, and for input that does not survive a save and
+/// load.
 pub fn normalize(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     guard_input(|| {
         let doc = load_external(bytes)?;
@@ -270,6 +279,10 @@ pub(crate) fn stored_heads_unguarded(bytes: &[u8]) -> Result<Vec<ChangeHash>, Er
 }
 
 /// Heads of a stored value (unsorted), without loading it when possible.
+///
+/// # Errors
+///
+/// [`Error::Internal`] if the value has to be loaded and does not load.
 pub fn stored_heads(bytes: &[u8]) -> Result<Vec<ChangeHash>, Error> {
     guard_stored(|| stored_heads_unguarded(bytes))
 }
@@ -424,11 +437,18 @@ pub enum Accumulated<'a> {
 }
 
 impl MergeAccumulator {
+    /// An empty accumulator (nothing added yet).
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add a stored value or a loaded document.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] if a stored value does not load or the merge fails
+    /// ([`Error::InvalidInput`] instead when the input or the state holds
+    /// unverified external changes).
     pub fn add_input(&mut self, input: loaded::Input<'_>) -> Result<(), Error> {
         guard_for(input.unverified(), || self.add_unguarded(input))
     }
@@ -476,6 +496,10 @@ impl MergeAccumulator {
     /// nothing was added to it, otherwise a copy of the merged document
     /// (the state stays usable, since a final function may run more than
     /// once). `None` if nothing was added.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] if copying the merged document fails.
     pub fn finish_loaded(&self) -> Result<Option<Accumulated<'_>>, Error> {
         match (&self.unchanged_first, &self.doc) {
             (Some(bytes), _) => Ok(Some(Accumulated::Stored(bytes))),

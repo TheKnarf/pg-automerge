@@ -53,3 +53,13 @@ run = "bash tests/concurrency.sh"
 [tasks.bench-expanded]
 description = "Benchmark merge-heavy workloads (PL/pgSQL loops, nested merges, merge_agg) on a release build; not part of test"
 run = "bash tests/bench_expanded.sh"
+
+[tasks.lint]
+description = "rustfmt check, clippy -D warnings for each build configuration, rustdoc -D warnings"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy --workspace --all-targets --features 'pg18 pg_test' --no-default-features -- -D warnings",
+  "cargo clippy -p pg_automerge_core --all-targets -- -D warnings",
+  "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --workspace --document-private-items",
+]

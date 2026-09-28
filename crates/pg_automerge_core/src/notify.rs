@@ -26,8 +26,11 @@ pub const MAX_PAYLOAD: usize = 7999;
 /// The row operation that fired the trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
+    /// `INSERT`: a new row.
     Insert,
+    /// `UPDATE`: old and new row.
     Update,
+    /// `DELETE`: the old row.
     Delete,
 }
 
@@ -49,8 +52,11 @@ pub type Heads = Option<Vec<String>>;
 /// UPDATE (the new row), `prev_heads` for UPDATE and DELETE (the old row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
+    /// The column name.
     pub name: String,
+    /// Heads of the new row's value (INSERT, UPDATE).
     pub heads: Option<Heads>,
+    /// Heads of the old row's value (UPDATE, DELETE).
     pub prev_heads: Option<Heads>,
 }
 
@@ -60,6 +66,7 @@ pub struct Column {
 pub struct Event {
     /// Schema-qualified, quoted as needed (`quote_qualified_identifier`).
     pub table: String,
+    /// The operation.
     pub op: Op,
     /// Per-backend event number, increasing with every notification the
     /// backend sends. Kept in every rendered form so that two events of one
@@ -71,6 +78,7 @@ pub struct Event {
     pub key: Vec<(String, String)>,
     /// The old row's key, for an UPDATE that changed it.
     pub old_key: Option<Vec<(String, String)>>,
+    /// The `automerge` columns to report (see [`Column`]).
     pub columns: Vec<Column>,
 }
 

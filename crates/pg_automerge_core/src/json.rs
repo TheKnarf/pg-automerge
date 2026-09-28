@@ -19,6 +19,11 @@ pub const MAX_DEPTH: usize = 1000;
 /// Integers (`Int`, `Uint`, `Counter`) become exact JSON numbers; they never
 /// pass through `f64`. For a key with concurrent conflicting values, the
 /// value Automerge's `get` returns (the conflict winner) is used.
+///
+/// # Errors
+///
+/// [`Error::Internal`] for a document nested deeper than [`MAX_DEPTH`] or
+/// if Automerge fails to read it.
 pub fn doc_to_json(doc: &Automerge) -> Result<Value, Error> {
     doc_to_json_at(doc, None)
 }
@@ -32,6 +37,10 @@ pub fn doc_to_json(doc: &Automerge) -> Result<Value, Error> {
 /// nearest cached clock, so historical reads are somewhat slower than
 /// current ones. Heads equal to the document's current heads take the
 /// current-state path inside Automerge.
+///
+/// # Errors
+///
+/// As [`doc_to_json`].
 pub fn doc_to_json_at(doc: &Automerge, heads: Option<&[ChangeHash]>) -> Result<Value, Error> {
     // Depth-first walk with an explicit stack of containers being filled, so
     // the native stack does not grow with document depth.

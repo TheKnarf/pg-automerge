@@ -20,6 +20,11 @@ pub fn to_hex_literal(bytes: &[u8]) -> String {
 
 /// Decode the `\x<hex>` form produced by [`to_hex_literal`]. Hex digits may
 /// be upper or lower case; anything else is rejected.
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] for anything but `\x` and an even number of hex
+/// digits.
 pub fn from_hex_literal(input: &str) -> Result<Vec<u8>, Error> {
     let hex = input.strip_prefix("\\x").ok_or_else(|| {
         Error::InvalidInput(
