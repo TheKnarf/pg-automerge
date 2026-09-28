@@ -6,3 +6,14 @@
 tests/pg_regress/results
 tests/pg_regress/regression.diffs
 tests/pg_regress/regression.out
+
+# Editors / OS
+.vscode/
+*.swp
+*~
+
+# Local environment
+.env
+.env.*
+mise.local.toml
+*.log

@@ -10,6 +10,7 @@ name = "pg_automerge"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
+license = "MIT"
 description = "Automerge CRDT documents as a native Postgres type: jsonb queries, merges, history and change notifications"
 readme = "README.md"
 keywords = ["postgres", "automerge", "crdt", "pgrx", "jsonb"]

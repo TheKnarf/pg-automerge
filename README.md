@@ -347,4 +347,4 @@ is the pgrx glue. See [DESIGN.md](docs/DESIGN.md#architecture).
 
 ## License
 
-Not decided yet; until a license is chosen, no license is granted.
+MIT — see [LICENSE](LICENSE).
