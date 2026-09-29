@@ -1,6 +1,14 @@
 comment = 'Automerge CRDT documents: jsonb queries, merges, history and change notifications'
 default_version = '@CARGO_VERSION@'
 module_pathname = 'pg_automerge'
-relocatable = false
+# CREATE EXTENSION .. SCHEMA x and ALTER EXTENSION pg_automerge SET SCHEMA y
+# both work: the install script names no schema, and the C code finds its
+# own objects by OID or in the extension's schema, never via search_path.
+# See docs/DESIGN.md, "Installation, schema and privileges".
+relocatable = true
+# Superuser-only, not trusted: the functions are LANGUAGE c, and a small
+# crafted input can make one Automerge load allocate without bound (the
+# Rust allocator aborts the backend on failure, which restarts the whole
+# cluster). A database owner must not be able to expose that on their own.
 superuser = true
 trusted = false

@@ -659,3 +659,19 @@ fn every_extension_object_has_a_comment() {
         assert!(kinds.contains(kind), "{kinds}");
     }
 }
+
+#[pg_test]
+fn type_oid_is_the_extensions_type_whatever_the_search_path() {
+    let ours: pg_sys::Oid = one(
+        "SELECT t.oid FROM pg_type t JOIN pg_extension e ON e.extnamespace = t.typnamespace \
+         WHERE e.extname = 'pg_automerge' AND t.typname = 'automerge'",
+        &[],
+    );
+    // A type of the same name earlier on search_path, and the extension's
+    // schema off it: the Rust types still name the extension's type.
+    Spi::run("CREATE SCHEMA tn_evil; CREATE TYPE tn_evil.automerge AS (x int)").unwrap();
+    Spi::run("SET LOCAL search_path TO tn_evil, pg_catalog").unwrap();
+    assert_eq!(crate::datum::AutomergeValue::type_oid(), ours);
+    assert_eq!(crate::datum::AutomergeDatum::type_oid(), ours);
+    Spi::run("RESET search_path").unwrap();
+}

@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:61
+-- src/io.rs:62
 -- creates:
 --   Type(pg_automerge::io::AutomergeDatum)
 --   Type(pg_automerge::io::AutomergeArg)
@@ -48,6 +48,18 @@ COMMENT ON FUNCTION automerge_send(automerge) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/notify.rs:133
+-- requires:
+--   automerge_type
+
+
+CREATE FUNCTION automerge_notify() RETURNS trigger
+    LANGUAGE c AS 'MODULE_PATHNAME', 'automerge_notify_wrapper';
+COMMENT ON FUNCTION automerge_notify() IS
+    'AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW trigger: automerge_notify(channel, key_column [, ...]) sends NOTIFY channel with the row key and the heads of changed automerge columns.';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/history.rs:16
 -- requires:
 --   automerge_type
@@ -80,18 +92,6 @@ CREATE TYPE automerge_change_meta AS (
 );
 COMMENT ON TYPE automerge_change_meta IS
     'Metadata of one change of an automerge document (no change bytes).';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/notify.rs:143
--- requires:
---   automerge_type
-
-
-CREATE FUNCTION automerge_notify() RETURNS trigger
-    LANGUAGE c AS 'MODULE_PATHNAME', 'automerge_notify_wrapper';
-COMMENT ON FUNCTION automerge_notify() IS
-    'AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW trigger: automerge_notify(channel, key_column [, ...]) sends NOTIFY channel with the row key and the heads of changed automerge columns.';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -148,7 +148,7 @@ AS 'MODULE_PATHNAME', 'automerge_changes_meta_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/introspect.rs:22
+-- src/introspect.rs:24
 -- pg_automerge::introspect::automerge_contains
 CREATE  FUNCTION "automerge_contains"(
 	"a" automerge, /* AutomergeArg */
@@ -160,7 +160,7 @@ AS 'MODULE_PATHNAME', 'automerge_contains_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/introspect.rs:46
+-- src/introspect.rs:63
 -- pg_automerge::introspect::automerge_contains
 CREATE  FUNCTION "automerge_contains"(
 	"a" automerge, /* AutomergeArg */
@@ -172,11 +172,11 @@ AS 'MODULE_PATHNAME', 'automerge_contains_changes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:108
+-- src/io.rs:113
 -- pg_automerge::io::automerge_from_bytea
 CREATE  FUNCTION "automerge_from_bytea"(
 	"bytes" bytea /* & [u8] */
-) RETURNS automerge /* AutomergeDatum */
+) RETURNS automerge /* AutomergeValue */
 IMMUTABLE STRICT PARALLEL SAFE
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'automerge_from_bytea_wrapper';
@@ -209,7 +209,7 @@ AS 'MODULE_PATHNAME', 'automerge_heads_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/introspect.rs:59
+-- src/introspect.rs:81
 -- requires:
 --   automerge_heads
 --   automerge_contains
@@ -225,13 +225,13 @@ COMMENT ON FUNCTION automerge_contains(automerge, bytea) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:18
+-- src/io.rs:19
 -- pg_automerge::io::automerge_in
 -- Skipped due to `#[pgrx(sql = false)]`
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/merge.rs:62
+-- src/merge.rs:77
 -- pg_automerge::merge::automerge_merge_support
 CREATE  FUNCTION "automerge_merge_support"(
 	"request" internal /* Internal */
@@ -242,25 +242,25 @@ AS 'MODULE_PATHNAME', 'automerge_merge_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:28
+-- src/io.rs:29
 -- pg_automerge::io::automerge_out
 -- Skipped due to `#[pgrx(sql = false)]`
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:34
+-- src/io.rs:35
 -- pg_automerge::io::automerge_recv
 -- Skipped due to `#[pgrx(sql = false)]`
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:53
+-- src/io.rs:54
 -- pg_automerge::io::automerge_send
 -- Skipped due to `#[pgrx(sql = false)]`
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:114
+-- src/io.rs:119
 -- pg_automerge::io::automerge_to_jsonb
 CREATE  FUNCTION "automerge_to_jsonb"(
 	"doc" automerge /* AutomergeArg */
@@ -271,7 +271,7 @@ AS 'MODULE_PATHNAME', 'automerge_to_jsonb_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:128
+-- src/io.rs:133
 -- requires:
 --   automerge_type
 --   automerge_from_bytea
@@ -348,7 +348,7 @@ AS 'MODULE_PATHNAME', 'merge_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/merge.rs:40
+-- src/merge.rs:50
 -- pg_automerge::merge::merge
 -- requires:
 --   automerge_merge_support
@@ -362,7 +362,7 @@ AS 'MODULE_PATHNAME', 'merge_bytea_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/merge.rs:106
+-- src/merge.rs:121
 -- requires:
 --   automerge_type
 --   merge
@@ -395,7 +395,7 @@ COMMENT ON OPERATOR || (automerge, bytea) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/merge.rs:177
+-- src/merge.rs:197
 -- pg_automerge::merge::merge_agg_final
 CREATE  FUNCTION "merge_agg_final"(
 	"state" internal /* Internal */
@@ -406,7 +406,7 @@ AS 'MODULE_PATHNAME', 'merge_agg_final_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/merge.rs:142
+-- src/merge.rs:157
 -- pg_automerge::merge::merge_agg_trans
 CREATE  FUNCTION "merge_agg_trans"(
 	"state" internal, /* Internal */
@@ -418,7 +418,7 @@ AS 'MODULE_PATHNAME', 'merge_agg_trans_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/merge.rs:189
+-- src/merge.rs:209
 -- requires:
 --   automerge_type
 --   merge_agg_trans

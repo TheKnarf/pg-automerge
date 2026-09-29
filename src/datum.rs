@@ -19,6 +19,41 @@ use crate::expanded::{
     ExpandedAutomerge, expanded_doc, expanded_object, new_expanded, replace_in_place,
 };
 
+/// The OID of the type `automerge` in schema `namespace`, or
+/// `InvalidOid` if there is none.
+pub(crate) fn automerge_type_in(namespace: pg_sys::Oid) -> pg_sys::Oid {
+    // SAFETY: a plain syscache lookup; the name is a NUL-terminated literal.
+    unsafe {
+        pg_sys::GetSysCacheOid(
+            pg_sys::SysCacheIdentifier::TYPENAMENSP as std::ffi::c_int,
+            pg_sys::Anum_pg_type_oid as pg_sys::AttrNumber,
+            pg_sys::Datum::from(c"automerge".as_ptr()),
+            pg_sys::Datum::from(namespace),
+            pg_sys::Datum::from(0),
+            pg_sys::Datum::from(0),
+        )
+    }
+}
+
+/// The OID of this extension's `automerge` type, looked up in the schema
+/// the extension is installed in (wherever `ALTER EXTENSION .. SET SCHEMA`
+/// moved it), never through `search_path`: a type of the same name in a
+/// schema earlier on the path must not be mistaken for it.
+pub(crate) fn automerge_type_oid() -> pg_sys::Oid {
+    // SAFETY: catalog lookups; the name is a NUL-terminated literal.
+    let namespace = unsafe {
+        let extension = pg_sys::get_extension_oid(c"pg_automerge".as_ptr(), false);
+        pg_sys::get_extension_schema(extension)
+    };
+    let oid = automerge_type_in(namespace);
+    if oid == pg_sys::InvalidOid {
+        crate::error::raise(Error::Internal(
+            "type automerge not found in the schema of extension pg_automerge".into(),
+        ));
+    }
+    oid
+}
+
 /// A new flat value of the SQL `automerge` type, returned by the input
 /// functions and the `bytea` cast: canonical stored bytes (the output of
 /// `save_nocompress()`).
@@ -42,7 +77,7 @@ impl IntoDatum for AutomergeDatum {
     }
 
     fn type_oid() -> pg_sys::Oid {
-        pgrx::regtypein("automerge")
+        automerge_type_oid()
     }
 }
 
@@ -358,7 +393,7 @@ impl IntoDatum for AutomergeValue {
     }
 
     fn type_oid() -> pg_sys::Oid {
-        pgrx::regtypein("automerge")
+        automerge_type_oid()
     }
 }
 

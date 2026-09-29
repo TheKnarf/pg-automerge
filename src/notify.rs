@@ -31,18 +31,8 @@ unsafe extern "C-unwind" {
 /// function `fn_oid` (this extension's schema), so it does not depend on
 /// `search_path`.
 fn automerge_type_in_schema_of(fn_oid: pg_sys::Oid) -> pg_sys::Oid {
-    // SAFETY: plain catalog lookups; the name is a NUL-terminated literal.
-    let oid = unsafe {
-        let nsp = pg_sys::get_func_namespace(fn_oid);
-        pg_sys::GetSysCacheOid(
-            pg_sys::SysCacheIdentifier::TYPENAMENSP as std::ffi::c_int,
-            pg_sys::Anum_pg_type_oid as pg_sys::AttrNumber,
-            pg_sys::Datum::from(c"automerge".as_ptr()),
-            pg_sys::Datum::from(nsp),
-            pg_sys::Datum::from(0),
-            pg_sys::Datum::from(0),
-        )
-    };
+    // SAFETY: a catalog lookup of the trigger's own function.
+    let oid = crate::datum::automerge_type_in(unsafe { pg_sys::get_func_namespace(fn_oid) });
     if oid == pg_sys::InvalidOid {
         raise(Error::Internal(
             "type automerge not found in the schema of automerge_notify()".into(),

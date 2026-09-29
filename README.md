@@ -18,7 +18,8 @@ queryable. [docs/DESIGN.md](docs/DESIGN.md) is the full specification.
 - To build: Rust 1.98 and `cargo-pgrx` 0.19.3 (the exact version of the
   `pgrx` crate), both pinned in `mise.toml`, plus what pgrx needs to build
   against Postgres (a C toolchain, libclang).
-- Installing needs superuser rights (`superuser = true`, not trusted).
+- `CREATE EXTENSION` needs a superuser: the extension is not trusted, see
+  [Install](#install).
 
 ## Install
 
@@ -37,8 +38,29 @@ the same `cargo pgrx install`. No `shared_preload_libraries` entry is
 needed. Then, in each database:
 
 ```sql
-CREATE EXTENSION pg_automerge;
+CREATE EXTENSION pg_automerge;               -- as a superuser
+-- or into a schema of its own (then qualify, or add it to search_path):
+CREATE EXTENSION pg_automerge SCHEMA automerge;
 ```
+
+The extension is relocatable: `ALTER EXTENSION pg_automerge SET SCHEMA x`
+moves it, and tables, domains, views, indexes, generated columns, check
+constraints, triggers and `BEGIN ATOMIC` SQL functions that use it keep
+working (they refer to it by OID). What resolves names at run time does
+not follow: queries, string-bodied SQL and PL/pgSQL functions, and
+`search_path` settings must name the new schema. The `||` operator is
+found only through `search_path` (or as `OPERATOR(x.||)`); the casts work
+regardless.
+
+It is **not trusted** (`trusted = false`): only a superuser can install
+it, not a database owner. The reason is a denial of service: a few kB of
+crafted (or merely compressed, highly repetitive) Automerge input can make
+a single load allocate gigabytes, and a failed Rust allocation aborts the
+backend, which restarts the whole cluster. Anyone who can write to an
+`automerge` column can send such input (see
+[Limitations](#limitations-and-gotchas)), so installing it into a
+database is a superuser's decision. Details in
+[DESIGN.md](docs/DESIGN.md#installation-schema-and-privileges).
 
 There are no published packages yet (tag builds in CI attach a tarball,
 built against the PGDG Postgres 18 on Ubuntu, to the workflow run as an
@@ -281,6 +303,14 @@ Details in
   for a grouped `merge_agg` over many large documents check `EXPLAIN` and
   use `SET enable_hashagg = off` if needed. In-memory merge results (the
   PL/pgSQL example above) are likewise not counted.
+- **Small input, large load.** Automerge input is compressed and
+  run-length encoded: a 4 kB save of a 4,000,000-character text takes
+  4.3 s and 390 MB to load, and memory grows linearly with what the input
+  describes, not with its size. That memory is outside Postgres'
+  accounting, and when an allocation fails the backend aborts and the
+  postmaster restarts every session. There is no size limit yet; let only
+  roles you trust write `automerge` values (input functions and casts
+  cannot be revoked) and keep memory overcommit in mind.
 - **A load is not interruptible.** The jsonb conversion and the history
   functions check for interrupts as they go (and `merge_agg` between
   rows), but a single Automerge load, merge or save runs to the end
@@ -359,7 +389,7 @@ Tooling runs through [mise](https://mise.jdx.dev):
 
 ```sh
 mise run pgrx-init   # once: build the Postgres pgrx develops against
-mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump and upgrade scripts
+mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump, upgrade and extension scripts
 mise run regress     # pg_regress examples in tests/pg_regress (checks their fixtures first)
 mise run lint        # CI/packaging checks, rustfmt, clippy -D warnings (all build configurations), rustdoc
 mise run ci          # lint + test + regress: what CI runs
@@ -367,6 +397,7 @@ mise run concurrency # only: two real psql sessions merging into one row
 mise run notify      # only: a real LISTEN session receiving automerge_notify() payloads
 mise run dump        # only: pg_dump/pg_restore and COPY round trips of every object kind
 mise run upgrade     # only: ALTER EXTENSION UPDATE from every released version
+mise run extension   # only: relocation (SCHEMA, SET SCHEMA, dump), install and setting privileges
 mise run replication # logical replication in a scratch cluster (not part of test)
 mise run fuzz        # a long mutation-fuzzing session of the core (not part of test)
 mise run bench-sql   # median timings of the everyday SQL paths on a release build (minutes)
