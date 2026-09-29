@@ -172,10 +172,12 @@ impl LoadedDoc {
         doc: Automerge,
         input: &[u8],
         scanned: &InputCounts,
+        inflated: Option<Vec<Vec<u8>>>,
         limit: Option<u64>,
     ) -> Result<Self, Error> {
         let saved = doc.save_nocompress();
-        let as_saved = loads_as_saved(input, &saved);
+        let as_saved = loads_as_saved(input, &saved, inflated.as_deref());
+        drop(inflated);
         let counts = match limit {
             Some(_) if as_saved => Some(scanned.first_doc),
             Some(_) => Some(budget::check_saved(&saved, LimitKind::Normalized, limit)?),
@@ -564,13 +566,13 @@ pub fn merge_changes(a: Input<'_>, changes: &[u8]) -> Result<Option<LoadedDoc>, 
             return Ok(None);
         }
         let limit = budget::limit();
-        let scanned = budget::scan_input(changes, limit);
+        let mut scanned = budget::scan_input_keep(changes, limit);
         budget::check_no_bundle(&scanned)?;
         if let Some(chunks) = header::change_chunks(changes) {
             return apply_change_chunks(a, &heads_a, changes, &chunks, &scanned, limit);
         }
         if header::starts_with_document(changes) {
-            match merge_save(a, &heads_a, changes, &scanned, limit)? {
+            match merge_save(a, &heads_a, changes, &mut scanned, limit)? {
                 SaveMerge::Unchanged => return Ok(None),
                 SaveMerge::New(doc) => return Ok(Some(*doc)),
                 SaveMerge::Concatenate => {}
@@ -680,7 +682,7 @@ fn merge_save(
     a: Input<'_>,
     heads_a: &[ChangeHash],
     changes: &[u8],
-    scanned: &InputCounts,
+    scanned: &mut InputCounts,
     limit: Option<u64>,
 ) -> Result<SaveMerge, Error> {
     let chunk = header::document_chunk(changes);
@@ -714,6 +716,10 @@ fn merge_save(
     }
     budget::check_load(scanned, changes, limit)?;
     let b = load_bytes(changes).map_err(invalid_changes)?;
+    // The scan's inflated columns (of a compressed save), held through
+    // the load for the comparison of `from_loaded_input`; dropped on every
+    // other path.
+    let inflated = scanned.inflated_columns.take();
     if ensure_complete(&b).is_err() {
         return Ok(SaveMerge::Concatenate);
     }
@@ -724,9 +730,10 @@ fn merge_save(
     }
     if is_subset(heads_a, &heads_b) || has_all(&b, heads_a) {
         return Ok(SaveMerge::New(Box::new(LoadedDoc::from_loaded_input(
-            b, changes, scanned, limit,
+            b, changes, scanned, inflated, limit,
         )?)));
     }
+    drop(inflated);
     let mut target = match (doc_a, a) {
         (Some(doc), _) => doc,
         (None, Input::Stored(bytes)) => load_stored_unguarded(bytes)?,

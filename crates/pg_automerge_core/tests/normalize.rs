@@ -1,12 +1,14 @@
 //! `normalize` on compressed input: the shortcut that skips the
 //! save-and-load check when the inflated input is the canonical save
-//! (`header::inflate_document`) must give exactly what the general path
-//! gives, and must only be taken when it is sound.
+//! (`header::inflate_document`, or with a limit the columns the load
+//! memory scan already inflated, `header::inflated_document_is`) must
+//! give exactly what the general path gives, and must only be taken when
+//! it is sound.
 
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, Automerge, ObjType, ROOT};
 use pg_automerge_core::header::inflate_document;
-use pg_automerge_core::test_hooks::reload_checks;
+use pg_automerge_core::test_hooks::{reload_checks, set_limit};
 use pg_automerge_core::{Error, normalize};
 
 mod common;
@@ -63,24 +65,30 @@ fn compressed_saves_skip_the_reload_and_match_the_general_path() {
         }
     }
     let mut deflated = 0;
-    for doc in &docs {
-        let canonical = doc.save_nocompress();
-        let compressed = doc.save();
-        let (got, reloaded) = normalize_counted(&compressed);
-        let got = got.unwrap();
-        assert_eq!(got, canonical);
-        assert_eq!(Some(got), reference_normalize(&compressed));
-        if compressed != canonical {
-            deflated += 1;
-            assert_eq!(inflate_document(&compressed), Some(canonical.clone()));
-            assert!(!reloaded, "a compressed save must not be reloaded");
+    // With a limit, the scan's inflated columns are compared; without one
+    // the input is inflated again.
+    for limit in [None, Some(None)] {
+        set_limit(limit);
+        for doc in &docs {
+            let canonical = doc.save_nocompress();
+            let compressed = doc.save();
+            let (got, reloaded) = normalize_counted(&compressed);
+            let got = got.unwrap();
+            assert_eq!(got, canonical);
+            assert_eq!(Some(got), reference_normalize(&compressed));
+            if compressed != canonical {
+                deflated += 1;
+                assert_eq!(inflate_document(&compressed), Some(canonical.clone()));
+                assert!(!reloaded, "a compressed save must not be reloaded");
+            }
+            // Canonical input never reloads either.
+            let (again, reloaded) = normalize_counted(&canonical);
+            assert_eq!(again.unwrap(), canonical);
+            assert!(!reloaded);
         }
-        // Canonical input never reloads either.
-        let (again, reloaded) = normalize_counted(&canonical);
-        assert_eq!(again.unwrap(), canonical);
-        assert!(!reloaded);
     }
-    assert!(deflated >= 5, "only {deflated} saves had deflated columns");
+    set_limit(None);
+    assert!(deflated >= 10, "only {deflated} saves had deflated columns");
 }
 
 #[test]

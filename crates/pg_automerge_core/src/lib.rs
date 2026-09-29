@@ -372,9 +372,9 @@ pub(crate) struct Normalized {
 /// the limit too, so that every stored value fit it when it was written.
 pub(crate) fn normalize_unguarded(bytes: &[u8]) -> Result<Normalized, Error> {
     let limit = budget::limit();
-    let scanned = match limit {
+    let mut scanned = match limit {
         Some(_) => {
-            let counts = budget::scan_input(bytes, limit);
+            let counts = budget::scan_input_keep(bytes, limit);
             budget::check_load(&counts, bytes, limit)?;
             Some(counts)
         }
@@ -383,7 +383,15 @@ pub(crate) fn normalize_unguarded(bytes: &[u8]) -> Result<Normalized, Error> {
     };
     let doc = load_external(bytes)?;
     let saved = doc.save_nocompress();
-    let as_saved = loads_as_saved(bytes, &saved);
+    // The scan's inflated columns, dropped once compared.
+    let as_saved = loads_as_saved(
+        bytes,
+        &saved,
+        scanned
+            .as_mut()
+            .and_then(|s| s.inflated_columns.take())
+            .as_deref(),
+    );
     let counts = match scanned {
         // The input is the save itself (or inflates to it): its counts.
         Some(scanned) if as_saved => Some(scanned.first_doc),
@@ -406,9 +414,18 @@ pub(crate) fn normalize_unguarded(bytes: &[u8]) -> Result<Normalized, Error> {
 /// from `input`) provably parses the bytes the load of `input` already
 /// accepted, so the save-and-load check is not needed: `input` is the
 /// canonical encoding itself, or one compressed document chunk that
-/// inflates to it (see [`normalize`]).
-pub(crate) fn loads_as_saved(input: &[u8], saved: &[u8]) -> bool {
-    saved == input || header::inflate_document(input).as_deref() == Some(saved)
+/// inflates to it (see [`normalize`]). `inflated`: the input's deflated
+/// columns as the load memory scan already inflated them
+/// ([`budget::InputCounts::inflated_columns`]), compared in place instead
+/// of inflating the input again.
+pub(crate) fn loads_as_saved(input: &[u8], saved: &[u8], inflated: Option<&[Vec<u8>]>) -> bool {
+    if saved == input {
+        return true;
+    }
+    match inflated {
+        Some(columns) => header::inflated_document_is(input, columns, saved),
+        None => header::inflate_document(input).as_deref() == Some(saved),
+    }
 }
 
 /// The process-wide switch of the save-and-load check (see

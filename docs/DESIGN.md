@@ -167,10 +167,17 @@ Data flow:
     header. If that equals `save_nocompress()` of the loaded document,
     loading the save parses the very bytes that `Automerge::load(input)`
     already parsed with `VerificationMode::Check`, so it cannot fail or
-    change the heads. The core tests compare this path with the full
-    load-save-load on generated documents, trailing changes, corrupt and
-    non-canonical deflate streams, and the fuzz harness checks it on every
-    input.
+    change the heads. With a load memory limit (the default), the scan
+    that prices the input (see [The scan](#the-scan)) has already inflated
+    those columns with the same decoder, and keeps them through the load:
+    `header::inflated_document_is` compares the save with the input's
+    layout and those columns in place, without inflating the input again
+    or hashing the result (the save's checksum is Automerge's hash of its
+    own data, so equal data means an equal checksum). The core tests
+    compare this path with the full load-save-load on generated
+    documents, trailing changes, corrupt and non-canonical deflate
+    streams, with and without a limit, and the fuzz harness checks it on
+    every input.
 
   Malformed input with valid checksums can load into a document whose
   re-save does not load ("mismatching heads", found by the fuzz harness);
@@ -1331,7 +1338,11 @@ chunk:
   the limit in scan memory, at most, and is reported "at least"). An
   uncompressed chunk is read in place.
 - Columns are counted run by run, never expanded: a run of `n` values is
-  one step whatever `n` is, and literal values are only stepped over.
+  one step whatever `n` is, and literal values are only stepped over,
+  numbers by the last byte of each LEB128 value, eight bytes at a time,
+  strings by their lengths. (An over-long number, at which Automerge's
+  decoders stop, is stepped over like any other: for malformed input the
+  scan can count more rows than Automerge reads, never fewer.)
   Decoding is lenient, as Automerge's streaming decoders are: a run that
   cannot be read ends the column.
 - Gmax is first taken at its upper bound, the chunk's successor entries
@@ -1362,7 +1373,14 @@ chunk:
 The same pass answers whether a single document chunk passes Automerge's
 chunk parse (`header::document_parses`, the condition of the no-op
 answers of `merge(automerge, bytea)` and `automerge_contains`), so those
-paths inflate a compressed save once, as before. Without a limit, input
+paths inflate a compressed save once, as before. A compressed save that
+is loaded (text or binary input, the `bytea` cast, `merge(automerge,
+bytea)` with a save loaded on its own) keeps the columns the scan
+inflated until the normalized save has been compared with them (see
+[Invariants](#invariants)), so it is inflated twice, by the scan and by
+Automerge's load, as it was before the limit (by the load and by the
+comparison); what is held meanwhile is at most the inflated bytes, each
+charged 10 in the estimate. Without a limit, input
 and the `bytea` cast walk only the chunk types (for bundles), merges of
 documents count nothing, and `merge(automerge, bytea)` and
 `automerge_contains(automerge, bytea)` still scan the input (without a
@@ -2470,16 +2488,16 @@ with optimized dependencies, counting allocator; peak / estimate):
 | 200,000 characters of text | 0.20 | 0.20 | 0.57 |
 | 3,000 typed characters (3,000 changes) | 0.40 | 0.40 | 0.41 |
 | 50,000 characters deleted | 0.21 | 0.21 | 0.39 |
-| 40,000 ints prepended to a list | 0.69 | 0.70 | 0.63 |
+| 40,000 ints prepended to a list | 0.69 | 0.71 | 0.63 |
 | 20,000 maps prepended to a list | 0.80 | 0.80 | 0.67 |
-| 40,000 map keys | 0.62 | 0.65 | 0.54 |
+| 40,000 map keys | 0.62 | 0.67 | 0.54 |
 | one key overwritten 40,000 times | 0.10 | 0.10 | 0.45 |
 | one key set and deleted 20,000 times | 0.55 | 0.56 | 0.34 |
 | 5,000 one-op changes | 0.33 | 0.33 | 0.46 |
 | 1,000 actors / 1,000 conflicting forks | 0.30 / 0.38 | 0.31 / 0.41 | 0.43 / 0.43 |
 | 400 actors, then 400 changes of 16 ops | 0.32 | 0.32 | 0.41 |
 | 6,000 characters with 2,000 marks | 0.39 | 0.42 | 0.67 |
-| 1 MB of bytes | 0.49 | 0.61 | 0.69 |
+| 1 MB of bytes | 0.49 | 0.71 | 0.69 |
 
 Crafted chunks (bytes, peak / estimate): a document chunk of 20,000 empty
 changes (77 bytes) 0.71, of 1,000 changes with 1,000 dependencies each (70
@@ -2563,7 +2581,65 @@ text within 1%. So the price of the limit is about 4-6% on writes of
 list-shaped documents of 0.1-1 MB (1-2 ms at 83 kB, 7-15 ms at 877 kB,
 of which the scans of a compressed input and of its normalized result
 account for 5.4 ms; the rest was not attributed), and about 1% on a
-large text, whose columns are few long runs. Not tuned further at this
-stage. Reads are unchanged; a
+large text, whose columns are few long runs. Recovered in the next
+entry. Reads are unchanged; a
 merge of stored values pays the scan of its result (A2, `merge_agg` of
 two versions: 174 → 181 ms at 877 kB, one pair).
+
+### The limit's write cost recovered (2026-09-29)
+
+Profiled with `perf` on an LTO-off symbolized build of the extension
+(backends running I1 and W1-W3 in a loop) and timed piece by piece in
+the core, the write cost of the limit was all in the scans, and the
+unattributed part was the inflation of a compressed save done three
+times: by the scan, by `Automerge::load`, and by `header::inflate_document`
+for the save-and-load shortcut, which also hashed the inflated chunk
+(together 4.1 ms of `normalize`'s 173 ms on the 877 kB list). Two
+changes:
+
+- The scan keeps the columns it inflated for a single compressed save
+  (`budget::scan_input_keep`) and `header::inflated_document_is` compares
+  the normalized save with them in place: 0.19 ms instead of 4.1 ms (on
+  the 3 MB text 0.7 ms instead of 28 ms), so a compressed save is
+  inflated twice, as before the limit. The columns are held through the
+  load, at most the inflated bytes, each charged 10: the compressed saves
+  of the memory battery peak a little higher (1 MB of bytes 0.61 → 0.71
+  of the estimate, 40,000 map keys 0.65 → 0.67), the worst input is still
+  0.80.
+- `column_stats` steps over literal numbers by their LEB128 last bytes,
+  eight bytes at a time, over strings by their lengths without the
+  general decoder, and reads one-byte run headers inline: the scan of the
+  stored 877 kB list takes 0.7 ms instead of 1.7 ms (compressed: 2.6
+  instead of 3.7, most of it the inflation). A unit test checks it
+  against decoding every value on 20,000 generated and corrupted columns.
+
+Interleaved `mise run bench-sql` runs (the 72e8d57 build before the limit,
+the previous commit, this one; median of the per-run medians of 9
+repetitions, six rounds, 3 MB text three rounds of 5; ms) and user-space
+instructions per statement (`perf stat` on the backend, 10-20
+statements):
+
+| case | doc | before the limit | limit | this | instructions: limit | this |
+|---|---|---|---|---|---|---|
+| I1 | 83 kB | 21.4 | 22.4 (+5%) | 21.0 (-2%) | +2.6% | +0.2% |
+| I1 | 877 kB | 203.2 | 207.9 (+2%) | 199.7 (-2%) | +2.4% | +0.0% |
+| I1 | 3 MB | 2745 | 2774 (+1%) | 2740 (-0.2%) | | |
+| W1 | 83 kB | 37.6 | 38.0 (+1%) | 37.7 (+0.4%) | +0.6% | +0.3% |
+| W1 | 877 kB | 361.7 | 367.2 (+2%) | 363.9 (+0.6%) | +0.7% | +0.3% |
+| W1 | 3 MB | 5159 | 5245 (+2%) | 5221 (+1%) | | ±0.0% |
+| W2 | 83 kB | 22.1 | 22.8 (+3%) | 22.4 (+1%) | +2.5% | +0.2% |
+| W2 | 877 kB | 205.4 | 213.2 (+4%) | 204.3 (-0.5%) | +2.4% | +0.1% |
+| W2 | 3 MB | 2770 | 2785 (+0.5%) | 2756 (-0.5%) | | |
+| W3 | 83 kB | 22.1 | 22.7 (+3%) | 22.0 (-0.4%) | +2.5% | +0.2% |
+| W3 | 877 kB | 205.7 | 211.5 (+3%) | 204.2 (-0.8%) | +2.4% | +0.0% |
+| W3 | 3 MB | 2771 | 2771 (0%) | 2755 (-0.6%) | | |
+
+What is left is the scan of the stored document a merge of change
+chunks applies them to (W1, 0.3% of its instructions; its time is within
+the drift, and on the 3 MB text W1 executes the same number of
+instructions as before the limit, ±0.004%, so its +1% is drift too). In
+`bench-core` `Automerge::load` itself, which did not change, varies by
+2-4% between the three binaries (code layout), so its `normalize` is best
+compared net of the load in the same binary: on the 877 kB list a
+compressed save costs 8.2 ms beyond its load before the limit, 13.7 with
+the limit, 7.3 now; a canonical one 2.6, 5.4 and 3.8 (three runs each).

@@ -341,50 +341,10 @@ fn count_rle(column: &[u8]) -> Result<u64, Stop> {
 pub fn inflate_document(bytes: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
 
-    let mut r = Reader {
-        prefix: bytes,
-        total_len: bytes.len(),
-        pos: 0,
-    };
-    let parsed = (|| -> Result<_, Stop> {
-        if r.take(4)? != MAGIC {
-            return Err(Stop::NotSingleDoc);
-        }
-        r.take(4)?; // checksum
-        if r.take(1)?[0] != DOCUMENT_CHUNK {
-            return Err(Stop::NotSingleDoc);
-        }
-        let data_len = r.uleb_usize()?;
-        if r.pos.checked_add(data_len) != Some(r.total_len) {
-            return Err(Stop::NotSingleDoc);
-        }
-        let data_start = r.pos;
-        let actors = r.uleb_usize()?;
-        for _ in 0..actors {
-            let len = r.uleb_usize()?;
-            r.take(len)?;
-        }
-        let heads = r.uleb_usize()?;
-        r.take(heads.checked_mul(32).ok_or(Stop::NotSingleDoc)?)?;
-        let prefix_end = r.pos;
-        let change_cols = column_specs(&mut r)?;
-        let op_cols = column_specs(&mut r)?;
-        Ok((data_start, prefix_end, change_cols, op_cols))
-    })();
-    let (data_start, prefix_end, change_cols, op_cols) = parsed.ok()?;
-    if !change_cols
-        .iter()
-        .chain(&op_cols)
-        .any(|(spec, _)| spec & DEFLATE_BIT != 0)
-    {
-        return None;
-    }
-
-    // Column data, in order: change columns, then op columns.
+    let layout = DocLayout::parse(bytes)?;
     let mut columns = Vec::new();
-    let mut inflated_lens = Vec::with_capacity(change_cols.len() + op_cols.len());
-    for &(spec, len) in change_cols.iter().chain(&op_cols) {
-        let raw = r.take(len).ok()?;
+    let mut inflated_lens = Vec::with_capacity(layout.column_count());
+    for (spec, raw) in layout.columns() {
         let start = columns.len();
         if spec & DEFLATE_BIT != 0 {
             flate2::bufread::DeflateDecoder::new(raw)
@@ -395,21 +355,174 @@ pub fn inflate_document(bytes: &[u8]) -> Option<Vec<u8>> {
         }
         inflated_lens.push(columns.len() - start);
     }
-    let suffix = &bytes[r.pos..];
+    let meta = layout.inflated_metadata(&inflated_lens)?;
+    let mut data =
+        Vec::with_capacity(layout.prefix.len() + meta.len() + columns.len() + layout.suffix.len());
+    data.extend_from_slice(layout.prefix);
+    data.extend_from_slice(&meta);
+    data.extend_from_slice(&columns);
+    data.extend_from_slice(layout.suffix);
+    Some(chunk(DOCUMENT_CHUNK, &data))
+}
 
-    let mut data = Vec::with_capacity(prefix_end - data_start + columns.len() + suffix.len() + 64);
-    data.extend_from_slice(&bytes[data_start..prefix_end]);
-    let mut lens = inflated_lens.into_iter();
-    for cols in [&change_cols, &op_cols] {
-        write_uleb(&mut data, cols.len() as u64);
-        for &(spec, _) in cols {
-            write_uleb(&mut data, spec & !DEFLATE_BIT);
-            write_uleb(&mut data, lens.next()? as u64);
+/// Whether `inflate_document(bytes) == Some(saved)`, given `inflated`, the
+/// deflated columns of `bytes` already inflated in the order they appear
+/// (change columns, then op columns), as the load memory scan inflates
+/// them (`budget::InputCounts::inflated_columns`, with the same decoder
+/// as [`inflate_document`]): nothing is inflated again and nothing is
+/// hashed. `saved`'s checksum is not recomputed: it is Automerge's own
+/// save, whose checksum is the hash of its data, so equal data means an
+/// equal checksum. `false` when `inflated` does not hold exactly one
+/// buffer per deflated column.
+pub fn inflated_document_is(bytes: &[u8], inflated: &[Vec<u8>], saved: &[u8]) -> bool {
+    let Some(layout) = DocLayout::parse(bytes) else {
+        return false;
+    };
+    let mut kept = inflated.iter();
+    let mut pieces: Vec<&[u8]> = Vec::with_capacity(layout.column_count());
+    for (spec, raw) in layout.columns() {
+        if spec & DEFLATE_BIT != 0 {
+            let Some(column) = kept.next() else {
+                return false;
+            };
+            pieces.push(column);
+        } else {
+            pieces.push(raw);
         }
     }
-    data.extend_from_slice(&columns);
-    data.extend_from_slice(suffix);
-    Some(chunk(DOCUMENT_CHUNK, &data))
+    if kept.next().is_some() {
+        return false;
+    }
+    let lens: Vec<usize> = pieces.iter().map(|p| p.len()).collect();
+    let Some(meta) = layout.inflated_metadata(&lens) else {
+        return false;
+    };
+    let data_len =
+        layout.prefix.len() + meta.len() + lens.iter().sum::<usize>() + layout.suffix.len();
+    // The header `chunk` would write, but for the checksum.
+    let mut header = Vec::with_capacity(10);
+    write_uleb(&mut header, data_len as u64);
+    if saved.len() != 9 + header.len() + data_len
+        || saved[..4] != MAGIC
+        || saved[8] != DOCUMENT_CHUNK
+        || saved[9..9 + header.len()] != header
+    {
+        return false;
+    }
+    let mut rest = &saved[9 + header.len()..];
+    [layout.prefix, meta.as_slice()]
+        .into_iter()
+        .chain(pieces)
+        .chain([layout.suffix])
+        .all(|piece| match rest.strip_prefix(piece) {
+            Some(tail) => {
+                rest = tail;
+                true
+            }
+            None => false,
+        })
+}
+
+/// The parts of a single document chunk with at least one deflated
+/// column, as [`inflate_document`] reads them.
+struct DocLayout<'a> {
+    /// The data from its start to the change column metadata (actors,
+    /// heads), copied verbatim.
+    prefix: &'a [u8],
+    change_cols: Vec<(u64, usize)>,
+    op_cols: Vec<(u64, usize)>,
+    /// The raw data of every column, change columns first.
+    column_data: &'a [u8],
+    /// The rest of the chunk (the head indices), copied verbatim.
+    suffix: &'a [u8],
+}
+
+impl<'a> DocLayout<'a> {
+    /// `None` unless `bytes` is exactly one document chunk with at least
+    /// one deflated column whose layout parses.
+    fn parse(bytes: &'a [u8]) -> Option<Self> {
+        let mut r = Reader {
+            prefix: bytes,
+            total_len: bytes.len(),
+            pos: 0,
+        };
+        let parsed = (|| -> Result<_, Stop> {
+            if r.take(4)? != MAGIC {
+                return Err(Stop::NotSingleDoc);
+            }
+            r.take(4)?; // checksum
+            if r.take(1)?[0] != DOCUMENT_CHUNK {
+                return Err(Stop::NotSingleDoc);
+            }
+            let data_len = r.uleb_usize()?;
+            if r.pos.checked_add(data_len) != Some(r.total_len) {
+                return Err(Stop::NotSingleDoc);
+            }
+            let data_start = r.pos;
+            let actors = r.uleb_usize()?;
+            for _ in 0..actors {
+                let len = r.uleb_usize()?;
+                r.take(len)?;
+            }
+            let heads = r.uleb_usize()?;
+            r.take(heads.checked_mul(32).ok_or(Stop::NotSingleDoc)?)?;
+            let prefix_end = r.pos;
+            let change_cols = column_specs(&mut r)?;
+            let op_cols = column_specs(&mut r)?;
+            let columns_start = r.pos;
+            for &(_, len) in change_cols.iter().chain(&op_cols) {
+                r.take(len)?;
+            }
+            Ok((data_start, prefix_end, change_cols, op_cols, columns_start))
+        })();
+        let (data_start, prefix_end, change_cols, op_cols, columns_start) = parsed.ok()?;
+        if !change_cols
+            .iter()
+            .chain(&op_cols)
+            .any(|(spec, _)| spec & DEFLATE_BIT != 0)
+        {
+            return None;
+        }
+        Some(DocLayout {
+            prefix: &bytes[data_start..prefix_end],
+            change_cols,
+            op_cols,
+            column_data: &bytes[columns_start..r.pos],
+            suffix: &bytes[r.pos..],
+        })
+    }
+
+    fn column_count(&self) -> usize {
+        self.change_cols.len() + self.op_cols.len()
+    }
+
+    /// Every column's spec (deflate bit as in the input) and raw data.
+    fn columns(&self) -> impl Iterator<Item = (u64, &'a [u8])> + '_ {
+        let mut data = self.column_data;
+        self.change_cols
+            .iter()
+            .chain(&self.op_cols)
+            .map(move |&(spec, len)| {
+                let (raw, rest) = data.split_at(len);
+                data = rest;
+                (spec, raw)
+            })
+    }
+
+    /// Both metadata blocks rewritten for columns of `lens` bytes (in
+    /// order), the deflate bit cleared.
+    fn inflated_metadata(&self, lens: &[usize]) -> Option<Vec<u8>> {
+        let mut meta = Vec::new();
+        let mut lens = lens.iter();
+        for cols in [&self.change_cols, &self.op_cols] {
+            write_uleb(&mut meta, cols.len() as u64);
+            for &(spec, _) in cols {
+                write_uleb(&mut meta, spec & !DEFLATE_BIT);
+                write_uleb(&mut meta, *lens.next()? as u64);
+            }
+        }
+        Some(meta)
+    }
 }
 
 /// A column metadata block: the (spec, length) of each column. Specs must
@@ -713,6 +826,77 @@ mod tests {
             b[i] ^= 0x5a;
             let _ = inflate_document(&b);
         }
+    }
+
+    #[test]
+    fn compares_the_scans_inflated_columns_like_inflate_document() {
+        let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
+        let text = doc
+            .put_object(ROOT, "text", automerge::ObjType::Text)
+            .unwrap();
+        doc.splice_text(&text, 0, 0, &"compressible ".repeat(200))
+            .unwrap();
+        doc.put(ROOT, "n", 1i64).unwrap();
+        let compressed = doc.save();
+        let plain = doc.document().save_nocompress();
+        let kept = crate::budget::scan_input_keep(&compressed, None)
+            .inflated_columns
+            .expect("the scan keeps the deflated columns");
+        assert!(inflated_document_is(&compressed, &kept, &plain));
+
+        // Any other save: the answer of inflate_document, except that the
+        // checksum is not compared (Automerge's save has the right one).
+        let inflated = inflate_document(&compressed);
+        for i in 0..plain.len() {
+            let mut saved = plain.clone();
+            saved[i] ^= 0x21;
+            let expected = (4..8).contains(&i) || inflated.as_deref() == Some(saved.as_slice());
+            assert_eq!(
+                inflated_document_is(&compressed, &kept, &saved),
+                expected,
+                "byte {i}"
+            );
+        }
+        for saved in [
+            &plain[..plain.len() - 1],
+            &[plain.as_slice(), &[0]].concat()[..],
+            &[][..],
+        ] {
+            assert!(!inflated_document_is(&compressed, &kept, saved));
+        }
+
+        // Not exactly one buffer per deflated column, or a different one.
+        let mut fewer = kept.clone();
+        fewer.pop();
+        assert!(!inflated_document_is(&compressed, &fewer, &plain));
+        let mut more = kept.clone();
+        more.push(Vec::new());
+        assert!(!inflated_document_is(&compressed, &more, &plain));
+        let mut changed = kept.clone();
+        changed[0][0] ^= 1;
+        assert!(!inflated_document_is(&compressed, &changed, &plain));
+        assert!(!inflated_document_is(&plain, &kept, &plain));
+
+        // Kept only for exactly one document chunk with deflated columns,
+        // scanned to its end.
+        let scan = crate::budget::scan_input_keep;
+        assert_eq!(scan(&plain, None).inflated_columns, None);
+        assert_eq!(scan(&compressed, None).inflated_columns, Some(kept.clone()));
+        assert_eq!(
+            crate::budget::scan_input(&compressed, None).inflated_columns,
+            None
+        );
+        let heads = doc.get_heads();
+        doc.put(ROOT, "m", 2i64).unwrap();
+        let trailing = [compressed.as_slice(), &doc.save_after(&heads)].concat();
+        assert_eq!(scan(&trailing, None).inflated_columns, None);
+        assert_eq!(
+            scan(&compressed[..compressed.len() - 1], None).inflated_columns,
+            None
+        );
+        // Over a tenth of a limit of 1 kB inflated: stopped, nothing kept.
+        assert!(scan(&compressed, Some(1024)).truncated);
+        assert_eq!(scan(&compressed, Some(1024)).inflated_columns, None);
     }
 
     #[test]

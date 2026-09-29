@@ -373,6 +373,13 @@ pub struct InputCounts {
     /// Gmax of some document chunk is its upper bound (the chunk's
     /// successor entries), not computed exactly (see [`scan_input`]).
     pub gmax_bounded: bool,
+    /// For input that is one document chunk with deflated columns, scanned
+    /// by [`scan_input_keep`] to the end: those columns as the scan
+    /// inflated them, in order, so that the normalized save can be
+    /// compared with the input's inflated form without inflating it again
+    /// ([`crate::header::inflated_document_is`]). Held while the input is
+    /// loaded: at most the inflated bytes, each charged 10 bytes.
+    pub inflated_columns: Option<Vec<Vec<u8>>>,
 }
 
 impl InputCounts {
@@ -843,6 +850,69 @@ impl<'a> Reader<'a> {
         Some(value)
     }
 
+    /// Step over up to `n` LEB128 values without decoding them: each ends
+    /// at the first byte with the high bit clear, found eight bytes at a
+    /// time. Returns how many were stepped over (fewer only at the end of
+    /// the data, where a value without its last byte is not counted).
+    /// Unlike [`Self::uleb`] it does not stop at a value longer than ten
+    /// bytes, so it can count more values than decoding would, never fewer.
+    fn skip_lebs(&mut self, n: u64) -> u64 {
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        let rest = &self.bytes[self.pos..];
+        let mut left = n;
+        let mut i = 0;
+        // A whole word is stepped over only when it ends fewer values than
+        // are left: its trailing bytes then belong to a value still to
+        // step over, not to what follows the run.
+        while left > 8 {
+            let Some(word) = rest.get(i..i + 8) else {
+                break;
+            };
+            let word = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+            let ends = u64::from((!word & HIGH).count_ones());
+            if ends >= left {
+                break;
+            }
+            left -= ends;
+            i += 8;
+        }
+        while left > 0 && i < rest.len() {
+            if rest[i] & 0x80 == 0 {
+                left -= 1;
+            }
+            i += 1;
+        }
+        if left > 0 {
+            // A value cut off by the end of the data: not counted.
+            self.pos = self.bytes.len();
+        } else {
+            self.pos += i;
+        }
+        n - left
+    }
+
+    /// Step over up to `n` length-prefixed strings; returns how many (a
+    /// string that cannot be read ends it, as in [`Runs::value`]).
+    fn skip_strings(&mut self, n: u64) -> u64 {
+        for done in 0..n {
+            // One-byte lengths (below 128) inline, others decoded.
+            let len = match self.bytes.get(self.pos) {
+                Some(&b) if b < 0x80 => {
+                    self.pos += 1;
+                    usize::from(b)
+                }
+                _ => match self.uleb().and_then(|l| usize::try_from(l).ok()) {
+                    Some(len) => len,
+                    None => return done,
+                },
+            };
+            if self.take(len).is_none() {
+                return done;
+            }
+        }
+        n
+    }
+
     fn usize_c(&mut self) -> Option<usize> {
         usize::try_from(self.uleb_c()?).ok()
     }
@@ -1037,9 +1107,11 @@ struct ColumnStats {
 }
 
 /// Rows of a column, and for a group column the sum of its values: run
-/// by run, reading literal values only to step over them (a group's are
-/// summed). Lenient like [`Runs`]: anything that cannot be read ends the
-/// column.
+/// by run. Literal values are only stepped over: numbers by their LEB128
+/// last bytes, eight bytes at a time ([`Reader::skip_lebs`]), strings by
+/// their lengths; a group's are summed. Lenient like [`Runs`]: anything
+/// that cannot be read ends the column (except an over-long literal
+/// number, which is stepped over like any other: more rows, never fewer).
 fn column_stats(ty: u64, data: &[u8], ticker: &mut Ticker) -> ColumnStats {
     let mut stats = ColumnStats::default();
     let mut r = Reader::new(data);
@@ -1055,38 +1127,54 @@ fn column_stats(ty: u64, data: &[u8], ticker: &mut Ticker) -> ColumnStats {
         }
         _ => {}
     }
-    // One value: its number for a group column, 0 otherwise.
-    let value = |r: &mut Reader<'_>| -> Option<u64> {
-        match ty {
-            STRING => {
-                let len = usize::try_from(r.uleb()?).ok()?;
-                r.take(len)?;
-                Some(0)
-            }
-            DELTA => r.sleb().map(|_| 0),
-            GROUP => r.uleb(),
-            _ => r.uleb().map(|_| 0),
+    // Step over `n` values that do not matter; returns how many.
+    let skip = |r: &mut Reader<'_>, n: u64| {
+        if ty == STRING {
+            r.skip_strings(n)
+        } else {
+            r.skip_lebs(n)
         }
     };
     'runs: while !r.done() {
         ticker.tick();
-        let Some(n) = r.sleb() else { break };
-        if n > 0 {
-            let Some(v) = value(&mut r) else { break };
-            let n = n.unsigned_abs();
-            stats.rows = stats.rows.saturating_add(n);
-            stats.sum = stats.sum.saturating_add(n.saturating_mul(v));
-        } else if n < 0 {
-            for _ in 0..n.unsigned_abs() {
-                let Some(v) = value(&mut r) else {
-                    break 'runs;
-                };
-                stats.rows = stats.rows.saturating_add(1);
-                stats.sum = stats.sum.saturating_add(v);
+        // A one-byte positive run length inline, anything else decoded.
+        let n = match r.bytes.get(r.pos) {
+            Some(&b) if b < 0x40 => {
+                r.pos += 1;
+                i64::from(b)
             }
-        } else {
+            _ => {
+                let Some(n) = r.sleb() else { break };
+                n
+            }
+        };
+        let len = n.unsigned_abs();
+        if n == 0 {
+            // A null run.
             let Some(k) = r.uleb() else { break };
             stats.rows = stats.rows.saturating_add(k);
+        } else if ty == GROUP {
+            // Group sizes, summed.
+            let values = if n > 0 { 1 } else { len };
+            for _ in 0..values {
+                let Some(v) = r.uleb() else { break 'runs };
+                let rows = if n > 0 { len } else { 1 };
+                stats.rows = stats.rows.saturating_add(rows);
+                stats.sum = stats.sum.saturating_add(rows.saturating_mul(v));
+            }
+        } else if n > 0 {
+            // A repeat run: one value.
+            if skip(&mut r, 1) == 0 {
+                break;
+            }
+            stats.rows = stats.rows.saturating_add(len);
+        } else {
+            // A literal run.
+            let stepped = skip(&mut r, len);
+            stats.rows = stats.rows.saturating_add(stepped);
+            if stepped < len {
+                break;
+            }
         }
     }
     stats
@@ -1123,6 +1211,10 @@ struct Scanner {
     exact_gmax: bool,
     /// Some Gmax was taken at its bound.
     gmax_bounded: bool,
+    /// Keep the inflated columns of the next document chunk in `kept`.
+    keep: bool,
+    /// The inflated columns of the first document chunk (when `keep`).
+    kept: Vec<Vec<u8>>,
     ticker: Ticker,
 }
 
@@ -1136,6 +1228,8 @@ impl Scanner {
             actors: HashSet::new(),
             exact_gmax,
             gmax_bounded: false,
+            keep: false,
+            kept: Vec::new(),
             ticker: Ticker::default(),
         }
     }
@@ -1306,6 +1400,21 @@ impl Scanner {
             self.gmax_bounded = true;
             succ
         };
+        if std::mem::take(&mut self.keep) {
+            self.kept = change_cols
+                .into_iter()
+                .chain(op_cols)
+                .filter_map(|c| match c.data {
+                    // Held through the load: no spare capacity (what is
+                    // held is exactly the inflated bytes, each charged).
+                    Cow::Owned(mut data) => {
+                        data.shrink_to_fit();
+                        Some(data)
+                    }
+                    Cow::Borrowed(_) => None,
+                })
+                .collect();
+        }
         Ok(layout && r.canonical)
     }
 
@@ -1506,17 +1615,24 @@ fn gmax(cols: &[Column<'_>], rows: u64, ticker: &mut Ticker) -> u64 {
 /// checks rescan exactly ([`scan_input_exact`]) when that bound is what
 /// puts an estimate over the limit. Never fails and never panics.
 pub fn scan_input(bytes: &[u8], limit: Option<u64>) -> InputCounts {
-    scan(bytes, limit, false)
+    scan(bytes, limit, false, false)
 }
 
 /// [`scan_input`] with Gmax computed exactly (merging the object, key,
 /// insert and successor columns run by run).
 pub fn scan_input_exact(bytes: &[u8], limit: Option<u64>) -> InputCounts {
-    scan(bytes, limit, true)
+    scan(bytes, limit, true, false)
 }
 
-fn scan(bytes: &[u8], limit: Option<u64>, exact_gmax: bool) -> InputCounts {
+/// [`scan_input`], also keeping the inflated columns of input that is one
+/// document chunk with deflated columns ([`InputCounts::inflated_columns`]).
+pub fn scan_input_keep(bytes: &[u8], limit: Option<u64>) -> InputCounts {
+    scan(bytes, limit, false, true)
+}
+
+fn scan(bytes: &[u8], limit: Option<u64>, exact_gmax: bool, keep: bool) -> InputCounts {
     let mut scanner = Scanner::new(limit, exact_gmax);
+    scanner.keep = keep;
     let mut counts = InputCounts::default();
     let mut r = Reader::new(bytes);
     let mut chunks = 0usize;
@@ -1536,6 +1652,8 @@ fn scan(bytes: &[u8], limit: Option<u64>, exact_gmax: bool) -> InputCounts {
             break;
         };
         chunks += 1;
+        // Only the first chunk's columns are kept.
+        scanner.keep &= chunks == 1;
         // Header bytes, and the chunk's data as it is (deflated columns
         // are counted inflated instead when they are inflated).
         scanner.count(data.len() as u64 + 20);
@@ -1606,6 +1724,9 @@ fn scan(bytes: &[u8], limit: Option<u64>, exact_gmax: bool) -> InputCounts {
         && !counts.malformed
         && !counts.truncated
         && counts.later_docs == DocCounts::default();
+    if chunks == 1 && !counts.malformed && !counts.truncated && !scanner.kept.is_empty() {
+        counts.inflated_columns = Some(scanner.kept);
+    }
     counts
 }
 
@@ -1753,4 +1874,206 @@ pub fn gmax_by_rows(bytes: &[u8]) -> Option<u64> {
         best = best.max(cur);
     }
     Some(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`column_stats`] as it decoded every value before literal values
+    /// were stepped over by their last bytes: the reference.
+    fn column_stats_decoding(ty: u64, data: &[u8]) -> ColumnStats {
+        let mut stats = ColumnStats::default();
+        let mut r = Reader::new(data);
+        match ty {
+            VALUE => return stats,
+            BOOLEAN => {
+                while !r.done() {
+                    let Some(n) = r.uleb() else { break };
+                    stats.rows = stats.rows.saturating_add(n);
+                }
+                return stats;
+            }
+            _ => {}
+        }
+        let value = |r: &mut Reader<'_>| -> Option<u64> {
+            match ty {
+                STRING => {
+                    let len = usize::try_from(r.uleb()?).ok()?;
+                    r.take(len)?;
+                    Some(0)
+                }
+                DELTA => r.sleb().map(|_| 0),
+                GROUP => r.uleb(),
+                _ => r.uleb().map(|_| 0),
+            }
+        };
+        'runs: while !r.done() {
+            let Some(n) = r.sleb() else { break };
+            if n > 0 {
+                let Some(v) = value(&mut r) else { break };
+                let n = n.unsigned_abs();
+                stats.rows = stats.rows.saturating_add(n);
+                stats.sum = stats.sum.saturating_add(n.saturating_mul(v));
+            } else if n < 0 {
+                for _ in 0..n.unsigned_abs() {
+                    let Some(v) = value(&mut r) else {
+                        break 'runs;
+                    };
+                    stats.rows = stats.rows.saturating_add(1);
+                    stats.sum = stats.sum.saturating_add(v);
+                }
+            } else {
+                let Some(k) = r.uleb() else { break };
+                stats.rows = stats.rows.saturating_add(k);
+            }
+        }
+        stats
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        /// A number of 0 to 64 bits (small ones more often).
+        fn number(&mut self) -> u64 {
+            let bits = [1, 6, 7, 8, 13, 14, 20, 32, 63, 64][self.below(10) as usize];
+            self.next() >> (64 - bits)
+        }
+    }
+
+    fn uleb(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    fn sleb(out: &mut Vec<u8>, mut v: i64) {
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0) {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// A well-formed column of type `ty`: repeat, literal and null runs.
+    fn column(rng: &mut Rng, ty: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let value = |rng: &mut Rng, out: &mut Vec<u8>| match ty {
+            STRING => {
+                let len = [0, 1, 5, 127, 128, 300][rng.below(6) as usize];
+                uleb(out, len);
+                out.extend((0..len).map(|i| i as u8));
+            }
+            DELTA => sleb(out, rng.number() as i64),
+            GROUP => uleb(out, rng.below(40)),
+            _ => uleb(out, rng.number()),
+        };
+        for _ in 0..rng.below(60) {
+            let len = 1 + [rng.below(3), rng.below(20), rng.number() >> 1][rng.below(3) as usize];
+            let len = len.min(if ty == GROUP { 1 << 20 } else { 1 << 40 });
+            match rng.below(3) {
+                0 => {
+                    sleb(&mut out, len as i64);
+                    value(rng, &mut out);
+                }
+                1 => {
+                    let len = len.min(40);
+                    sleb(&mut out, -(len as i64));
+                    for _ in 0..len {
+                        value(rng, &mut out);
+                    }
+                }
+                _ => {
+                    sleb(&mut out, 0);
+                    uleb(&mut out, len);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn column_stats_steps_over_literals_like_decoding_them() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut ticker = Ticker::default();
+        for i in 0..20_000 {
+            let ty = [GROUP, 1, 2, DELTA, BOOLEAN, STRING, 6][rng.below(7) as usize];
+            let mut data = column(&mut rng, ty);
+            let well_formed = i % 2 == 0;
+            if !well_formed {
+                // Corrupted: bytes flipped, cut off, or garbage appended.
+                match rng.below(3) {
+                    0 if !data.is_empty() => {
+                        for _ in 0..1 + rng.below(4) {
+                            let at = rng.below(data.len() as u64) as usize;
+                            data[at] = rng.next() as u8;
+                        }
+                    }
+                    1 => data.truncate(rng.below(data.len() as u64 + 1) as usize),
+                    _ => data.extend((0..rng.below(40)).map(|_| rng.next() as u8)),
+                }
+            }
+            let fast = column_stats(ty, &data, &mut ticker);
+            let reference = column_stats_decoding(ty, &data);
+            if well_formed || ty == GROUP || ty == STRING || ty == BOOLEAN {
+                assert_eq!(
+                    (fast.rows, fast.sum),
+                    (reference.rows, reference.sum),
+                    "column {i} of type {ty}: {data:?}"
+                );
+            } else {
+                // Only an over-long number (which decoding stops at) can
+                // make it count more; never fewer.
+                assert!(fast.rows >= reference.rows, "column {i}: {data:?}");
+                assert_eq!(fast.sum, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn skip_lebs_stops_after_the_last_value() {
+        // Values of 1 to 10 bytes packed back to back, then a marker byte:
+        // stepping over all of them lands exactly on the marker, whatever
+        // the word boundaries.
+        for lens in [&[1usize; 20][..], &[2; 9], &[10, 1, 3, 8, 8, 1, 1, 9, 2]] {
+            for pad in 0..9 {
+                let mut data = vec![0x7f; pad];
+                for &len in lens {
+                    data.extend(std::iter::repeat_n(0x80, len - 1));
+                    data.push(0x01);
+                }
+                data.push(0xaa);
+                let mut r = Reader::new(&data);
+                assert_eq!(r.skip_lebs(pad as u64), pad as u64);
+                assert_eq!(r.skip_lebs(lens.len() as u64), lens.len() as u64);
+                assert_eq!(r.bytes[r.pos], 0xaa, "{lens:?} after {pad}");
+                // Asking for more than there are: the cut-off value is not
+                // counted, and the reader is at the end.
+                let mut r = Reader::new(&data[pad..]);
+                assert_eq!(r.skip_lebs(lens.len() as u64 + 5), lens.len() as u64);
+                assert!(r.done());
+            }
+        }
+    }
 }

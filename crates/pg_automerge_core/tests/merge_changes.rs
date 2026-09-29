@@ -502,8 +502,14 @@ fn full_saves_load_once_when_they_contain_the_document() {
     let newer_stored = stored(&mut newer);
 
     // A newer save, compressed or canonical: one load (the save), no
-    // check, and the result is the save's own stored bytes.
-    for input in [newer.save(), newer_stored.clone()] {
+    // check, and the result is the save's own stored bytes; with a limit
+    // (the scan's inflated columns compared) and without one (inflated
+    // again).
+    for (limit, input) in [None, Some(None)]
+        .into_iter()
+        .flat_map(|limit| [(limit, newer.save()), (limit, newer_stored.clone())])
+    {
+        pg_automerge_core::test_hooks::set_limit(limit);
         let checks = reload_checks();
         let (got, n) = loads_of(|| loaded::merge_changes(Input::Stored(&a), &input).unwrap());
         let got = got.expect("new changes");
@@ -518,6 +524,7 @@ fn full_saves_load_once_when_they_contain_the_document() {
         assert_eq!(n, 1);
         assert_eq!(got.unwrap().cached_stored(), Some(newer_stored.as_slice()));
     }
+    pg_automerge_core::test_hooks::set_limit(None);
     // The document's own save, or one it contains: the header decides
     // (no load), or `a` is loaded first because the save has fewer
     // changes (one load, never the save).
