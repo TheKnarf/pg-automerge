@@ -488,3 +488,115 @@ fn verification_can_be_switched_off() {
     set_verification(None);
     assert!(pg_automerge_core::verification_enabled());
 }
+
+/// A document chunk whose header lists heads the stored document has, but
+/// whose body Automerge's chunk parser rejects, is malformed input (22P02),
+/// not a no-op: a load of `a ++ bytes` fails on it too (Automerge skips
+/// only the reconstruction of a known chunk, not its parsing). A chunk
+/// that does parse is decided from its header, as that load decides it.
+#[test]
+fn saves_with_known_heads_and_malformed_bodies_are_rejected() {
+    use pg_automerge_core::contains_input_by_header;
+    use pg_automerge_core::header::document_parses;
+    use pg_automerge_core::loaded::{self, Input, LoadedDoc};
+
+    let mut doc = AutoCommit::new().with_actor(actor(1));
+    doc.put(ROOT, "x", 1i64).unwrap();
+    doc.commit();
+    let a = stored(&mut doc);
+    let head = doc.get_heads()[0];
+    let loaded_a = LoadedDoc::from_stored(&a).unwrap();
+    // A chunk's data: after magic, checksum, type and the LEB128 length.
+    let data_of = |bytes: &[u8]| -> Vec<u8> {
+        let mut pos = 9;
+        while bytes[pos] & 0x80 != 0 {
+            pos += 1;
+        }
+        bytes[pos + 1..].to_vec()
+    };
+    let data_a = data_of(&a);
+    // Header of a chunk with no actors and `head` as its only head.
+    let known = |rest: &[u8]| -> Vec<u8> {
+        let mut data = vec![0x00, 0x01];
+        data.extend_from_slice(&head.0);
+        data.extend_from_slice(rest);
+        common::chunk(0, &data)
+    };
+
+    let malformed = [
+        // The review's probe: garbage after the heads.
+        (
+            "garbage columns",
+            known(&[0xff, 0xff, 0xff, 0xff, 0x01, 0x02]),
+        ),
+        // Valid save data with a byte after the head indices.
+        (
+            "leftover data",
+            common::chunk(0, &[data_a.as_slice(), &[0]].concat()),
+        ),
+        // Overlong LEB128 for the actor count.
+        (
+            "overlong leb128",
+            common::chunk(0, &[&[data_a[0] | 0x80, 0x00][..], &data_a[1..]].concat()),
+        ),
+        // A deflated change column that does not inflate.
+        (
+            "bad deflate",
+            known(&[0x01, 0x09, 0x02, 0x00, 0xff, 0xff, 0x00]),
+        ),
+        // A value column without its metadata column.
+        ("lone value column", known(&[0x01, 0x57, 0x00, 0x00, 0x00])),
+        // Columns out of order.
+        (
+            "out of order",
+            known(&[0x02, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]),
+        ),
+        // A truncated head index.
+        ("truncated head index", known(&[0x00, 0x00, 0x80])),
+    ];
+    for (what, bad) in &malformed {
+        assert!(
+            Automerge::load(&[a.as_slice(), bad].concat()).is_err(),
+            "{what}: Automerge should reject it"
+        );
+        assert!(!document_parses(bad), "{what}");
+        assert_eq!(
+            contains_input_by_header(&stored_heads(&a).unwrap(), || Some(1), bad),
+            None,
+            "{what}"
+        );
+        invalid(merge_changes(&a, bad));
+        assert!(
+            matches!(
+                loaded::merge_changes(Input::Loaded(&loaded_a), bad),
+                Err(Error::InvalidInput(_))
+            ),
+            "{what}"
+        );
+        assert!(
+            matches!(contains_changes(&a, bad), Err(Error::InvalidInput(_))),
+            "{what}"
+        );
+        assert!(
+            matches!(
+                loaded::contains_changes(Input::Loaded(&loaded_a), bad),
+                Err(Error::InvalidInput(_))
+            ),
+            "{what}"
+        );
+    }
+
+    // A chunk Automerge does accept on top of `a` (no columns, one head
+    // index): decided from its header, as the load decides it.
+    let empty_body = known(&[0x00, 0x00, 0x00]);
+    assert!(Automerge::load(&[a.as_slice(), &empty_body].concat()).is_ok());
+    assert!(document_parses(&empty_body));
+    assert_eq!(merge_changes(&a, &empty_body).unwrap(), None);
+    assert!(contains_changes(&a, &empty_body).unwrap());
+    // And the document's own saves.
+    for save in [a.clone(), doc.save()] {
+        assert!(document_parses(&save));
+        assert_eq!(merge_changes(&a, &save).unwrap(), None);
+        assert!(contains_changes(&a, &save).unwrap());
+    }
+}

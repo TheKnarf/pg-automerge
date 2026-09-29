@@ -479,9 +479,12 @@ enum SaveMerge {
 /// like `merge(a, b)` of two documents, cheapest checks first (unguarded):
 ///
 /// 1. Exactly one document chunk with a valid checksum whose header heads
-///    are all in `a` (heads of `a`, or changes of a loaded `a`): `a`
+///    are all in `a` (heads of `a`, or changes of a loaded `a`) and that
+///    passes Automerge's chunk parse ([`header::document_parses`]): `a`
 ///    unchanged, nothing loaded. This is what a load of `a ++ changes`
-///    decides from the same header (Automerge skips such a chunk).
+///    decides: it parses such a chunk and skips only reconstructing its
+///    changes (see [`header::document_chunk`]). A chunk that does not
+///    parse goes on to step 3, whose load rejects it.
 /// 2. If the header says the save has no more changes than a stored `a`
 ///    (an older save, probably contained in `a`), `a` is loaded first and
 ///    checked for those heads, again as that load would.
@@ -498,13 +501,14 @@ enum SaveMerge {
 /// no check.
 fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<SaveMerge, Error> {
     let chunk = header::document_chunk(changes);
+    // Whether the chunk parses, checked once and only before a header
+    // answer (it inflates any deflated columns).
+    let mut parsed = None;
+    let mut parses = || *parsed.get_or_insert_with(|| header::document_parses(changes));
     if let Some(chunk) = &chunk {
-        if is_subset(&chunk.heads, heads_a) {
-            return Ok(SaveMerge::Unchanged);
-        }
-        if let Input::Loaded(loaded) = a
-            && has_all(loaded.doc(), &chunk.heads)
-        {
+        let known = is_subset(&chunk.heads, heads_a)
+            || matches!(a, Input::Loaded(loaded) if has_all(loaded.doc(), &chunk.heads));
+        if known && parses() {
             return Ok(SaveMerge::Unchanged);
         }
     }
@@ -513,6 +517,7 @@ fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<Sa
         && let (Some(count), Some(count_a)) =
             (chunk.change_count, header::change_count_from_bytes(bytes))
         && count <= count_a
+        && parses()
     {
         let doc = load_stored_unguarded(bytes)?;
         if has_all(&doc, &chunk.heads) {
@@ -566,9 +571,13 @@ fn has_change(doc: &Automerge, hash: &ChangeHash) -> bool {
 /// Decided by [`crate::contains_changes_by_heads`] when possible; for a
 /// loaded `a` and bare change chunks by a lookup of each chunk's hash (a
 /// change with that hash has exactly those bytes); for a single document
-/// chunk (a save) by whether `a` has the heads in its header (loading a
-/// stored `a`, never the save: what a load of `a ++ changes` decides from
-/// the same header); otherwise by loading `a ++ changes` (one load, no
+/// chunk (a save) by its header's change count (`false` when it lists at
+/// least as many changes as a stored `a` has, and other heads), else, if
+/// it passes Automerge's chunk parse, by whether `a` has the heads in its
+/// header (loading a stored `a`, never the save: what a load of
+/// `a ++ changes` decides once the chunk parses, see
+/// [`header::document_chunk`]); otherwise by loading
+/// `a ++ changes` (one load, no
 /// save). Changes whose dependencies are in neither input are not in `a`:
 /// `false`, where `merge` raises an error.
 ///
@@ -589,7 +598,8 @@ pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
             return Ok(chunks.iter().all(|c| has_change(loaded.doc(), &c.hash)));
         }
         // One document chunk (a save): whether `a` has its heads, as a
-        // load of `a ++ changes` decides it, without reading the save; a
+        // load of `a ++ changes` decides it once the chunk parses, without
+        // reconstructing the save; a
         // save listing at least as many changes as a stored `a` has (and
         // other heads) is not in it (see `contains_input_by_header`).
         if let Some(chunk) = header::document_chunk(changes) {
@@ -600,11 +610,17 @@ pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
             {
                 return Ok(false);
             }
-            return Ok(is_subset(&chunk.heads, &heads_a)
-                || match a {
-                    Input::Loaded(loaded) => has_all(loaded.doc(), &chunk.heads),
-                    Input::Stored(bytes) => has_all(&load_stored_unguarded(bytes)?, &chunk.heads),
-                });
+            // A save that does not parse is left to the load below, which
+            // rejects it.
+            if header::document_parses(changes) {
+                return Ok(is_subset(&chunk.heads, &heads_a)
+                    || match a {
+                        Input::Loaded(loaded) => has_all(loaded.doc(), &chunk.heads),
+                        Input::Stored(bytes) => {
+                            has_all(&load_stored_unguarded(bytes)?, &chunk.heads)
+                        }
+                    });
+            }
         }
         Ok(matches!(
             apply_changes(&a.bytes_for_load(), &heads_a, changes)?,

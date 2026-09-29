@@ -5,7 +5,7 @@
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, Automerge, ChangeHash, ROOT, ReadDoc};
 use pg_automerge_core::header::{
-    HeadsPrefix, change_count_from_bytes, heads_from_bytes, heads_from_prefix,
+    HeadsPrefix, change_count_from_bytes, document_parses, heads_from_bytes, heads_from_prefix,
 };
 use pg_automerge_core::{
     MergeAccumulator, contains_by_heads, contains_by_heads_and_counts, contains_input_by_header,
@@ -148,6 +148,12 @@ fn shortcuts_agree_with_the_slow_paths() {
                 // The same for `b` as a compressed save (bytea input): the
                 // header shortcut, and the full check.
                 let save_b = Automerge::load(b).unwrap().save();
+                // Every save Automerge writes passes the chunk check that
+                // the header shortcuts rely on.
+                assert!(
+                    document_parses(b) && document_parses(&save_b),
+                    "seed {seed}"
+                );
                 if let Some(fast) = contains_input_by_header(&load_heads(a), || count_a, &save_b) {
                     assert_eq!(fast, slow, "seed {seed}: save header shortcut wrong");
                 }

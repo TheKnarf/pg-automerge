@@ -98,6 +98,21 @@ impl Reader<'_> {
         Err(Stop::NotSingleDoc)
     }
 
+    /// [`Self::uleb`], also rejecting overlong encodings (a last byte of
+    /// zero after the first), as Automerge's parser does.
+    fn canonical_uleb(&mut self) -> Result<u64, Stop> {
+        let start = self.pos;
+        let value = self.uleb()?;
+        if self.pos - start > 1 && self.prefix[self.pos - 1] == 0 {
+            return Err(Stop::NotSingleDoc);
+        }
+        Ok(value)
+    }
+
+    fn canonical_uleb_usize(&mut self) -> Result<usize, Stop> {
+        usize::try_from(self.canonical_uleb()?).map_err(|_| Stop::NotSingleDoc)
+    }
+
     fn uleb_usize(&mut self) -> Result<usize, Stop> {
         usize::try_from(self.uleb()?).map_err(|_| Stop::NotSingleDoc)
     }
@@ -485,10 +500,18 @@ pub struct DocumentChunk {
 }
 
 /// Read the header of external input that is exactly one document chunk
-/// (compressed or not) with a valid checksum, without loading it: what
-/// Automerge checks of a document chunk it then skips because it already
-/// has all of the chunk's heads (automerge 0.12 `storage/load.rs`). `None`
+/// (compressed or not) with a valid checksum, without loading it. `None`
 /// for anything else. Hashes the whole chunk; never panics.
+///
+/// Automerge 0.12 (`storage/load.rs` `load_next_change`) skips only the
+/// reconstruction of a document chunk whose heads it already has: it first
+/// parses the chunk (`storage::Chunk::parse`, `Document::parse`: header,
+/// actors, heads, column metadata, column data, head indices, inflation of
+/// deflated columns, the column layout) and checks its checksum. So "the
+/// save's heads are all in `a`" is what a load of `a ++ bytes` decides
+/// only when the chunk also passes [`document_parses`]; callers check that
+/// before they answer "contained" from the header (otherwise that load
+/// fails, and so must `merge`).
 pub fn document_chunk(bytes: &[u8]) -> Option<DocumentChunk> {
     use sha2::{Digest, Sha256};
 
@@ -503,6 +526,139 @@ pub fn document_chunk(bytes: &[u8]) -> Option<DocumentChunk> {
         heads,
         change_count: change_count_from_bytes(bytes),
     })
+}
+
+/// Change column specs of a document chunk in the order Automerge 0.12
+/// writes them (`change_graph.rs` `ids`), deflate bit clear: actor, seq,
+/// max op, time, message, deps (group, then values), extra (metadata, then
+/// values).
+const DOC_CHANGE_SPECS: [u64; 9] = [0x01, 0x03, 0x13, 0x23, 0x35, 0x40, 0x43, 0x56, 0x57];
+/// Op column specs of a document chunk in the order Automerge 0.12 writes
+/// them (`op_set2/columns.rs` `ids::ALL_COLUMN_SPECS` sorted): obj (actor,
+/// counter), key (actor, counter, string), id (actor, counter), insert,
+/// action, value (metadata, values), succ (group, actor, counter), expand,
+/// mark name.
+const DOC_OP_SPECS: [u64; 16] = [
+    0x01, 0x02, 0x11, 0x13, 0x15, 0x21, 0x23, 0x34, 0x42, 0x56, 0x57, 0x80, 0x81, 0x83, 0x94, 0xa5,
+];
+
+/// Whether `bytes`, exactly one document chunk, passes everything Automerge
+/// 0.12's `storage::Chunk::parse` checks of a document chunk (the checksum
+/// is [`document_chunk`]'s), conservatively: `true` only if that
+/// parse succeeds; `false` also for some chunks it would accept (callers
+/// then load, and Automerge decides).
+///
+/// Checked, as `Document::parse` does (automerge `storage/document.rs`,
+/// `storage/parse.rs`, `storage/columns/raw_column.rs`,
+/// `storage/columns.rs`):
+///
+/// - every LEB128 is canonical (Automerge rejects overlong encodings) and
+///   fits its type (column specs 32 bits);
+/// - the chunk length, actors, heads, both column metadata blocks and the
+///   column data fit, and after them come either nothing or exactly one
+///   LEB128 head index per head, then the end of the chunk;
+/// - every deflated column inflates (the same `flate2` decoder);
+/// - the column layout is valid. Automerge's layout parser (`Columns::parse2`)
+///   accepts specs in order without duplicates, with value columns right
+///   after their metadata column and group members after their group;
+///   here each block's specs (deflate bit cleared) must be a subsequence of
+///   the specs Automerge itself writes, in that order, with each value
+///   column immediately preceded by its metadata column. Such a layout
+///   passes the parser: the order is strictly increasing, group members
+///   either follow their group or stand alone as plain columns, a metadata
+///   column without values stands for its own range, and every column
+///   range is contiguous with the previous one. Anything else (unknown or
+///   out-of-order specs, a value column without its metadata) is `false`.
+///
+/// The column contents are not decoded: Automerge does not decode them
+/// either for a chunk it skips. Costs a pass over the metadata and an
+/// inflation of the deflated columns (into nothing). Never panics.
+pub fn document_parses(bytes: &[u8]) -> bool {
+    let mut r = Reader {
+        prefix: bytes,
+        total_len: bytes.len(),
+        pos: 0,
+    };
+    let parsed = (|| -> Result<(), Stop> {
+        if r.take(4)? != MAGIC {
+            return Err(Stop::NotSingleDoc);
+        }
+        r.take(4)?; // checksum
+        if r.take(1)?[0] != DOCUMENT_CHUNK {
+            return Err(Stop::NotSingleDoc);
+        }
+        let data_len = r.canonical_uleb_usize()?;
+        if r.pos.checked_add(data_len) != Some(r.total_len) {
+            return Err(Stop::NotSingleDoc);
+        }
+        let actors = r.canonical_uleb_usize()?;
+        for _ in 0..actors {
+            let len = r.canonical_uleb_usize()?;
+            r.take(len)?;
+        }
+        let heads = r.canonical_uleb_usize()?;
+        r.take(heads.checked_mul(32).ok_or(Stop::NotSingleDoc)?)?;
+        let change_cols = canonical_column_specs(&mut r)?;
+        let op_cols = canonical_column_specs(&mut r)?;
+        if !layout_ok(&change_cols, &DOC_CHANGE_SPECS) || !layout_ok(&op_cols, &DOC_OP_SPECS) {
+            return Err(Stop::NotSingleDoc);
+        }
+        for &(spec, len) in change_cols.iter().chain(&op_cols) {
+            let raw = r.take(len)?;
+            if spec & DEFLATE_BIT != 0 {
+                let mut decoder = flate2::bufread::DeflateDecoder::new(raw);
+                std::io::copy(&mut decoder, &mut std::io::sink())
+                    .map_err(|_| Stop::NotSingleDoc)?;
+            }
+        }
+        // The head indices: absent (older JS saves), or one per head and
+        // nothing after them.
+        if r.pos < r.total_len {
+            for _ in 0..heads {
+                r.canonical_uleb()?;
+            }
+            if r.pos != r.total_len {
+                return Err(Stop::NotSingleDoc);
+            }
+        }
+        Ok(())
+    })();
+    parsed.is_ok()
+}
+
+/// A column metadata block with canonical LEB128 throughout.
+fn canonical_column_specs(r: &mut Reader<'_>) -> Result<Vec<(u64, usize)>, Stop> {
+    let count = r.canonical_uleb_usize()?;
+    // Each entry takes at least two bytes.
+    if count > r.total_len / 2 {
+        return Err(Stop::NotSingleDoc);
+    }
+    let mut cols = Vec::with_capacity(count);
+    for _ in 0..count {
+        let spec = r.canonical_uleb()?;
+        if spec > u64::from(u32::MAX) {
+            return Err(Stop::NotSingleDoc);
+        }
+        cols.push((spec, r.canonical_uleb_usize()?));
+    }
+    Ok(cols)
+}
+
+/// The layout rule of [`document_parses`] for one metadata block.
+fn layout_ok(cols: &[(u64, usize)], known: &[u64]) -> bool {
+    const VALUE: u64 = 7;
+    let specs: Vec<u64> = cols.iter().map(|&(spec, _)| spec & !DEFLATE_BIT).collect();
+    let mut rest = known.iter();
+    if !specs.iter().all(|s| rest.any(|k| k == s)) {
+        return false;
+    }
+    // A value column only right after its metadata column; a metadata
+    // column alone is fine (Automerge writes one for an empty extra-bytes
+    // column).
+    specs
+        .iter()
+        .enumerate()
+        .all(|(i, &s)| s & 0x07 != VALUE || (i > 0 && specs[i - 1] == s - 1))
 }
 
 /// Chunk type of an uncompressed change chunk.
@@ -668,6 +824,80 @@ mod tests {
             let mut b = compressed.clone();
             b[i] ^= 0x5a;
             let _ = inflate_document(&b);
+        }
+    }
+
+    #[test]
+    fn automerge_saves_pass_the_document_chunk_check() {
+        use automerge::marks::{ExpandMark, Mark};
+        use automerge::transaction::CommitOptions;
+
+        let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
+        let empty = doc.document().save_nocompress();
+        let text = doc
+            .put_object(ROOT, "text", automerge::ObjType::Text)
+            .unwrap();
+        doc.splice_text(&text, 0, 0, &"compressible text ".repeat(300))
+            .unwrap();
+        doc.mark(
+            &text,
+            Mark::new("bold".into(), true, 2, 40),
+            ExpandMark::Both,
+        )
+        .unwrap();
+        let list = doc
+            .put_object(ROOT, "list", automerge::ObjType::List)
+            .unwrap();
+        for i in 0..50i64 {
+            doc.insert(&list, 0, i).unwrap();
+        }
+        doc.put(ROOT, "bytes", automerge::ScalarValue::Bytes(vec![7; 300]))
+            .unwrap();
+        doc.commit_with(
+            CommitOptions::default()
+                .with_message("a message")
+                .with_time(12345),
+        );
+        let mut fork = doc.fork().with_actor(ActorId::from([2u8; 16]));
+        fork.delete(&list, 3).unwrap();
+        fork.put(ROOT, "x", 1.5f64).unwrap();
+        doc.put(ROOT, "x", "conflict").unwrap();
+        doc.merge(&mut fork).unwrap();
+
+        let plain = doc.document().save_nocompress();
+        let compressed = doc.save();
+        assert_ne!(plain, compressed);
+        for bytes in [&empty, &plain, &compressed] {
+            assert!(document_parses(bytes));
+        }
+        // Without the head indices (older JS saves): still accepted, as
+        // Automerge accepts it; with one missing: not.
+        let heads = doc.get_heads().len();
+        assert_eq!(heads, 2);
+        let mut r = Reader {
+            prefix: &plain,
+            total_len: plain.len(),
+            pos: 9,
+        };
+        r.uleb().ok().unwrap();
+        let data = &plain[r.pos..];
+        // Each head index is below 128: one byte.
+        let no_indices = chunk(DOCUMENT_CHUNK, &data[..data.len() - heads]);
+        assert!(automerge::Automerge::load(&no_indices).is_ok());
+        assert!(document_parses(&no_indices));
+        let one_index = chunk(DOCUMENT_CHUNK, &data[..data.len() - 1]);
+        assert!(automerge::Automerge::load(&one_index).is_err());
+        assert!(!document_parses(&one_index));
+        // Truncated, trailing data, a change chunk: not.
+        assert!(!document_parses(&plain[..plain.len() - 1]));
+        assert!(!document_parses(&[plain.as_slice(), &[0]].concat()));
+        assert!(!document_parses(&doc.save_after(&[])));
+        assert!(!document_parses(&[]));
+        // Never panics on corruption.
+        for i in 0..compressed.len() {
+            let mut b = compressed.clone();
+            b[i] ^= 0x5a;
+            let _ = document_parses(&b);
         }
     }
 

@@ -656,3 +656,60 @@ fn update_only_when_not_contained() {
     let json: JsonB = one("SELECT doc::jsonb FROM p", &[]);
     assert_eq!(json.0, json!({ "n": 1 }));
 }
+
+/// A document chunk whose header lists the document's own head but whose
+/// body does not parse is rejected (22P02) by `merge(automerge, bytea)` and
+/// `automerge_contains(automerge, bytea)`, stored or expanded, as a load of
+/// `doc ++ bytes` rejects it; one that parses is decided from its header.
+#[pg_test]
+fn saves_with_known_heads_and_malformed_bodies_are_rejected() {
+    let mut doc = AutoCommit::new().with_actor(actor(1));
+    doc.put(ROOT, "x", 1i64).unwrap();
+    let older = doc.save();
+    let older_heads = doc.get_heads();
+    doc.put(ROOT, "y", 2i64).unwrap();
+    let newer = doc.save_after(&older_heads);
+    Spi::run("CREATE TEMP TABLE probe(doc automerge, older automerge, newer bytea)").unwrap();
+    Spi::run_with_args(
+        "INSERT INTO probe VALUES ($1::automerge, $2::automerge, $3)",
+        &[doc.save().into(), older.into(), newer.into()],
+    )
+    .unwrap();
+    // magic || sha256(0x00 || len || data)[..4] || 0x00 || len || data,
+    // data = no actors, one head (the document's), then `body`.
+    Spi::run(
+        "CREATE FUNCTION pg_temp.known_chunk(body bytea) RETURNS bytea LANGUAGE sql AS $$ \
+         WITH d(data) AS (SELECT '\\x0001'::bytea \
+             || decode((SELECT automerge_heads(doc) FROM probe)[1], 'hex') || body) \
+         SELECT '\\x856f4a83'::bytea \
+             || substring(sha256('\\x00'::bytea || set_byte('\\x00'::bytea, 0, length(data)) || data) \
+                          FROM 1 FOR 4) \
+             || '\\x00'::bytea || set_byte('\\x00'::bytea, 0, length(data)) || data FROM d $$",
+    )
+    .unwrap();
+    let garbage = "pg_temp.known_chunk('\\xffffffff0102')";
+    for sql in [
+        format!("SELECT merge(doc, {garbage}) FROM probe"),
+        format!("SELECT doc || {garbage} FROM probe"),
+        format!("SELECT automerge_contains(doc, {garbage}) FROM probe"),
+        format!(
+            "DO $$ DECLARE d automerge; BEGIN SELECT merge(older, newer) INTO d FROM probe; \
+             d := merge(d, {garbage}); END $$"
+        ),
+    ] {
+        let err = sql_error(&sql);
+        assert!(err.starts_with("22P02: invalid automerge changes"), "{sql}: {err}");
+    }
+    // A known chunk that parses (no columns, one head index): a no-op.
+    let empty = "pg_temp.known_chunk('\\x000000')";
+    let unchanged: bool = one(
+        &format!("SELECT merge(doc, {empty})::bytea = doc::bytea FROM probe"),
+        &[],
+    );
+    assert!(unchanged);
+    let contained: bool = one(
+        &format!("SELECT automerge_contains(doc, {empty}) FROM probe"),
+        &[],
+    );
+    assert!(contained);
+}

@@ -548,9 +548,10 @@ pub fn contains_changes_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Opti
 
 /// [`contains_changes_by_heads`], extended to a save: input that is
 /// exactly one document chunk with a valid checksum whose header heads are
-/// all heads of `a` is contained (`Some(true)`; what a load of
-/// `a ++ changes` decides from the same header, see
-/// [`loaded::merge_changes`]). Needs only `a`'s heads, so callers can
+/// all heads of `a`, and that passes Automerge's chunk parse
+/// ([`header::document_parses`]), is contained (`Some(true)`; what a load
+/// of `a ++ changes` decides, see [`loaded::merge_changes`]). One that
+/// does not parse is left to the loading path, which rejects it. Needs only `a`'s heads, so callers can
 /// answer before they fetch or load `a`.
 pub fn contains_input_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Option<bool> {
     contains_input_by_header(heads_a, || None, changes)
@@ -565,8 +566,10 @@ pub fn contains_input_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Option
 /// exactly the changes of its heads' history, so `a` having them all would
 /// make the histories equal). This decides "is this newer or concurrent
 /// save already in the stored document" without loading it. Only the
-/// header of the save is read, as for its heads: a save whose header
-/// disagrees with its content is not loadable, and `merge` rejects it.
+/// header of the save is read for this answer: a save whose header
+/// disagrees with its content, or that does not parse, is not loadable,
+/// and `merge` rejects it (so, as for bare change chunks, `false` does not
+/// promise that `merge` accepts the input).
 pub fn contains_input_by_header(
     heads_a: &[ChangeHash],
     count_a: impl FnOnce() -> Option<u64>,
@@ -580,7 +583,8 @@ pub fn contains_input_by_header(
     }
     let chunk = header::document_chunk(changes)?;
     if is_subset(&chunk.heads, heads_a) {
-        return Some(true);
+        // Only if the chunk parses; otherwise the loading path rejects it.
+        return header::document_parses(changes).then_some(true);
     }
     match (chunk.change_count, count_a()) {
         (Some(count), Some(count_a)) if count >= count_a => Some(false),

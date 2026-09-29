@@ -52,7 +52,8 @@ fn automerge_contains(a: AutomergeArg, b: AutomergeArg) -> bool {
 ///
 /// Decided from `doc`'s heads (read from a prefix) and the chunks' hashes
 /// and dependencies when `changes` is bare change chunks that re-send the
-/// current heads or build on them, or from a save's header heads when they
+/// current heads or build on them, or (for a save that passes Automerge's
+/// chunk parse, without reconstructing it) from its header heads when they
 /// are heads of `doc`, or from its header's change count when that is at
 /// least `doc`'s (not contained; no load); for another single save `doc` is loaded
 /// and checked for the save's heads (the save never is); otherwise

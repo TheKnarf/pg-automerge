@@ -348,13 +348,26 @@ enforces it).
   - A save (input starting with a document chunk, compressed or not,
     optionally followed by change chunks) is merged like
     `merge(a, b::automerge)`, cheapest check first:
-    1. exactly one document chunk with a valid checksum whose header heads
-       are heads of `a` (or changes of an expanded `a`): `a` unchanged,
-       nothing loaded. A load of `a ++ changes` decides the same from the
-       same header: Automerge skips a document chunk whose heads it has.
+    1. exactly one document chunk that passes Automerge's chunk parse
+       (below) with a valid checksum, whose header heads are heads of `a`
+       (or changes of an expanded `a`): `a` unchanged, nothing loaded. A
+       load of `a ++ changes` decides the same: for a document chunk whose
+       heads it has, Automerge 0.12 (`storage/load.rs`) still parses the
+       chunk (`Chunk::parse` / `Document::parse`: header, actors, heads,
+       column metadata, column data, head indices, inflating deflated
+       columns, the column layout) and checks its checksum, and skips only
+       reconstructing its changes. `header::document_parses` checks the
+       same, without reconstructing, before this answer (conservatively:
+       every LEB128 canonical, everything in bounds, the
+       head indices absent or complete with nothing after them, deflated
+       columns inflating, and each column block a subsequence of the specs
+       Automerge writes with value columns right after their metadata;
+       anything it does not recognize takes the loading path, where
+       Automerge decides). So a chunk with known heads and a malformed
+       body is `22P02`, as that load would make it.
     2. When the headers say the save has no more changes than a stored `a`
-       (an older save), `a` is loaded first and checked for those heads,
-       again as that load would.
+       (an older save) and the chunk parses, `a` is loaded first and
+       checked for those heads, again as that load would.
     3. The save is loaded on its own (strictly, and complete: if trailing
        change chunks depend on changes only `a` has, the input takes the
        `a ++ changes` path below). If it contains `a` (by the heads, or its
@@ -391,8 +404,8 @@ enforces it).
     first flattened (see
     [The deferred verification](#the-deferred-verification)).
   - A document chunk after the first chunk of `changes` whose heads `a`
-    already has is skipped by Automerge after the checksum check, without
-    decoding its columns.
+    already has is parsed and checksum-checked by Automerge (as in case 1),
+    and its changes are not reconstructed.
 - Operators `automerge || automerge` and `automerge || bytea` → `automerge`
   are the two `merge`s. There is no `bytea || automerge`, so the second has
   no commutator.
@@ -506,21 +519,25 @@ implicit).
     made the current heads (true).
   - For an expanded `a` and bare change chunks, each chunk's hash is looked
     up in the loaded document.
-  - For exactly one document chunk (a save) with a valid checksum: whether
-    `a` has the heads its header lists, from `a`'s heads; else `false`
-    when the save's header lists at least as many changes as a stored `a`
-    has (by the change-count argument above: a save that loads has
-    exactly the changes of its heads' history, one change actor entry
-    each, and a save whose header disagrees with its content is rejected
-    by `merge`); else from `a`'s history (a stored `a` is loaded; the save
-    never is). That is what the
-    no-op check of `merge(automerge, bytea)`, and a load of `a ++ changes`,
-    decide from the same header.
+  - For exactly one document chunk (a save) with a valid checksum:
+    `false` when the save's header lists other heads and at least as many
+    changes as a stored `a` has (by the change-count argument above: a
+    save that loads has exactly the changes of its heads' history, one
+    change actor entry each, and a save whose header disagrees with its
+    content, or does not parse, is rejected by `merge`). Otherwise, when
+    the chunk passes Automerge's chunk parse (as in `merge`'s case 1),
+    whether `a` has the heads its header lists: from `a`'s heads, else
+    from `a`'s history (a stored `a` is loaded; the save never is). That
+    is what the no-op check of `merge(automerge, bytea)`, and a load of
+    `a ++ changes`, decide. A save that does not parse is loaded as
+    `a ++ changes`, which rejects it (`22P02`).
   - Otherwise (older changes, a save plus change chunks, compressed chunks)
     `a ++ changes` is loaded once (no save) and the heads compared.
-  - On the no-load and the header paths only the framing, checksums and
-    dependency lists or header heads are read, so `false` does not promise
-    that `merge` accepts the input.
+  - On the no-load path only the framing, checksums and dependency lists
+    are read, and a save's `false` comes from its header alone, so `false`
+    does not promise that `merge` accepts the input. `true` does: a
+    header `true` needs the chunk to parse, which is all a load of
+    `a ++ changes` checks of it.
 
 ### Heads fast path
 
@@ -1615,3 +1632,26 @@ history). `mise run bench-sql`, release build, median of five, ms:
 
 C1 on the 3 MB text is the save's checksum (a SHA-256 over 3 MB) and the
 parameter's detoast. No other path changed.
+
+### Header no-ops check that the save parses (2026-09-29)
+
+A save whose header lists heads the document already has was a no-op
+after only its framing and checksum were checked, so `merge(doc, bytea)`
+and `automerge_contains(doc, bytea)` accepted a checksummed chunk with
+known heads and a malformed body, which a load of `doc ++ bytes` (and so
+the earlier `merge`) rejects with `22P02`. The header answers that say
+"contained" now first run `header::document_parses` (see
+[Merging](#merging), case 1), which inflates any deflated columns.
+Answers of "not contained" and paths that load the save are unchanged.
+Release build, median of seven, ms:
+
+| Case | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|
+| `merge(doc, own compressed save)` (no-op) | 1.2 | 2.9 | 8.9 | 32 |
+| `automerge_contains(doc, own compressed save)` | 1.1 | 3.1 | 8.9 | 31 |
+| `merge(doc, doc::bytea)` (uncompressed, no-op) | 5.8 | 5.8 | 15.6 | 14.1 |
+| W2 `merge(doc, newer save)` | 206 | 214 | 2787 | 2767 |
+| C1 `automerge_contains(doc, newer save)` | 1.2 | 1.3 | 9.6 | 9.0 |
+
+The added time is the inflation of the save's columns; loading the save
+instead would cost 200 ms / 2.8 s.
