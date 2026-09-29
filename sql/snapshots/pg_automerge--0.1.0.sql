@@ -48,18 +48,6 @@ COMMENT ON FUNCTION automerge_send(automerge) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/notify.rs:133
--- requires:
---   automerge_type
-
-
-CREATE FUNCTION automerge_notify() RETURNS trigger
-    LANGUAGE c AS 'MODULE_PATHNAME', 'automerge_notify_wrapper';
-COMMENT ON FUNCTION automerge_notify() IS
-    'AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW trigger: automerge_notify(channel, key_column [, ...]) sends NOTIFY channel with the row key and the heads of changed automerge columns.';
-/* </end connected objects> */
-
-/* <begin connected objects> */
 -- src/history.rs:16
 -- requires:
 --   automerge_type
@@ -95,7 +83,19 @@ COMMENT ON TYPE automerge_change_meta IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:200
+-- src/notify.rs:133
+-- requires:
+--   automerge_type
+
+
+CREATE FUNCTION automerge_notify() RETURNS trigger
+    LANGUAGE c AS 'MODULE_PATHNAME', 'automerge_notify_wrapper';
+COMMENT ON FUNCTION automerge_notify() IS
+    'AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW trigger: automerge_notify(channel, key_column [, ...]) sends NOTIFY channel with the row key and the heads of changed automerge columns.';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/history.rs:220
 -- pg_automerge::history::automerge_change_count
 CREATE  FUNCTION "automerge_change_count"(
 	"doc" automerge /* AutomergeArg */
@@ -106,7 +106,7 @@ AS 'MODULE_PATHNAME', 'automerge_change_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:129
+-- src/history.rs:149
 -- pg_automerge::history::automerge_changes
 -- requires:
 --   automerge_change_types
@@ -121,7 +121,7 @@ AS 'MODULE_PATHNAME', 'automerge_changes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:169
+-- src/history.rs:189
 -- pg_automerge::history::automerge_changes_bytes
 CREATE  FUNCTION "automerge_changes_bytes"(
 	"doc" automerge, /* AutomergeArg */
@@ -133,7 +133,7 @@ AS 'MODULE_PATHNAME', 'automerge_changes_bytes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:148
+-- src/history.rs:168
 -- pg_automerge::history::automerge_changes_meta
 -- requires:
 --   automerge_change_types
@@ -163,7 +163,7 @@ AS 'MODULE_PATHNAME', 'automerge_contains_wrapper';
 -- src/introspect.rs:63
 -- pg_automerge::introspect::automerge_contains
 CREATE  FUNCTION "automerge_contains"(
-	"a" automerge, /* AutomergeArg */
+	"doc" automerge, /* AutomergeArg */
 	"changes" bytea /* & [u8] */
 ) RETURNS bool /* bool */
 IMMUTABLE STRICT PARALLEL SAFE 
@@ -183,7 +183,7 @@ AS 'MODULE_PATHNAME', 'automerge_from_bytea_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:184
+-- src/history.rs:204
 -- pg_automerge::history::automerge_get_change
 -- requires:
 --   automerge_change_types
@@ -228,6 +228,55 @@ COMMENT ON FUNCTION automerge_contains(automerge, bytea) IS
 -- src/io.rs:19
 -- pg_automerge::io::automerge_in
 -- Skipped due to `#[pgrx(sql = false)]`
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/merge.rs:197
+-- pg_automerge::merge::automerge_merge_agg_final
+CREATE  FUNCTION "automerge_merge_agg_final"(
+	"state" internal /* Internal */
+) RETURNS automerge /* Option < AutomergeValue > */
+IMMUTABLE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_merge_agg_final_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/merge.rs:157
+-- pg_automerge::merge::automerge_merge_agg_trans
+CREATE  FUNCTION "automerge_merge_agg_trans"(
+	"state" internal, /* Internal */
+	"value" automerge /* Option < AutomergeArg > */
+) RETURNS internal /* Internal */
+IMMUTABLE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_merge_agg_trans_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/merge.rs:209
+-- requires:
+--   automerge_type
+--   automerge_merge_agg_trans
+--   automerge_merge_agg_final
+
+
+CREATE AGGREGATE merge_agg(automerge) (
+    SFUNC = automerge_merge_agg_trans,
+    STYPE = internal,
+    FINALFUNC = automerge_merge_agg_final,
+    -- The state is a fully loaded document in the Rust heap, invisible to
+    -- Postgres memory accounting and not spillable by HashAgg (no
+    -- serialfunc). Declare a size that is realistic for non-trivial
+    -- documents (the default estimate for internal is ~8kB) so the planner
+    -- prefers sorted grouping over large per-group hash tables.
+    SSPACE = 1048576,
+    PARALLEL = SAFE
+);
+
+COMMENT ON AGGREGATE merge_agg(automerge) IS 'CRDT merge of all non-null inputs.';
+COMMENT ON FUNCTION automerge_merge_agg_trans(internal, automerge) IS 'Transition function of merge_agg.';
+COMMENT ON FUNCTION automerge_merge_agg_final(internal) IS 'Final function of merge_agg.';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -298,7 +347,7 @@ COMMENT ON CAST (automerge AS jsonb) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:211
+-- src/history.rs:231
 -- pg_automerge::history::automerge_to_jsonb
 CREATE  FUNCTION "automerge_to_jsonb"(
 	"doc" automerge, /* AutomergeArg */
@@ -310,7 +359,7 @@ AS 'MODULE_PATHNAME', 'automerge_to_jsonb_at_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:224
+-- src/history.rs:244
 -- requires:
 --   automerge_changes
 --   automerge_changes_meta
@@ -353,7 +402,7 @@ AS 'MODULE_PATHNAME', 'merge_wrapper';
 -- requires:
 --   automerge_merge_support
 CREATE  FUNCTION "merge"(
-	"a" automerge, /* AutomergeArg */
+	"doc" automerge, /* AutomergeArg */
 	"changes" bytea /* & [u8] */
 ) RETURNS automerge /* AutomergeValue */
 IMMUTABLE STRICT PARALLEL SAFE SUPPORT "automerge_merge_support" 
@@ -392,54 +441,5 @@ COMMENT ON FUNCTION automerge_merge_support(internal) IS
 COMMENT ON OPERATOR || (automerge, automerge) IS 'merge(automerge, automerge): CRDT merge.';
 COMMENT ON OPERATOR || (automerge, bytea) IS
     'merge(automerge, bytea): apply an Automerge save or change chunks.';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/merge.rs:197
--- pg_automerge::merge::merge_agg_final
-CREATE  FUNCTION "merge_agg_final"(
-	"state" internal /* Internal */
-) RETURNS automerge /* Option < AutomergeValue > */
-IMMUTABLE PARALLEL SAFE
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'merge_agg_final_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/merge.rs:157
--- pg_automerge::merge::merge_agg_trans
-CREATE  FUNCTION "merge_agg_trans"(
-	"state" internal, /* Internal */
-	"value" automerge /* Option < AutomergeArg > */
-) RETURNS internal /* Internal */
-IMMUTABLE PARALLEL SAFE
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'merge_agg_trans_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/merge.rs:209
--- requires:
---   automerge_type
---   merge_agg_trans
---   merge_agg_final
-
-
-CREATE AGGREGATE merge_agg(automerge) (
-    SFUNC = merge_agg_trans,
-    STYPE = internal,
-    FINALFUNC = merge_agg_final,
-    -- The state is a fully loaded document in the Rust heap, invisible to
-    -- Postgres memory accounting and not spillable by HashAgg (no
-    -- serialfunc). Declare a size that is realistic for non-trivial
-    -- documents (the default estimate for internal is ~8kB) so the planner
-    -- prefers sorted grouping over large per-group hash tables.
-    SSPACE = 1048576,
-    PARALLEL = SAFE
-);
-
-COMMENT ON AGGREGATE merge_agg(automerge) IS 'CRDT merge of all non-null inputs.';
-COMMENT ON FUNCTION merge_agg_trans(internal, automerge) IS 'Transition function of merge_agg.';
-COMMENT ON FUNCTION merge_agg_final(internal) IS 'Final function of merge_agg.';
 /* </end connected objects> */
 

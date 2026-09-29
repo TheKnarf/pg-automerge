@@ -30,9 +30,12 @@ pub use serde_json;
 
 /// Errors surfaced to SQL. The glue maps [`Error::InvalidInput`] and
 /// [`Error::MissingDependencies`] to SQLSTATE 22P02
-/// (invalid_text_representation), [`Error::InvalidParameter`] to 22023
-/// (invalid_parameter_value) and [`Error::Internal`] to XX000, with
-/// [`Error::message`] as the message and [`Error::detail`] as the DETAIL.
+/// (invalid_text_representation), [`Error::ConflictingChanges`] to 22000
+/// (data_exception), [`Error::InvalidParameter`] to 22023
+/// (invalid_parameter_value), [`Error::LimitExceeded`] to 54000
+/// (program_limit_exceeded) and [`Error::Internal`] to XX000, with
+/// [`Error::message`] as the message, [`Error::detail`] as the DETAIL and
+/// [`Error::hint`] as the HINT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// Malformed or unacceptable client input (bytes, text, hashes).
@@ -44,6 +47,15 @@ pub enum Error {
     /// input (`merge(automerge, bytea)`): the missing hashes, sorted.
     /// Invalid input, like [`Error::InvalidInput`].
     MissingDependencies(Vec<ChangeHash>),
+    /// Two histories of one actor: different changes with the same actor
+    /// id and sequence number (or two author assignments of one actor),
+    /// which Automerge refuses to merge. Each input may be valid on its
+    /// own; together they show that two writers shared an actor id. The
+    /// primary message, naming the actor and seq.
+    ConflictingChanges(String),
+    /// A valid document that an output format cannot represent (nesting
+    /// deeper than [`json::MAX_DEPTH`] for jsonb).
+    LimitExceeded(String),
     /// A broken invariant: a stored value that does not load, or a bug.
     Internal(String),
 }
@@ -55,9 +67,11 @@ impl Error {
     /// The primary message: one short line.
     pub fn message(&self) -> String {
         match self {
-            Error::InvalidInput(msg) | Error::InvalidParameter(msg) | Error::Internal(msg) => {
-                msg.clone()
-            }
+            Error::InvalidInput(msg)
+            | Error::InvalidParameter(msg)
+            | Error::ConflictingChanges(msg)
+            | Error::LimitExceeded(msg)
+            | Error::Internal(msg) => msg.clone(),
             Error::MissingDependencies(missing) => {
                 let what = if missing.len() == 1 {
                     "dependency"
@@ -73,12 +87,30 @@ impl Error {
     }
 
     /// Supporting detail, if any: for [`Error::MissingDependencies`] the
-    /// missing hashes (at most five, then a count of the others).
+    /// missing hashes (at most five, then a count of the others), for
+    /// [`Error::ConflictingChanges`] why they cannot be merged.
     pub fn detail(&self) -> Option<String> {
         match self {
             Error::MissingDependencies(missing) => {
                 Some(format!("Missing changes: {}.", Self::list_missing(missing)))
             }
+            Error::ConflictingChanges(_) => Some(
+                "An actor's changes form one sequence; these inputs hold two different ones, \
+                 which cannot be merged."
+                    .into(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Advice for the user, if any: for [`Error::ConflictingChanges`] that
+    /// every writer needs its own actor id.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Error::ConflictingChanges(_) => Some(
+                "Each writer must use its own actor id. Automerge picks a random one \
+                 for every document instance unless the application sets it.",
+            ),
             _ => None,
         }
     }
@@ -197,6 +229,34 @@ pub(crate) fn guard_input<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, 
     })
 }
 
+/// An error of Automerge as an [`Error`]: a conflict between two
+/// histories of one actor (a reused actor id: `DuplicateSeqNumber`,
+/// `DuplicateAuthor`) is [`Error::ConflictingChanges`] wherever it
+/// arises (a load of concatenated input, applying changes, a merge);
+/// anything else is what `other` makes of it.
+pub(crate) fn automerge_error(
+    e: AutomergeError,
+    other: impl FnOnce(AutomergeError) -> Error,
+) -> Error {
+    match e {
+        AutomergeError::DuplicateSeqNumber(seq, actor) => Error::ConflictingChanges(format!(
+            "conflicting automerge changes: actor {actor} has two different changes with seq {seq}"
+        )),
+        AutomergeError::DuplicateAuthor(_, actor, seq) => Error::ConflictingChanges(format!(
+            "conflicting automerge changes: actor {actor} is assigned an author again at seq {seq}"
+        )),
+        e => other(e),
+    }
+}
+
+/// [`automerge_error`] for external change bytes: `invalid automerge
+/// changes: ...` ([`Error::InvalidInput`]) unless it is a conflict.
+pub(crate) fn invalid_changes(e: AutomergeError) -> Error {
+    automerge_error(e, |e| {
+        Error::InvalidInput(format!("invalid automerge changes: {e}"))
+    })
+}
+
 /// `guard` for operations on stored (already validated) values.
 pub(crate) fn guard_stored<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     guard(f, |msg| {
@@ -226,11 +286,13 @@ pub(crate) fn guard_for<T>(
 /// Empty input is the empty document. Unguarded: callers run it inside
 /// [`guard_input`].
 fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
-    let doc = load_bytes(bytes).map_err(|e| match e {
-        AutomergeError::MissingDeps => Error::InvalidInput(
-            "invalid automerge document: changes are missing dependencies".into(),
-        ),
-        e => Error::InvalidInput(format!("invalid automerge document: {e}")),
+    let doc = load_bytes(bytes).map_err(|e| {
+        automerge_error(e, |e| match e {
+            AutomergeError::MissingDeps => Error::InvalidInput(
+                "invalid automerge document: changes are missing dependencies".into(),
+            ),
+            e => Error::InvalidInput(format!("invalid automerge document: {e}")),
+        })
     })?;
     ensure_complete(&doc).map_err(|missing| {
         Error::InvalidInput(format!(
@@ -480,8 +542,7 @@ pub(crate) fn apply_changes(
     let mut combined = Vec::with_capacity(a.len() + changes.len());
     combined.extend_from_slice(a);
     combined.extend_from_slice(changes);
-    let doc = load_bytes(&combined)
-        .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
+    let doc = load_bytes(&combined).map_err(invalid_changes)?;
     drop(combined);
     if let Err(mut missing) = ensure_complete(&doc) {
         missing.sort();

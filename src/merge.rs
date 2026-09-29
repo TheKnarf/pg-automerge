@@ -45,23 +45,23 @@ fn merge(a: AutomergeArg, b: AutomergeArg) -> AutomergeValue {
 
 /// `merge(automerge, bytea)`: apply an Automerge save or bare change chunks
 /// (`save_incremental()` / `save_after()` output, possibly concatenated) on
-/// top of the stored document. Returns `a` unchanged when nothing is new.
+/// top of the stored document. Returns `doc` unchanged when nothing is new.
 /// Changes with missing dependencies are rejected (22P02), naming them.
 #[pg_extern(immutable, strict, parallel_safe, name = "merge", support = automerge_merge_support)]
-fn merge_bytea(a: AutomergeArg, changes: &[u8]) -> AutomergeValue {
-    // Nothing new by `a`'s heads (read from a prefix): `a` as it arrived,
-    // never detoasted (see `AutomergeArg::unchanged`).
-    if am::contains_input_by_heads(&a.heads().or_raise(), changes) == Some(true) {
-        return a.unchanged();
+fn merge_bytea(doc: AutomergeArg, changes: &[u8]) -> AutomergeValue {
+    // Nothing new by `doc`'s heads (read from a prefix): `doc` as it
+    // arrived, never detoasted (see `AutomergeArg::unchanged`).
+    if am::contains_input_by_heads(&doc.heads().or_raise(), changes) == Some(true) {
+        return doc.unchanged();
     }
-    let doc = {
-        let da = a.detoast();
+    let merged = {
+        let da = doc.detoast();
         match loaded::merge_changes(da.input(), changes).or_raise() {
             None => return da.into_value(),
-            Some(doc) => doc,
+            Some(merged) => merged,
         }
     };
-    a.with_result(doc)
+    doc.with_result(merged)
 }
 
 /// Planner support function of both `merge`s: answers PL/pgSQL's
@@ -155,7 +155,7 @@ COMMENT ON OPERATOR || (automerge, bytea) IS
 /// Transition function of `merge_agg`. The state is a [`MergeAccumulator`]
 /// owned by the aggregate's memory context and dropped when it is reset.
 #[pg_extern(immutable, parallel_safe)]
-fn merge_agg_trans(
+fn automerge_merge_agg_trans(
     mut state: Internal,
     value: Option<AutomergeArg>,
     fcinfo: pg_sys::FunctionCallInfo,
@@ -174,7 +174,7 @@ fn merge_agg_trans(
             // SAFETY: fcinfo is this call's; AggCheckCallContext only reads it.
             if unsafe { pg_sys::AggCheckCallContext(fcinfo, &mut agg_context) } == 0 {
                 raise(Error::Internal(
-                    "merge_agg_trans called in non-aggregate context".into(),
+                    "automerge_merge_agg_trans called in non-aggregate context".into(),
                 ));
             }
             let ptr =
@@ -195,8 +195,8 @@ fn merge_agg_trans(
 
 /// Final function of `merge_agg`; NULL if every input was NULL.
 #[pg_extern(immutable, parallel_safe)]
-fn merge_agg_final(state: Internal) -> Option<AutomergeValue> {
-    // SAFETY: the state is only ever created by merge_agg_trans.
+fn automerge_merge_agg_final(state: Internal) -> Option<AutomergeValue> {
+    // SAFETY: the state is only ever created by automerge_merge_agg_trans.
     let acc = unsafe { state.get::<MergeAccumulator>() }?;
     Some(match acc.finish_loaded().or_raise()? {
         am::Accumulated::Stored(bytes) => AutomergeValue::Bytes(bytes.to_vec()),
@@ -209,9 +209,9 @@ fn merge_agg_final(state: Internal) -> Option<AutomergeValue> {
 extension_sql!(
     r#"
 CREATE AGGREGATE merge_agg(automerge) (
-    SFUNC = merge_agg_trans,
+    SFUNC = automerge_merge_agg_trans,
     STYPE = internal,
-    FINALFUNC = merge_agg_final,
+    FINALFUNC = automerge_merge_agg_final,
     -- The state is a fully loaded document in the Rust heap, invisible to
     -- Postgres memory accounting and not spillable by HashAgg (no
     -- serialfunc). Declare a size that is realistic for non-trivial
@@ -222,9 +222,13 @@ CREATE AGGREGATE merge_agg(automerge) (
 );
 
 COMMENT ON AGGREGATE merge_agg(automerge) IS 'CRDT merge of all non-null inputs.';
-COMMENT ON FUNCTION merge_agg_trans(internal, automerge) IS 'Transition function of merge_agg.';
-COMMENT ON FUNCTION merge_agg_final(internal) IS 'Final function of merge_agg.';
+COMMENT ON FUNCTION automerge_merge_agg_trans(internal, automerge) IS 'Transition function of merge_agg.';
+COMMENT ON FUNCTION automerge_merge_agg_final(internal) IS 'Final function of merge_agg.';
 "#,
     name = "automerge_merge_agg",
-    requires = ["automerge_type", merge_agg_trans, merge_agg_final],
+    requires = [
+        "automerge_type",
+        automerge_merge_agg_trans,
+        automerge_merge_agg_final
+    ],
 );

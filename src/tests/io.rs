@@ -426,7 +426,7 @@ fn deep_nesting_limit() {
     let err = sql_error(&format!("SELECT '{hex}'::automerge::jsonb"));
     assert_eq!(
         err,
-        format!("XX000: automerge document is nested more than {max} levels deep")
+        format!("54000: automerge document is nested more than {max} levels deep")
     );
     // Storing and merging it is still fine; only the jsonb view fails.
     let ok: bool = one(

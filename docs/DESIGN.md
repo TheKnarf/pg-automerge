@@ -13,6 +13,7 @@ Contents: [Scope](#scope) · [Architecture](#architecture) ·
 [Testing](#testing) ·
 [Installation, schema and privileges](#installation-schema-and-privileges) ·
 [Versioning and upgrades](#versioning-and-upgrades) ·
+[Future work](#future-work) ·
 [Appendix: benchmarks](#appendix-benchmarks)
 
 ## Scope
@@ -48,7 +49,7 @@ CREATE TABLE docs (id uuid PRIMARY KEY, doc automerge NOT NULL);
 -- persist a full save: $2 is Automerge.save() (optionally followed by later
 -- save_incremental() chunks), bound as bytea. Every writer must use its own
 -- actor id: two different histories claiming the same (actor, seq) cannot be
--- merged (ERROR "duplicate seq").
+-- merged (ERROR 22000 "conflicting automerge changes").
 INSERT INTO docs (id, doc) VALUES ($1, $2)
 ON CONFLICT (id) DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc);
 
@@ -270,8 +271,9 @@ identity; `automerge_heads` is.
 
 Errors are raised with `ereport(ERROR)` and a SQLSTATE (see
 [Error codes](#error-codes)); nothing panics across FFI. Client input that
-is not acceptable (bytes, text, hashes) is always `22P02`, stored values
-that fail are `XX000`.
+is malformed (bytes, text, hashes) is always `22P02`; well-formed input
+whose history conflicts with the document it meets (a reused actor id) is
+`22000`; stored values that fail are `XX000`.
 
 The automerge decoder is not panic-free: input whose chunk checksums are
 valid but whose column data is malformed can hit `unwrap`s, index panics
@@ -287,10 +289,9 @@ interrupt checks, an error from a jsonb function the walk calls), which
 pgrx carries as a panic with its own payload type and must re-raise as
 is, not relabel as `22P02`/`XX000`.
 
-Messages are short and lowercase; supporting data goes in the DETAIL
-(e.g. the hashes of missing dependencies) and advice in the HINT (e.g. how
-to declare the notification trigger). The LOCATION of an error (shown with
-`\set VERBOSITY verbose`) is the source file and line that raised it.
+Messages follow PostgreSQL's error message style guide (see [Error
+codes](#error-codes)). The LOCATION of an error (shown with `\set
+VERBOSITY verbose`) is the source file and line that raised it.
 
 ## SQL API and semantics
 
@@ -329,13 +330,14 @@ enforces it).
     read-write expanded pointer (a PL/pgSQL variable in `d := merge(d, x)`,
     or the result of an inner `merge`), the merge happens in place.
   - Merging two valid stored documents cannot fail except for a reused
-    actor id (two histories with the same (actor, seq)): `XX000`
-    "duplicate seq".
+    actor id (two histories with different changes for the same (actor,
+    seq)): `22000` "conflicting automerge changes", with a HINT (see
+    [Error codes](#error-codes)).
   - `merge` is an unreserved keyword since PG15; unqualified
     `SELECT merge(a, b)` and `SET doc = merge(doc, ...)` work on PG18
     (tested), so the function keeps the name `merge`.
-- `merge(a automerge, changes bytea) → automerge`: applies external bytes on
-  top of `a`, like Automerge's `load_incremental`. `changes` may be a full
+- `merge(doc automerge, changes bytea) → automerge` (`doc` is called `a`
+  below, as in `merge(a, b)`): applies external bytes on top of `a`, like Automerge's `load_incremental`. `changes` may be a full
   save (compressed or not, optionally followed by change chunks) or bare
   change chunks (`save_incremental()` / `save_after()` output, several may
   be concatenated) whose dependencies are in `a` or earlier in `changes`.
@@ -440,7 +442,8 @@ enforces it).
   outside memory-context accounting, and without a serialfunc HashAgg
   cannot spill it; the aggregate declares `SSPACE = 1048576` so the
   planner's per-group estimate is realistic and it prefers sorted grouping.
-  `merge_agg_trans` runs `CHECK_FOR_INTERRUPTS` before each input. When no
+  The transition function (`automerge_merge_agg_trans`) runs
+  `CHECK_FOR_INTERRUPTS` before each input. When no
   single input contains all others, the result is an expanded value
   holding a copy of the state (the final function may run more than once,
   e.g. as a window function), so `merge_agg(doc)::jsonb` needs no save and
@@ -502,12 +505,14 @@ implicit).
     concurrent versions with as many changes each (the same edit count on
     both sides of a fork). A stored count is exact: stored values are
     saves of a loaded document, one change actor entry per change.
-- `automerge_contains(a automerge, changes bytea) → bool`: whether `a`
-  already has every change in `changes` (the same inputs as
+- `automerge_contains(doc automerge, changes bytea) → bool` (`doc` is
+  `a` below): whether `a` already has every change in `changes` (the same inputs as
   `merge(automerge, bytea)`), i.e. whether `merge(a, changes)` returns `a`
   unchanged. Empty `changes` is contained. Changes whose dependencies are
   in neither `a` nor `changes` are not in `a`: `false` (where `merge`
-  raises `22P02`). Malformed bytes are `22P02` when they have to be loaded.
+  raises `22P02`). Malformed bytes are `22P02` when they have to be
+  loaded, and changes that conflict with `a`'s (a reused actor id) are
+  `22000` when `a ++ changes` has to be loaded, as in `merge`.
   - No-load path, when `changes` is only uncompressed change chunks: each
     chunk's hash is `sha256(type ‖ uleb128 length ‖ data)` (its checksum
     is the first 4 bytes, and must match) and its data starts with its
@@ -772,11 +777,12 @@ key of several kB). Tested with a 150-head document.
 
 Argument checks, when the trigger fires (Postgres does not validate
 trigger arguments at `CREATE TRIGGER`): not `AFTER` or not `FOR EACH ROW` →
-`39P01` (trigger protocol violated); fewer than two arguments, an empty
+`39P01` (trigger protocol violated), and so is calling
+`automerge_notify()` outside a trigger; fewer than two arguments, an empty
 channel or one of 64 bytes or more, a key column listed twice or of type
-`automerge` → `22023`; an unknown key column → `42703`; calling
-`automerge_notify()` outside a trigger → `0A000`. Errors about how the
-trigger is declared carry a HINT with the correct `CREATE TRIGGER`. These
+`automerge` → `22023`; an unknown key column → `42703`. Errors about how
+the trigger is declared carry a HINT with the correct `CREATE TRIGGER`
+(an `automerge` key column, a HINT on which columns to name). These
 errors fail the write, as trigger errors do. The channel is used verbatim,
 like `pg_notify`: `LISTEN` folds unquoted names to lower case, so use a
 lower-case channel (or `LISTEN "Name"`). The `automerge` type is looked up
@@ -926,7 +932,7 @@ Where it does not:
   protocol requires.
 - Failure atomicity: the new document is complete before it replaces the
   old one, and nothing after the replacement can fail. An error (bad
-  changes, missing dependencies, a duplicate seq, a decoder panic) leaves
+  changes, missing dependencies, a reused actor id, a decoder panic) leaves
   the argument's document as it was. This is condition 1 of
   `SupportRequestModifyInPlace`, and it holds for every read-write call,
   not just PL/pgSQL's.
@@ -980,7 +986,8 @@ fuzzing, as malformed input with recomputed checksums) fails with `22P02`
 where the value is stored, sent or cast, e.g. at the `UPDATE`, not at the
 `merge` call; a `BEGIN .. EXCEPTION` block around only the `merge` does
 not catch it. Every other bad input (framing, checksums, change columns,
-missing dependencies, duplicate seq, decoder panics) fails inside `merge`.
+missing dependencies, a reused actor id, decoder panics) fails inside
+`merge`.
 Verifying eagerly would cost a load per merge and undo most of the gain.
 The check runs only while `pg_automerge.verify_writes` is on (read when
 the value is flattened; see [The `pg_automerge.verify_writes`
@@ -1018,6 +1025,64 @@ it.
    `pg_backend_memory_contexts` shows at most the live variables' objects
    during the loop and none after, and that the number of live Rust
    documents returns to where it was.
+
+### Naming
+
+The SQL surface was reviewed as a whole before the first release (0.1.0 is
+unreleased, so renames need no aliases or upgrade script). Principles:
+objects that cannot collide because they take an `automerge` argument may
+use generic names where that reads better (`merge`, `merge_agg`, `||`);
+everything else carries the `automerge_` prefix; parameter names are the
+same for the same role, so named-argument calls read consistently (`doc`
+for the document, `changes` for bytes, `since_heads`/`heads`, `hash`).
+
+Renamed:
+
+- `merge_agg_trans` / `merge_agg_final` → `automerge_merge_agg_trans` /
+  `automerge_merge_agg_final`. `merge_agg_final(internal)` has no
+  extension type in its signature, so another extension (or a user
+  function) of that name in the same schema would make `CREATE EXTENSION`
+  fail, or ours block theirs; both support functions also show up in
+  `\df`. The prefix removes the clash; the aggregate keeps its name.
+- The first parameter of `merge(automerge, bytea)` and
+  `automerge_contains(automerge, bytea)`: `a` → `doc`, as in every other
+  function whose first argument is the document the bytes apply to
+  (`merge(doc => d, changes => c)`). `merge(a, b)` and
+  `automerge_contains(a, b)` keep `a`, `b`: a pair of documents.
+
+Considered and kept:
+
+- `merge`, `||`: required, and keyed on the `automerge` type (`merge` is an
+  unreserved keyword; unqualified calls work, tested).
+- `merge_agg` rather than `automerge_merge_agg`: Postgres identifies an
+  aggregate by name and argument types, so another extension's
+  `merge_agg(hll)` or `merge_agg(anyelement)` coexists with ours in the
+  same schema, and a call on an `automerge` argument resolves to ours (an
+  exact match beats a polymorphic or cast candidate). It pairs with `merge`
+  the way `string_agg`, `json_object_agg` pair with their scalar forms.
+- `automerge_changes` / `automerge_changes_meta` / `automerge_changes_bytes`:
+  one family with the same `since_heads` parameter. `automerge_save_after`
+  (Automerge's name) for the last was rejected: it would split the family,
+  and "save" suggests a document, while the result is change chunks.
+- `automerge_get_change` rather than `automerge_change(doc, hash)`: a
+  function named like the composite type `automerge_change` would read as
+  the function-call form of a cast to that type.
+- `automerge_change_count`, `automerge_heads`, `automerge_contains`,
+  `automerge_notify` (trigger functions are named for what they do, like
+  `pg_notify`), `automerge_from_bytea` (the cast function),
+  `automerge_merge_support`.
+- `automerge_to_jsonb(doc, heads)` as an overload of the cast function
+  rather than `automerge_to_jsonb_at`: same result, "the jsonb of `doc`",
+  as of `heads`; the cast is bound by OID, so the overload cannot change
+  what the cast calls, and `heads => '{}'` reads well in named form.
+- The composite types' columns (`hash`, `actor`, `seq`, `start_op`,
+  `op_count`, `time`, `message`, `deps`, `change`): Automerge's own field
+  names in snake case. `time` is a non-reserved keyword and works unquoted
+  as a column (`SELECT seq, time FROM ...`, in the regress examples);
+  `change` (the change's bytes, for `decodeChange` / `applyChanges`) was
+  kept over `bytes`, which names a representation, not what it is.
+- The setting `pg_automerge.verify_writes`: custom settings are prefixed
+  with the extension name.
 
 ## jsonb mapping
 
@@ -1084,23 +1149,117 @@ the same events for current and historical states of generated documents,
 text with blocks, marks and non-string elements, unreachable objects,
 conflicts and deep nesting.
 
-Nesting is capped at 1000 levels (error `XX000`): the walk itself uses an
-explicit stack, but `convertToJsonb` recurses (it checks the stack depth,
-the cap gives a clear error instead).
+Nesting is capped at 1000 levels (error `54000` program_limit_exceeded,
+like jsonb's own size limits): the walk itself uses an explicit stack, but
+`convertToJsonb` recurses (it checks the stack depth, the cap gives a
+clear error instead). The document is valid and can still be stored,
+merged and read as `bytea`; only its jsonb view fails.
 
 ## Error codes
+
+Every error the extension raises, by SQLSTATE. The core crate's `Error`
+enum carries the class (`InvalidInput`, `MissingDependencies`,
+`ConflictingChanges`, `InvalidParameter`, `LimitExceeded`, `Internal`),
+and `src/error.rs` maps it; errors that only the glue can detect (NULL
+array elements, trigger usage, jsonb limits) are built there directly.
 
 | SQLSTATE | When | Message (DETAIL / HINT) |
 |---|---|---|
 | `22P02` invalid_text_representation | Bad text input; bytes that are not a loadable Automerge save or change sequence (including decoder panics); a result that does not survive a save and load | `invalid input syntax for type automerge: ...`, `invalid automerge document: ...`, `invalid automerge changes: ...` |
 | `22P02` | `merge(automerge, bytea)` with changes whose dependencies are in neither input | `invalid automerge changes: missing N dependencies that neither the document nor the input contains` (DETAIL: `Missing changes: <hashes>.`) |
 | `22P02` | A change hash that is not 64 hex digits | `invalid automerge change hash "...": expected 64 hexadecimal digits` |
-| `22023` invalid_parameter_value | `automerge_to_jsonb(doc, heads)` with a head the document lacks; bad `automerge_notify` arguments (count, channel length, key column listed twice or of type `automerge`) | `automerge document does not contain change <hash>`, `automerge_notify(): ...` (HINT when the arguments are missing) |
+| `22000` data_exception | Two histories that disagree about one actor's changes (a reused actor id): two different changes with the same (actor, seq), or a second author assignment, met by `merge`, `\|\|`, `merge_agg`, `merge(automerge, bytea)`, `automerge_contains(automerge, bytea)` when it loads, or one input holding both (text input, the `bytea` cast) | `conflicting automerge changes: actor <hex> has two different changes with seq N` (DETAIL: `An actor's changes form one sequence; these inputs hold two different ones, which cannot be merged.` HINT: `Each writer must use its own actor id. Automerge picks a random one for every document instance unless the application sets it.`) |
+| `22003` numeric_value_out_of_range | A change's `seq`, `start_op` or `op_count`, or the change count, above `bigint`'s range (Automerge rejects such changes on load, so this is not expected to occur) | `automerge seq N is out of range for type bigint` (DETAIL: the change) |
 | `22004` null_value_not_allowed | A NULL element in `since_heads` / `heads` | `since_heads must not contain NULL` |
-| `39P01` trigger_protocol_violated | `automerge_notify()` not fired `AFTER ... FOR EACH ROW` for INSERT/UPDATE/DELETE | `automerge_notify() must be fired ...` (HINT: the correct `CREATE TRIGGER`) |
+| `22023` invalid_parameter_value | `automerge_to_jsonb(doc, heads)` with a head the document lacks; bad `automerge_notify` arguments (count, channel length, key column listed twice or of type `automerge`) | `automerge document does not contain change <hash>`, `automerge_notify(): ...` (HINT on how to declare the trigger, or which columns to name) |
+| `39P01` trigger_protocol_violated | `automerge_notify()` not fired `AFTER ... FOR EACH ROW` for INSERT/UPDATE/DELETE, or called outside a trigger | `automerge_notify() must be fired ...`, `automerge_notify() can only be called as a trigger` (HINT: the correct `CREATE TRIGGER`) |
 | `42703` undefined_column | `automerge_notify()` key column that does not exist | `automerge_notify(): key column "x" does not exist in table ...` |
-| `0A000` feature_not_supported | `automerge_notify()` called outside a trigger | `automerge_notify() can only be called as a trigger` (HINT) |
-| `XX000` internal_error | A stored value that does not load (corruption), a merge of two histories that reuse an actor id (`duplicate seq`), nesting deeper than 1000 levels, broken invariants | |
+| `54000` program_limit_exceeded | A document nested deeper than 1000 levels, or with more elements, pairs or a longer string than jsonb allows, read as jsonb | `automerge document is nested more than 1000 levels deep`, `number of jsonb array elements exceeds the maximum allowed (N)`, `string too long to represent as jsonb string` (DETAIL, as jsonb's) |
+| `XX000` internal_error | A stored value that does not load (corruption, or a value stored with `pg_automerge.verify_writes` off that does not survive a save and load), broken invariants (bugs) | `corrupt stored automerge value: ...`, `automerge failed on a stored value: ...`, others naming the invariant |
+
+### Why `22000` for a reused actor id
+
+Merging two histories that hold different changes with the same (actor,
+seq) used to fail with `XX000` when both were `automerge` values and with
+`22P02` when the changes came as `bytea`. Neither fits: `XX000` says the
+extension is broken (and monitoring pages someone for it), `22P02` says the
+bytes are malformed, but each input is a valid document. What is wrong is
+the combination, caused by a writer bug: two writers (or two copies of a
+document) used the same actor id. Candidates, against PostgreSQL's
+errcodes table (Appendix A) and how drivers map classes:
+
+- `23505` unique_violation / class `23` integrity_constraint_violation:
+  (actor, seq) is a key, but not a table constraint. Drivers map class 23
+  to "integrity error" exceptions (psycopg's `IntegrityError`, JDBC's
+  `SQLIntegrityConstraintViolationException`) that applications routinely
+  catch in an upsert-or-ignore path, which would silently drop the
+  write; clients also expect a constraint name with it. Rejected.
+- `55000` object_not_in_prerequisite_state: for an object whose state
+  forbids the operation (a sequence not yet used, a replication slot in
+  use); retrying later can succeed. Here neither document is in a wrong
+  state and no retry helps. Rejected.
+- `40001` serialization_failure: drivers and ORMs retry it automatically,
+  which would loop. Rejected.
+- `22023` invalid_parameter_value: the extension uses it for an argument
+  that does not fit the document (unknown heads); the (actor, seq) clash
+  is not about one argument, and in a merge either side can be the
+  "wrong" one. Rejected.
+- `22000` data_exception, chosen: the class for data values that are
+  unacceptable, with no more specific code in class `22` for this.
+  Drivers map class `22` to a non-transient data error (psycopg's
+  `DataError`, JDBC's `SQLDataException`): not retried, not confused with
+  a constraint, and distinct from `22P02` so a client can tell "these
+  bytes are corrupt" from "these two histories cannot be combined" by
+  SQLSTATE alone.
+
+Every path reports it the same way, since the cause is the same: the
+Automerge errors `DuplicateSeqNumber` and `DuplicateAuthor` become
+`Error::ConflictingChanges` wherever Automerge raises them (a load of
+concatenated input, applying change chunks, merging two documents); other
+Automerge errors keep their class. So input that holds both histories on
+its own (a save followed by the other writer's change chunk, through text
+input or the `bytea` cast) is also `22000` now, where it was `22P02`.
+
+### Other reclassifications (0.1.0, unreleased)
+
+- Nesting deeper than 1000 levels: `XX000` → `54000`. The document is
+  valid; the jsonb view has a limit, like jsonb's own element and string
+  limits, which are already `54000`.
+- A change field above `bigint`: `XX000` → `22003`, as for any value out
+  of `bigint`'s range.
+- `automerge_notify()` called outside a trigger: `0A000` → `39P01`, the
+  code of every other misuse of the trigger and the one Postgres' own C
+  trigger function `suppress_redundant_updates_trigger` raises for the
+  same mistake (PL/pgSQL's compiler uses `0A000` for it; a C function is
+  closer to the former).
+- The `automerge_notify()` error for an `automerge` key column moved its
+  advice ("name the columns that identify the row") from the message into
+  a HINT.
+
+### Message style
+
+Following PostgreSQL's error message style guide:
+
+- The primary message is short, factual, lowercase and without a trailing
+  period; it names the specific object (the hash, the actor and seq, the
+  key column, the trigger) after a colon or in quotes, as Postgres' own
+  messages do (`invalid input syntax for type ...: ...`).
+- The DETAIL carries supporting facts as complete sentences (the hashes
+  of missing dependencies, the change holding an out-of-range value, why
+  conflicting changes cannot be merged).
+- The HINT carries advice as complete sentences: how to declare the
+  notification trigger, which key columns to name, that each writer needs
+  its own actor id.
+- Messages of Automerge's own errors are embedded after a colon (`invalid
+  automerge document: <Automerge's message>`), and the message of a
+  caught decoder panic in parentheses; their wording is Automerge's.
+
+Tests: `reused_actor_id_is_a_conflict_on_every_path` (core) and
+`reused_actor_id_is_a_data_exception_with_a_hint` (pg_test: SQLSTATE,
+message, DETAIL and HINT for every SQL path, and that the failed writes
+changed nothing), the pg_regress example showing the error, and the
+existing per-code tests (`notify_trigger_validates_usage`, the nesting and
+hash tests).
 
 ## Performance
 
@@ -1264,7 +1423,7 @@ What costs a load, per call:
 - Interrupts: the core's long loops (the jsonb walk, building history rows
   and ordering them) call an interrupt check every 1024 steps, which the
   extension registers in `_PG_init` as `CHECK_FOR_INTERRUPTS()`
-  (`set_interrupt_check`); `merge_agg_trans` checks between inputs. A
+  (`set_interrupt_check`); `automerge_merge_agg_trans` checks between inputs. A
   cancel or `statement_timeout` raises its ERROR there, which unwinds
   through the core's guard untouched. Single Automerge calls (a load, a
   merge, a save, `text()`) have no hook, so a cancel waits for the one
@@ -1528,7 +1687,7 @@ The rest of the review found nothing that would stop it:
   output functions, as the caller). It finds the `automerge` type by OID
   (above), not through `search_path`.
 - Functions with `internal` arguments (`automerge_recv`,
-  `automerge_merge_support`, `merge_agg_trans`, `merge_agg_final`) cannot
+  `automerge_merge_support`, `automerge_merge_agg_trans`, `automerge_merge_agg_final`) cannot
   be called from SQL, and only a superuser can create an aggregate with
   an `internal` state or attach a `SUPPORT` function, so no other role can
   hand them a foreign state.
@@ -1599,6 +1758,64 @@ Data compatibility:
     and each row is re-encoded on its next write.
 - Text output (`\x` + hex of the stored bytes) is the dump format and is
   stable, so dump and restore works across versions.
+
+## Future work
+
+### Native `->` / `->>` operators (evaluated, not implemented)
+
+The performance work found that `automerge -> text` / `automerge ->> text`
+operators reading one field without converting the whole document could
+roughly halve single-field reads. They are not implemented; this is the
+evaluation, for a decision before the first release.
+
+- **Benefit.** Today `doc->>'status'` resolves to `jsonb ->> text` through
+  the implicit cast: load the document, convert all of it to jsonb, take
+  one key. A native operator would load the document and convert only the
+  value at that key (`doc.get(ROOT, key)` and the walk of that subtree).
+  The load itself stays: Automerge has no partial load. The gain is the
+  walk and jsonb build of everything else, from the primitives in
+  [Performance](#performance): on the 877 kB list document about 100 ms
+  (72 ms walk, about 30 ms build) of roughly 260 ms, close to half with
+  the per-call overhead; on the 3 MB text document about 0.3 s (the text's
+  conversion) of 2.8 s, since the load dominates there. The more of the
+  document lies outside the requested field and the smaller its history,
+  the larger the share.
+- **Expression indexes and plans.** An existing index on `(doc->>'x')`
+  was created when that text resolved to `(doc::jsonb) ->> 'x'`, and
+  stores that expression. Once a native `->>(automerge, text)` exists,
+  the same query text resolves to it (an exact match on the left type
+  beats the implicit cast), the expressions differ, and the planner no
+  longer matches the index: queries silently fall back to scans until the
+  index is recreated. Views, rules and `BEGIN ATOMIC` bodies keep their
+  stored (jsonb) resolution. The same applies to generated columns and
+  check constraints written as `doc->>'x'`. After a release, adding the
+  operators would therefore be a plan-breaking change needing release
+  notes (`REINDEX` is not enough; the index must be dropped and created
+  from the new expression). Before the first release it costs nothing.
+- **Semantics to match exactly.** The operators must return the same
+  types as jsonb's (`->` jsonb, `->>` text) and the same values as the
+  cast's mapping (counters, timestamps, NaN, bytes, conflicts), so that
+  `doc->'a'->>'b'` chains and mixing with jsonb operators stay coherent;
+  the subtree conversion must reuse the core's walk, and a test would
+  compare `doc->k` with `doc::jsonb->k` over the generated documents.
+  `#>` / `#>>` (paths) and array indexes would follow the same pattern;
+  `@>`, `?`, jsonpath and the rest keep going through the cast.
+- **Naming.** To be a drop-in, the operators must be `->` and `->>`;
+  anything else is a new API anyway, which argues for functions instead.
+- **Alternative: functions.** `automerge_extract_path(doc, VARIADIC path
+  text[]) → jsonb` and `automerge_extract_path_text(doc, VARIADIC path
+  text[]) → text`, named after `jsonb_extract_path` / `_text` so jsonb
+  users recognize them (a shorter `automerge_get(doc, VARIADIC path
+  text[])` was considered; the jsonb-parallel names say what the result
+  is). Opt-in: nothing resolves differently, no index stops matching,
+  and hot queries are rewritten deliberately; `IMMUTABLE`, so indexable
+  too. Their cost is discoverability.
+- **Recommendation.** If faster single-field reads are wanted, add the
+  functions (no compatibility hazard). Add the operators only before
+  0.1.0 is released, if at all, with a test that an index on
+  `(doc->>'x')` created afterwards is used. For read-heavy tables the
+  stored generated jsonb column stays the fastest option either way
+  (no load at read time).
 
 ## Appendix: benchmarks
 

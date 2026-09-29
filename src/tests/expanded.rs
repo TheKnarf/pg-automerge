@@ -201,7 +201,8 @@ fn expanded_failed_merge_leaves_the_variable_unchanged() {
              FOREACH b IN ARRAY bad LOOP
                  BEGIN
                      d := merge(d, b);
-                 EXCEPTION WHEN invalid_text_representation THEN
+                 -- Class 22: 22P02, and 22000 for the reused actor id.
+                 EXCEPTION WHEN data_exception THEN
                      failed := failed + 1;
                  END;
                  ASSERT d::bytea = e[3], 'd changed by a failed merge';

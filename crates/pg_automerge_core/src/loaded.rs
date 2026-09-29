@@ -23,9 +23,9 @@ use automerge::{Automerge, Change, ChangeHash};
 
 use crate::{
     Applied, Error, apply_changes, contains_changes_by_heads, ensure_complete, guard_for,
-    guard_input, guard_stored, has_all, header, is_subset, load_bytes, load_stored_unguarded,
-    loads_as_saved, normalize_unguarded, reload_check, stored_heads_unguarded,
-    verification_enabled,
+    guard_input, guard_stored, has_all, header, invalid_changes, is_subset, load_bytes,
+    load_stored_unguarded, loads_as_saved, normalize_unguarded, reload_check,
+    stored_heads_unguarded, verification_enabled,
 };
 
 /// Number of [`LoadedDoc`]s alive in this process (for leak tests).
@@ -354,9 +354,11 @@ fn merge_unguarded(a: Input<'_>, b: Input<'_>, unverified: bool) -> Result<Merge
 /// `Automerge::merge` does, without needing `other` mutably.
 pub(crate) fn merge_from(target: &mut Automerge, other: &Automerge) -> Result<(), Error> {
     let changes = target.get_changes_added(other);
-    target
-        .apply_changes(changes)
-        .map_err(|e| Error::Internal(format!("could not merge automerge documents: {e}")))?;
+    target.apply_changes(changes).map_err(|e| {
+        crate::automerge_error(e, |e| {
+            Error::Internal(format!("could not merge automerge documents: {e}"))
+        })
+    })?;
     ensure_complete(target).map_err(|missing| {
         Error::Internal(format!(
             "merged automerge document is missing {} dependencies (e.g. {})",
@@ -453,8 +455,7 @@ fn apply_change_chunks(
         Input::Stored(bytes) => load_stored_unguarded(bytes)?,
         Input::Loaded(loaded) => loaded.doc().clone(),
     };
-    doc.apply_changes(parsed)
-        .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
+    doc.apply_changes(parsed).map_err(invalid_changes)?;
     if let Err(mut missing) = ensure_complete(&doc) {
         missing.sort();
         return Err(Error::MissingDependencies(missing));
@@ -525,8 +526,7 @@ fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<Sa
         }
         doc_a = Some(doc);
     }
-    let b = load_bytes(changes)
-        .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
+    let b = load_bytes(changes).map_err(invalid_changes)?;
     if ensure_complete(&b).is_err() {
         return Ok(SaveMerge::Concatenate);
     }
@@ -554,9 +554,7 @@ fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<Sa
         return Ok(SaveMerge::Unchanged);
     }
     let added = target.get_changes_added(&b);
-    target
-        .apply_changes(added)
-        .map_err(|e| Error::InvalidInput(format!("invalid automerge changes: {e}")))?;
+    target.apply_changes(added).map_err(invalid_changes)?;
     Ok(SaveMerge::New(Box::new(LoadedDoc::new(target, None, true))))
 }
 

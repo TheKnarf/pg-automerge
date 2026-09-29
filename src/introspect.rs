@@ -61,18 +61,18 @@ fn automerge_contains(a: AutomergeArg, b: AutomergeArg) -> bool {
 /// each chunk's hash is looked up.
 /// Changes with dependencies in neither input are not contained (false).
 #[pg_extern(immutable, strict, parallel_safe, name = "automerge_contains")]
-fn automerge_contains_changes(a: AutomergeArg, changes: &[u8]) -> bool {
+fn automerge_contains_changes(doc: AutomergeArg, changes: &[u8]) -> bool {
     if changes.is_empty() {
         return true;
     }
-    // `a`'s change count is read (from a prefix) only for a save its heads
-    // do not decide; an expanded `a` answers the rest for free.
-    let heads_a = a.heads().or_raise();
-    let count_a = || a.loaded().is_none().then(|| a.change_count()).flatten();
-    let decided = am::contains_input_by_header(&heads_a, count_a, changes);
+    // `doc`'s change count is read (from a prefix) only for a save its
+    // heads do not decide; an expanded `doc` answers the rest for free.
+    let heads_doc = doc.heads().or_raise();
+    let count_doc = || doc.loaded().is_none().then(|| doc.change_count()).flatten();
+    let decided = am::contains_input_by_header(&heads_doc, count_doc, changes);
     match decided {
         Some(answer) => answer,
-        None => a
+        None => doc
             .with_input(|input| loaded::contains_changes(input, changes))
             .or_raise(),
     }

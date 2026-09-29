@@ -189,27 +189,63 @@ fn merge_agg_declares_realistic_state_size() {
 }
 
 #[pg_test]
-fn reused_actor_id_is_a_clean_merge_error() {
+fn reused_actor_id_is_a_data_exception_with_a_hint() {
     // Two different histories that both claim (actor 1, seq 1): a
     // backend bug, e.g. a hard-coded actor id. Automerge refuses to
-    // merge them; that must surface as an ERROR, not a crash.
-    let mut a = AutoCommit::new().with_actor(actor(1));
-    let mut b = AutoCommit::new().with_actor(actor(1));
+    // merge them; every way of combining them raises the same 22000
+    // (data_exception) error naming the actor and seq, with a HINT, and
+    // never a crash or an XX000.
+    let mut base = AutoCommit::new().with_actor(actor(2));
+    base.put(ROOT, "base", true).unwrap();
+    base.commit();
+    let base_heads = base.get_heads();
+    let mut a = base.fork().with_actor(actor(1));
+    let mut b = base.fork().with_actor(actor(1));
     a.put(ROOT, "x", 1i64).unwrap();
     b.put(ROOT, "x", 2i64).unwrap();
-    let (a, b) = (
-        pg_automerge_core::encoding::to_hex_literal(&a.save()),
-        pg_automerge_core::encoding::to_hex_literal(&b.save()),
+    let hex = |bytes: &[u8]| pg_automerge_core::encoding::to_hex_literal(bytes);
+    let (ha, hb) = (hex(&a.save()), hex(&b.save()));
+    let hb_change = hex(&b.save_after(&base_heads));
+    Spi::run(&format!(
+        "CREATE TABLE dup (id int PRIMARY KEY, doc automerge); \
+         INSERT INTO dup VALUES (1, '{ha}'), (2, '{hb}')"
+    ))
+    .unwrap();
+    let expected_message = format!(
+        "conflicting automerge changes: actor {} has two different changes with seq 1",
+        actor(1)
     );
     for sql in [
-        format!("SELECT merge('{a}'::bytea::automerge, '{b}'::bytea::automerge)"),
-        format!("SELECT merge_agg(d) FROM (VALUES ('{a}'::bytea::automerge), ('{b}')) v(d)"),
-        // Concatenated saves go through Automerge::load instead.
-        format!("SELECT ('{a}'::bytea || '{b}'::bytea)::automerge"),
+        format!("SELECT merge('{ha}'::bytea::automerge, '{hb}'::bytea::automerge)"),
+        "SELECT merge(x.doc, y.doc) FROM dup x, dup y WHERE x.id = 1 AND y.id = 2".into(),
+        format!("SELECT '{ha}'::bytea::automerge || '{hb}'::bytea::automerge"),
+        "SELECT merge_agg(doc) FROM dup".into(),
+        // merge(automerge, bytea): a full save and a bare change chunk.
+        format!("UPDATE dup SET doc = merge(doc, '{hb}'::bytea) WHERE id = 1"),
+        format!("UPDATE dup SET doc = doc || '{hb_change}'::bytea WHERE id = 1"),
+        format!("SELECT automerge_contains(doc, '{hb_change}'::bytea) FROM dup WHERE id = 1"),
+        // Concatenated saves go through Automerge::load (the bytea cast and
+        // text input).
+        format!("SELECT ('{ha}'::bytea || '{hb}'::bytea)::automerge"),
+        format!("SELECT '{ha}{}'::automerge", &hb[2..]),
+        // In place, in PL/pgSQL.
+        format!(
+            "DO $$ DECLARE d automerge; BEGIN \
+               SELECT doc INTO d FROM dup WHERE id = 1; \
+               d := merge(d, '{hb_change}'::bytea); \
+             END $$"
+        ),
     ] {
-        let err = sql_error(&sql);
-        assert!(err.contains("duplicate seq 1"), "{sql}: {err}");
+        let [code, message, detail, hint]: [String; 4] =
+            sql_error_report(&sql).try_into().unwrap();
+        assert_eq!(code, "22000", "{sql}: {message}");
+        assert_eq!(message, expected_message, "{sql}");
+        assert!(detail.ends_with("which cannot be merged."), "{sql}: {detail}");
+        assert!(hint.starts_with("Each writer must use its own actor id."), "{sql}: {hint}");
     }
+    // The failed writes changed nothing.
+    let x: JsonB = one("SELECT doc::jsonb FROM dup WHERE id = 1", &[]);
+    assert_eq!(x.0, json!({ "base": true, "x": 1 }));
 }
 
 #[pg_test]

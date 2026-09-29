@@ -194,7 +194,7 @@ fn deep_nesting_up_to_the_limit_converts() {
     let mut too_deep = nested(MAX_DEPTH);
     assert!(matches!(
         to_json(&stored(&mut too_deep)),
-        Err(Error::Internal(_))
+        Err(Error::LimitExceeded(_))
     ));
 }
 

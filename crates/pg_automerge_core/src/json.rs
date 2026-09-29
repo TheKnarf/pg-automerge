@@ -64,8 +64,8 @@ pub trait JsonSink {
 ///
 /// # Errors
 ///
-/// [`Error::Internal`] for a document nested deeper than [`MAX_DEPTH`] or
-/// if Automerge fails to read it.
+/// [`Error::LimitExceeded`] for a document nested deeper than
+/// [`MAX_DEPTH`]; [`Error::Internal`] if Automerge fails to read it.
 pub fn doc_to_json(doc: &Automerge) -> Result<Value, Error> {
     doc_to_json_at(doc, None)
 }
@@ -297,7 +297,7 @@ impl<'a> Sweep<'a> {
                 },
                 EntryValue::Object(id, typ) => {
                     if stack.len() >= MAX_DEPTH {
-                        return Err(Error::Internal(format!(
+                        return Err(Error::LimitExceeded(format!(
                             "automerge document is nested more than {MAX_DEPTH} levels deep"
                         )));
                     }
@@ -357,7 +357,7 @@ pub fn write_json_per_object<S: JsonSink + ?Sized>(
             }
             (ValueRef::Object(typ), Some(id)) => {
                 if stack.len() >= MAX_DEPTH {
-                    return Err(Error::Internal(format!(
+                    return Err(Error::LimitExceeded(format!(
                         "automerge document is nested more than {MAX_DEPTH} levels deep"
                     )));
                 }
@@ -816,7 +816,7 @@ mod tests {
         }
         assert!(matches!(
             doc_to_json(doc.document()),
-            Err(Error::Internal(_))
+            Err(Error::LimitExceeded(_))
         ));
     }
 }

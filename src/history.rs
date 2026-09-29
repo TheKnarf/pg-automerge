@@ -10,7 +10,7 @@ use pgrx::heap_tuple::PgHeapTuple;
 use pgrx::prelude::*;
 
 use crate::datum::AutomergeArg;
-use crate::error::{OrRaise, null_element, raise};
+use crate::error::{OrRaise, PgError, null_element, raise};
 use crate::jsonb::{JsonbBuilder, JsonbDatum};
 
 extension_sql!(
@@ -61,8 +61,25 @@ fn hashes_arg(name: &str, texts: &[Option<String>]) -> Vec<ChangeHash> {
     am::history::parse_hashes(&hashes).or_raise()
 }
 
-fn to_i64(n: u64) -> i64 {
-    i64::try_from(n).unwrap_or_else(|_| raise(Error::Internal(format!("{n} exceeds bigint"))))
+/// `n` (`what`, e.g. the `seq` of change `hash`) as `bigint`: 22003
+/// (numeric_value_out_of_range) when it does not fit, as for any value too
+/// large for `bigint`. Automerge keeps these as `u64`, and a value past
+/// `i64::MAX` does not make a document invalid.
+#[track_caller]
+fn to_i64(what: &str, n: u64, hash: Option<&str>) -> i64 {
+    match i64::try_from(n) {
+        Ok(n) => n,
+        Err(_) => {
+            let err = PgError::new(
+                PgSqlErrorCode::ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE,
+                format!("automerge {what} {n} is out of range for type bigint"),
+            );
+            raise(match hash {
+                Some(hash) => err.detail(format!("The value is in change {hash}.")),
+                None => err,
+            })
+        }
+    }
 }
 
 /// The declared result type of the function being called (the composite
@@ -81,12 +98,15 @@ fn change_tuple(
 ) -> pgrx::composite_type!('static, "automerge_change") {
     let time = am::history::pg_timestamptz_micros(row.time)
         .and_then(|micros| pgrx::datum::TimestampWithTimeZone::try_from(micros).ok());
+    let seq = to_i64("seq", row.seq, Some(&row.hash));
+    let start_op = to_i64("start_op", row.start_op, Some(&row.hash));
+    let op_count = to_i64("op_count", row.op_count, Some(&row.hash));
     let mut datums = vec![
         row.hash.into_datum(),
         row.actor.into_datum(),
-        to_i64(row.seq).into_datum(),
-        to_i64(row.start_op).into_datum(),
-        to_i64(row.op_count).into_datum(),
+        seq.into_datum(),
+        start_op.into_datum(),
+        op_count.into_datum(),
         time.into_datum(),
         row.message.into_datum(),
         row.deps.into_datum(),
@@ -203,7 +223,7 @@ fn automerge_change_count(doc: AutomergeArg) -> i64 {
         Some(n) => n,
         None => doc.with_input(am::history::change_count).or_raise(),
     };
-    to_i64(n)
+    to_i64("change count", n, None)
 }
 
 /// The document's state as of `heads` as jsonb. Every head must be a change

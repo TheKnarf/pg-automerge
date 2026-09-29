@@ -203,7 +203,12 @@ fn a_failed_merge_leaves_the_loaded_document_as_it_was() {
             .err()
             .unwrap_or_else(|| panic!("{what}: expected an error"));
         assert!(
-            matches!(err, Error::InvalidInput(_) | Error::MissingDependencies(_)),
+            matches!(
+                err,
+                Error::InvalidInput(_)
+                    | Error::MissingDependencies(_)
+                    | Error::ConflictingChanges(_)
+            ),
             "{what}: {err:?}"
         );
         // Untouched: same heads, same cached bytes, still loads the same.

@@ -211,7 +211,7 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `bytea → automerge` | I S P | Assignment cast (validates). |
 | `automerge → bytea` | | Explicit binary-coercible cast: the stored Automerge bytes. |
 | `automerge → jsonb` | I S P | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
-| `merge(a, b)`, `a \|\| b` | I S P | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. |
+| `merge(a, b)`, `a \|\| b` | I S P | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. Two histories with different changes under one actor id cannot be merged (22000, see [Limitations](#limitations-and-gotchas)). |
 | `merge(doc, changes bytea)`, `doc \|\| changes` | I S P | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them in the DETAIL). |
 | `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. Loads a document only to merge it: a single row, or a version plus older ones, costs no load or one. |
 | `automerge_heads(automerge) → text[]` | I S P | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
@@ -316,6 +316,14 @@ Details in
   rows), but a single Automerge load, merge or save runs to the end
   before a cancel or `statement_timeout` takes effect: 2.5 s for a 3 MB
   document, longer for documents of tens of MB.
+- **Every writer needs its own actor id.** Two writers (or two copies of
+  a document) that commit with the same actor id produce different changes
+  with the same sequence number, and Automerge cannot merge them: `merge`,
+  `merge_agg` and `merge(doc, changes)` fail with SQLSTATE `22000`
+  (`conflicting automerge changes: actor ... has two different changes
+  with seq N`, with a HINT). Retrying does not help; the fix is in the
+  writer. Automerge picks a random actor id per document instance unless
+  you set one.
 - Malformed input is always SQLSTATE `22P02` (`invalid automerge document`),
   including input that passes Automerge's checksums but panics its decoder.
   One rare case is reported late: a result of `merge(doc, bytea)` is checked

@@ -129,7 +129,9 @@ thread_local! {
 //
 // Written like pgrx's `#[pg_trigger]` expansion (V1 info record, guarded
 // entry point, SQL below), except that a call outside a trigger is a clean
-// 0A000 error instead of an XX000 panic message.
+// 39P01 error (as Postgres' own C trigger function
+// suppress_redundant_updates_trigger raises) instead of an XX000 panic
+// message.
 extension_sql!(
     r#"
 CREATE FUNCTION automerge_notify() RETURNS trigger
@@ -168,7 +170,7 @@ pub unsafe extern "C-unwind" fn automerge_notify_wrapper(
                 .unwrap_or_else(|| {
                     raise(
                         PgError::new(
-                            PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+                            PgSqlErrorCode::ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED,
                             "automerge_notify() can only be called as a trigger",
                         )
                         .hint(NOTIFY_USAGE),
@@ -204,12 +206,16 @@ fn trigger_name(trigger: &PgTrigger<'_>) -> String {
 
 /// The trigger's table as `schema.table`, quoted as needed.
 fn table_name(trigger: &PgTrigger<'_>) -> String {
-    let schema = trigger
-        .table_schema()
-        .unwrap_or_else(|e| raise(Error::Internal(e.to_string())));
-    let relname = trigger
-        .table_name()
-        .unwrap_or_else(|e| raise(Error::Internal(e.to_string())));
+    let schema = trigger.table_schema().unwrap_or_else(|e| {
+        raise(Error::Internal(format!(
+            "automerge_notify(): could not read the trigger data: {e}"
+        )))
+    });
+    let relname = trigger.table_name().unwrap_or_else(|e| {
+        raise(Error::Internal(format!(
+            "automerge_notify(): could not read the trigger data: {e}"
+        )))
+    });
     format!(
         "{}.{}",
         pgrx::spi::quote_identifier(&schema),
@@ -235,7 +241,9 @@ fn check_trigger_context(trigger: &PgTrigger<'_>) -> Op {
             ))
             .hint(NOTIFY_USAGE),
         ),
-        Err(e) => raise(Error::Internal(e.to_string())),
+        Err(e) => raise(Error::Internal(format!(
+            "automerge_notify(): could not read the trigger data: {e}"
+        ))),
     }
     if !matches!(trigger.level(), PgTriggerLevel::Row) {
         raise(
@@ -298,14 +306,18 @@ fn resolve_columns(trigger: &PgTrigger<'_>, key_names: &[String]) -> (Vec<Attr>,
         // SAFETY: catalog lookup.
         typoid == automerge_oid || unsafe { pg_sys::getBaseType(typoid) } == automerge_oid
     };
-    let bad_key = |code: PgSqlErrorCode, what: String| -> ! {
-        raise(PgError::new(
+    let bad_key = |code: PgSqlErrorCode, what: String, hint: Option<&str>| -> ! {
+        let err = PgError::new(
             code,
             format!(
                 "automerge_notify(): key column {what} (trigger \"{}\")",
                 trigger_name(trigger)
             ),
-        ))
+        );
+        raise(match hint {
+            Some(hint) => err.hint(hint),
+            None => err,
+        })
     };
 
     let (mut automerge, mut others): (Vec<Attr>, Vec<Attr>) = live_columns(trigger)
@@ -317,6 +329,7 @@ fn resolve_columns(trigger: &PgTrigger<'_>, key_names: &[String]) -> (Vec<Attr>,
             bad_key(
                 PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
                 format!("\"{name}\" is listed twice"),
+                None,
             );
         }
         if let Some(i) = others.iter().position(|a| &a.name == name) {
@@ -324,14 +337,17 @@ fn resolve_columns(trigger: &PgTrigger<'_>, key_names: &[String]) -> (Vec<Attr>,
         } else if automerge.iter().any(|a| &a.name == name) {
             bad_key(
                 PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
-                format!(
-                    "\"{name}\" is an automerge column; name the columns that identify the row"
+                format!("\"{name}\" is an automerge column"),
+                Some(
+                    "Name the columns that identify the row, such as its primary key; \
+                     the automerge columns are reported by their heads.",
                 ),
             );
         } else {
             bad_key(
                 PgSqlErrorCode::ERRCODE_UNDEFINED_COLUMN,
                 format!("\"{name}\" does not exist in table {}", table_name(trigger)),
+                None,
             );
         }
     }

@@ -79,4 +79,9 @@ fn main() {
     let mut bytes = base.save();
     bytes.extend(inc.save_after(&heads));
     println!("\\set incremental '\\{}'", to_hex_literal(&bytes));
+    // A writer that reused bob's actor id: its first change differs from
+    // bob's, so the two cannot be merged.
+    let mut reused = base.fork().with_actor(ActorId::from([0xbbu8; 16]));
+    reused.put(ROOT, "status", "cancelled").unwrap();
+    println!("\\set bob_reused '\\{}'", hex(&mut reused));
 }

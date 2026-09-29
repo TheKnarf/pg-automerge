@@ -8,7 +8,7 @@ use serde_json::json;
 
 mod common;
 
-use common::{contains_changes, heads, merge_changes, to_json};
+use common::{contains_changes, heads, merge, merge_changes, to_json};
 
 fn actor(n: u8) -> ActorId {
     ActorId::from([n; 16])
@@ -218,14 +218,94 @@ fn malformed_input_is_rejected_strictly() {
     }
 }
 
+/// Two writers that share an actor id: each history is valid, together
+/// they hold two different changes with the same (actor, seq). Every path
+/// that combines them reports the same [`Error::ConflictingChanges`]
+/// (22000 in SQL), with the actor and seq in the message and a hint.
 #[test]
-fn reused_actor_id_is_an_error() {
-    let mut a = AutoCommit::new().with_actor(actor(1));
-    let mut b = AutoCommit::new().with_actor(actor(1));
+fn reused_actor_id_is_a_conflict_on_every_path() {
+    let mut base = AutoCommit::new().with_actor(actor(2));
+    base.put(ROOT, "base", true).unwrap();
+    base.commit();
+    let base_heads = base.get_heads();
+    let mut a = base.fork().with_actor(actor(1));
+    let mut b = base.fork().with_actor(actor(1));
     a.put(ROOT, "x", 1i64).unwrap();
+    a.commit();
     b.put(ROOT, "x", 2i64).unwrap();
-    let msg = invalid(merge_changes(&stored(&mut a), &b.save()));
-    assert!(msg.contains("duplicate seq"), "{msg}");
+    b.commit();
+    let stored_a = stored(&mut a);
+    let stored_b = stored(&mut b);
+    let b_change = b.save_after(&base_heads);
+
+    let conflict = |what: &str, err: Error| {
+        let Error::ConflictingChanges(msg) = &err else {
+            panic!("{what}: expected ConflictingChanges, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            &format!(
+                "conflicting automerge changes: actor {} has two different changes with seq 1",
+                actor(1)
+            ),
+            "{what}"
+        );
+        assert!(err.detail().is_some(), "{what}");
+        assert!(
+            err.hint().is_some_and(|h| h.contains("its own actor id")),
+            "{what}"
+        );
+    };
+    // merge(automerge, automerge) of two stored documents.
+    conflict("merge", merge(&stored_a, &stored_b).err().unwrap());
+    // merge(automerge, bytea): a full save, compressed or not; bare change
+    // chunks; a save followed by change chunks (the concatenating load).
+    conflict("save", merge_changes(&stored_a, &b.save()).unwrap_err());
+    conflict(
+        "uncompressed save",
+        merge_changes(&stored_a, &stored_b).unwrap_err(),
+    );
+    conflict(
+        "change chunk",
+        merge_changes(&stored_a, &b_change).unwrap_err(),
+    );
+    let mut save_then_change = base.save();
+    save_then_change.extend_from_slice(&b_change);
+    conflict(
+        "save and chunk",
+        merge_changes(&stored_a, &save_then_change).unwrap_err(),
+    );
+    // One input that holds both histories (text input, the bytea cast).
+    conflict(
+        "normalize",
+        normalize(&[a.save(), b_change.clone()].concat()).unwrap_err(),
+    );
+    // merge_agg.
+    let mut acc = pg_automerge_core::MergeAccumulator::new();
+    acc.add_input(pg_automerge_core::loaded::Input::Stored(&stored_a))
+        .unwrap();
+    let err = acc
+        .add_input(pg_automerge_core::loaded::Input::Stored(&stored_b))
+        .and_then(|()| acc.finish_loaded().map(|_| ()))
+        .unwrap_err();
+    conflict("merge_agg", err);
+    // automerge_contains(doc, bytea) when it has to load `a ++ changes`:
+    // the same error (the changes could never be merged either).
+    conflict(
+        "contains",
+        contains_changes(&stored_a, &b_change).unwrap_err(),
+    );
+}
+
+/// Other errors of Automerge keep their class: only the actor conflicts
+/// are [`Error::ConflictingChanges`].
+#[test]
+fn only_actor_conflicts_are_conflicts() {
+    let mut doc = AutoCommit::new().with_actor(actor(1));
+    doc.put(ROOT, "x", 1i64).unwrap();
+    let base = stored(&mut doc);
+    let msg = invalid(merge_changes(&base, b"\x85\x6f\x4a\x83garbage"));
+    assert!(msg.starts_with("invalid automerge"), "{msg}");
 }
 
 #[test]
