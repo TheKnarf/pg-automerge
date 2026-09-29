@@ -1208,8 +1208,11 @@ The default admits about 4.4 million characters of plain text (whose real
 peak is about 0.4 GB: the estimate over-counts plain text about five
 times, see below); the tests' 3,000,000-character document estimates at
 1.38 GB, so a 1 GB default would refuse it. Time follows the estimate at
-up to about 8 s per GB on the test machine, so at the default an
-uncancellable load takes at most about 16 s. Every session can use up to
+up to about 8 s per GB on the test machine (release build; the core test
+asserts it for every input of its battery when run with `--release`), so
+at the default an uncancellable load takes at most about 16 s. A dev
+build (`cargo pgrx install` without `--release`) does not optimize the
+extension's own crates, and its scan is about ten times slower. Every session can use up to
 the limit at once (plus the stored documents a merge loads, which are not
 priced), so size it like `work_mem`. Every estimate includes 64 kB, so a
 limit of 64 kB or less refuses every write (the tests use it for that).
@@ -1267,7 +1270,8 @@ In bytes, saturating, from counts read from the chunks:
   (ops + successors) / 16) × actors.
 - **Change chunks, or changes about to be applied** to a document with
   *base* changes and actors: 1000 per op + 80 per pred entry + 2500 per
-  change + 200 per dependency + 200 per distinct actor + 0.3 × (changes ×
+  change + 200 per dependency + 200 per distinct actor + 100 per entry of
+  a change's list of other actors (duplicates included) + 0.3 × (changes ×
   (base actors + new actors) + base changes × new actors).
 - **Plus** 10 per byte of the chunks with their columns inflated, and 64 kB
   (Automerge's fixed structures, which the per-unit costs do not cover for
@@ -1286,7 +1290,16 @@ length before it checks the columns against each other, so the largest
 counts. Successors, preds and dependencies are the sums of their group
 columns (or the member columns' rows, if larger). Ops of every action are
 counted alike (deletes too; the flat 450 covers them). Actors of change
-chunks are counted by name, once each. **Gmax** is the largest number of
+chunks are counted by name, once each, for the 200 (and the clock-cache
+terms); besides, every entry of a change's list of other actors costs 100,
+duplicates included: Automerge's parse keeps one 32-byte `ActorId` per
+entry in a vector that doubles as it fills, and an entry (an empty actor
+id) takes one input byte, so a 10 kB compressed change listing 10,000,000
+empty actors peaked at 627 MB while pricing them by name and bytes said
+100 MB (measured up to 73 per entry; 100 leaves room for the old and new
+buffer of a growth step both being held). Dependencies (32 bytes each,
+320 through the bytes) and heads already cost more per entry than their
+vectors take. **Gmax** is the largest number of
 successor entries in one (object, key) group of rows: a new group starts at
 the first row, at an insert row, when the object changes, or when the key
 changes and the previous row was not an insert (a key overwritten or
@@ -1331,7 +1344,12 @@ chunk:
   row-by-row definition. Documents far below the limit never pay for it
   (on the 877 kB list document the exact pass costs about as much as the
   rest of the scan).
-- The loops run the interrupt check (a cancel stops a scan).
+- The loops run the interrupt check (a cancel stops a scan), per run of
+  a column and per entry of an actor list.
+- A change whose list of other actors is longer than the limit pays for
+  (110 per entry, its byte and the 100) stops the scan before its entries
+  are read, like a deflate bomb ("at least"): 20,000,000 empty actors
+  deflate to 19 kB, and stepping through them would take seconds.
 - It never fails. Framing it cannot parse (bad magic, lengths, column
   metadata, a column that does not inflate, an unknown chunk type) stops
   it with the counts of what came before, which is all Automerge can
@@ -1422,19 +1440,25 @@ again as new input, which is what a restore does:
   compressed saves and change chunks, `merge_changes`, `contains_changes`,
   `merge` of two documents, the accumulator) on generated documents of
   every shape the estimate prices differently and on crafted chunks (RLE
-  op, change, dependency, successor and pred bombs, many actors, a save
-  with 2,000 trailing change chunks): at the limit set to the estimate
+  op, change, dependency, successor and pred bombs, many actors, change
+  headers listing millions of empty or duplicate other actors and
+  duplicate dependencies, plain and compressed, a save with 2,000
+  trailing change chunks): at the limit set to the estimate
   the input is accepted (or refused by Automerge, for crafted input that
   does not load) with a peak below it; one byte lower it is refused before
   loading with a peak that is a small fraction of it. Also deflate bombs
   (256 MB of zeros, as a deflated column and as a compressed change chunk)
-  refused quickly with a small peak, the scan's counts against Automerge's
+  refused quickly with a small peak, a 19 kB change listing 20,000,000
+  empty actors refused at the default limit without its entries being
+  read, the scan's counts against Automerge's
   `stats()` and its own change parser, Gmax against the row-by-row
   definition on random histories, merge results outgrowing the limit, the
   guarantees under a lowered limit, bundles, and the messages.
 - The fuzz harness (`tests/fuzz.rs`): input Automerge loads is never
   marked unparseable by the scan, `normalize`'s measured peak stays below
-  the estimate, and it refuses input only when the estimate is over.
+  the estimate whether Automerge accepts the input or refuses it, and it
+  refuses input only when the estimate is over. Its seeds include change
+  chunks with repeated header list entries.
 - `src/tests/limits.rs` (pg_tests): the setting's default, unit and
   privileges; `53400` with its message, DETAIL and HINT on every SQL path
   (text input, `COPY` text and binary, the `bytea` cast, `merge` and `||`
@@ -1446,8 +1470,9 @@ again as new input, which is what a restore does:
   bundles refused whatever the limit.
 - `tests/limits.sh` (`mise run limits`, part of `mise run test`): a scratch
   cluster with its address space capped (`ulimit -v`, about 1 GB). With
-  the limit off, the 12 kB compressed save of a 12,000,000-character text
-  and a 113-byte crafted change chunk each abort the backend ("memory
+  the limit off, the 12 kB compressed save of a 12,000,000-character text,
+  a 113-byte crafted change chunk and a 19 kB compressed change chunk
+  listing 20,000,000 empty other actors each abort the backend ("memory
   allocation of 1543503872 bytes failed", signal 6) and the cluster
   restarts, which shows the inputs and the cap reproduce the crash. With
   the default limit, the same inputs through text input, the `bytea` cast,
@@ -1864,7 +1889,8 @@ What costs a load, per call:
   idempotent), `merge(automerge, bytea)` results load back with their
   heads, the load memory scan never takes input Automerge loads for
   unparseable, and `normalize`'s peak (a counting allocator) stays below
-  the estimate. 1,500 inputs per `cargo test`; `mise run fuzz` runs 200,000 (or
+  the estimate, also when Automerge refuses the input. The seeds include
+  change chunks whose header lists repeat entries. 1,500 inputs per `cargo test`; `mise run fuzz` runs 200,000 (or
   `FUZZ_ITERS`) and can save findings (`FUZZ_SAVE_DIR`) for
   `tests/corpus/`, which runs first. In 300,000 inputs it caught 4,903
   decoder panics (all `22P02`) and 19 inputs that load but whose re-save
@@ -2461,7 +2487,14 @@ bytes) 0.68, of one op with 200,000 successors (136 bytes) 0.48, of a
 200,000-item list (141 bytes) 0.17; a change chunk of 100,000 ops (104
 bytes) 0.58, of one op with 1,000,000 preds (71 bytes) 0.08 (priced as the
 document it normalizes to, where the preds become successors on one key);
-a save followed by 2,000 change chunks 0.34. Merges of two concurrent
+a save followed by 2,000 change chunks 0.34. Change chunks whose header
+lists repeat entries (added after review, which found the first version
+priced other actors by name: a 200 kB input estimated just under 2 GB
+aborted a scratch cluster capped at 4 GB): 1,100,000 or 2,200,000 empty
+other actors, plain or compressed (1-2 kB), 0.64, 1,100,000 copies of one
+16-byte actor 0.32, 1,100,000 copies of one dependency (compressed, 34 kB)
+0.36; in release they take 1.3 s per GB of the estimate, the battery's
+worst being 5.5 s per GB (change chunks of 1,000 actors). Merges of two concurrent
 documents (both loaded, the other's changes applied): 0.21 to 0.38 of the
 two loads plus the apply estimate. Refused inputs peak below 64 kB for the
 run-length bombs (100 to 221 bytes describing 10^8 to 2^62 rows) and below

@@ -194,6 +194,44 @@ fn client_input_over_the_limit_is_53400_on_every_path() {
         "1 MB",
         "Loading it could take at least ",
     );
+    // A change chunk whose header lists the empty actor id `others`
+    // times (one byte each; Automerge keeps every entry): priced per
+    // entry, 110 bytes. 9,000 entries are 990 kB: read, and with the
+    // rest over 1 MB, "up to" (priced by name, as the first version did,
+    // it was 160 kB); 20,000 are more than the limit pays for, so the scan
+    // stops before reading them: "at least".
+    let listing = |others: usize| {
+        let mut data = vec![0u8, 16];
+        data.extend([9u8; 16]);
+        data.extend([1, 1, 0, 0]); // seq, start op, time, message
+        let mut n = others;
+        while n >= 0x80 {
+            data.push((n & 0x7f) as u8 | 0x80);
+            n >>= 7;
+        }
+        data.push(n as u8);
+        data.extend(std::iter::repeat_n(0u8, others));
+        data.push(0); // no columns
+        let mut out = vec![0x85, 0x6f, 0x4a, 0x83, 0, 0, 0, 0, 1];
+        let mut n = data.len();
+        while n >= 0x80 {
+            out.push((n & 0x7f) as u8 | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+        out.extend(data);
+        out
+    };
+    for (others, detail) in [(9_000, "Loading it could take up to "), (20_000, "Loading it could take at least ")] {
+        let h = hex(&listing(others));
+        for sql in [
+            format!("SELECT '{h}'::automerge"),
+            format!("UPDATE lim SET doc = merge(doc, '{h}'::bytea)"),
+            format!("SELECT automerge_contains(doc, '{h}'::bytea) FROM lim"),
+        ] {
+            assert_over_limit(&sql, INPUT, "1 MB", detail);
+        }
+    }
     // Nothing was written.
     let unchanged: bool = one("SELECT doc::bytea = $1 FROM lim", &[small.into()]);
     assert!(unchanged);

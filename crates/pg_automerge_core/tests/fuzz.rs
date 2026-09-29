@@ -22,7 +22,8 @@
 //!   loads back with the document's heads;
 //! - the load memory scan (`budget::scan_input`) never marks input that
 //!   Automerge loads as malformed, and the peak memory of `normalize`
-//!   (measured by a counting allocator) stays below its estimate;
+//!   (measured by a counting allocator) stays below its estimate, whether
+//!   it accepts the input or Automerge refuses it;
 //!   `normalize` rejects input over the limit (`Error::LoadLimit`) only
 //!   when the estimate says so.
 //!
@@ -48,6 +49,8 @@ use pg_automerge_core::{Error, normalize};
 mod common;
 #[path = "common/counting.rs"]
 mod counting;
+#[path = "common/craft.rs"]
+mod craft;
 
 use common::{Rng, chunk, edit, random_replicas, reference_normalize};
 
@@ -167,7 +170,8 @@ fn mutate(input: &[u8], other: &[u8], rng: &mut Rng) -> Vec<u8> {
 }
 
 /// Seed inputs: saves (plain and compressed), incremental change chunks,
-/// and concatenations of those, from random histories.
+/// and concatenations of those, from random histories; and change chunks
+/// whose header lists repeat dependencies and empty other actors.
 fn seeds() -> Vec<Vec<u8>> {
     let mut seeds = Vec::new();
     for seed in 0..8 {
@@ -194,6 +198,8 @@ fn seeds() -> Vec<Vec<u8>> {
     seeds.push([base.as_slice(), &changes].concat());
     seeds.push(changes);
     seeds.push(doc.save());
+    seeds.push(craft::listing(3, 200, 0));
+    seeds.push(craft::compressed_listing(2, 300, 1));
     seeds
 }
 
@@ -232,13 +238,16 @@ fn check(input: &[u8], base: &[u8]) -> Notable {
             assert!(err.estimate > err.limit);
             return Notable::Nothing;
         }
-        if let Ok(stored) = &normalized {
-            let estimate = scanned.load_estimate().max(doc_estimate(&scan_doc(stored)));
-            assert!(
-                peak <= estimate,
-                "normalize peak {peak} above the estimate {estimate}"
-            );
-        }
+        // Accepted or refused by Automerge: the estimate bounds the peak
+        // either way (a refusal after parsing has spent the memory).
+        let estimate = match &normalized {
+            Ok(stored) => scanned.load_estimate().max(doc_estimate(&scan_doc(stored))),
+            Err(_) => scanned.load_estimate(),
+        };
+        assert!(
+            peak <= estimate,
+            "normalize peak {peak} above the estimate {estimate} ({normalized:?})"
+        );
         let notable = match &normalized {
             Err(Error::InvalidInput(m)) if m.contains("malformed data") => Notable::DecoderPanic,
             Err(Error::InvalidInput(m))

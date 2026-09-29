@@ -9,6 +9,10 @@
 //! - `ops.bin`: a crafted change chunk of about 100 bytes whose
 //!   run-length encoded columns describe `LIMITS_OPS` (default 20,000,000)
 //!   list inserts, which Automerge loads (several GB).
+//! - `others.bin`: a compressed change chunk of about 19 kB whose header
+//!   lists the empty actor id `LIMITS_OTHERS` (default 20,000,000) times;
+//!   Automerge's parse keeps one 32-byte entry each (over a gigabyte)
+//!   before it rejects the change.
 //! - `small.bin`: an ordinary small document.
 
 use std::path::PathBuf;
@@ -30,6 +34,7 @@ fn main() {
     let dir = PathBuf::from(std::env::args().nth(1).expect("usage: gen_limits <dir>"));
     let chars = env_or("LIMITS_TEXT_CHARS", 12_000_000);
     let ops = env_or("LIMITS_OPS", 20_000_000);
+    let others = env_or("LIMITS_OTHERS", 20_000_000);
 
     let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
     let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
@@ -37,6 +42,11 @@ fn main() {
     std::fs::write(dir.join("text.bin"), doc.save()).unwrap();
 
     std::fs::write(dir.join("ops.bin"), craft::change_ops(ops as u64)).unwrap();
+    std::fs::write(
+        dir.join("others.bin"),
+        craft::compressed_listing(0, others as u64, 0),
+    )
+    .unwrap();
 
     let mut small = AutoCommit::new().with_actor(ActorId::from([2u8; 16]));
     small.put(ROOT, "status", "small").unwrap();

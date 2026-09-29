@@ -360,3 +360,55 @@ pub fn compressed_bomb(n: u64) -> Vec<u8> {
     out.extend(deflated);
     out
 }
+
+/// The data of an empty change chunk of actor 0 (seq 1, start op 1, no
+/// ops) whose header lists `deps` dependencies (all the same hash) and
+/// `others` other actors, each `other_len` bytes (all the same): the
+/// length-prefixed lists Automerge parses into vectors, one entry per
+/// listed item, duplicates included.
+pub fn listing_data(deps: u64, others: u64, other_len: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    uleb(&mut data, deps);
+    for _ in 0..deps {
+        data.extend([7u8; 32]);
+    }
+    let a = actor(0);
+    uleb(&mut data, a.len() as u64);
+    data.extend(&a);
+    uleb(&mut data, 1); // seq
+    uleb(&mut data, 1); // start op
+    sleb(&mut data, 0); // time
+    uleb(&mut data, 0); // message
+    uleb(&mut data, others);
+    let other = vec![3u8; other_len];
+    for _ in 0..others {
+        uleb(&mut data, other_len as u64);
+        data.extend(&other);
+    }
+    uleb(&mut data, 0); // no columns
+    data
+}
+
+/// A change chunk of [`listing_data`].
+pub fn listing(deps: u64, others: u64, other_len: usize) -> Vec<u8> {
+    chunk(1, &listing_data(deps, others, other_len))
+}
+
+/// The same change as a compressed chunk (type 2: the checksum of the
+/// uncompressed chunk, deflated data).
+pub fn compressed_listing(deps: u64, others: u64, other_len: usize) -> Vec<u8> {
+    compress(&listing_data(deps, others, other_len))
+}
+
+/// A compressed change chunk (type 2) of the change chunk data `raw`.
+pub fn compress(raw: &[u8]) -> Vec<u8> {
+    let mut out = chunk(1, raw);
+    let deflated = deflate(raw);
+    let mut len = Vec::new();
+    uleb(&mut len, deflated.len() as u64);
+    out.truncate(8);
+    out.push(2);
+    out.extend(len);
+    out.extend(deflated);
+    out
+}

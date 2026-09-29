@@ -11,11 +11,13 @@
 #      crashed a capped server before the limit existed still do: a 12 kB
 #      compressed save of a 12,000,000-character text and a 113-byte
 #      crafted change chunk of 20,000,000 ops each abort the backend and
-#      the cluster restarts (checked in the log). This proves the inputs
-#      and the cap reproduce the crash.
+#      the cluster restarts (checked in the log), and so does a 19 kB
+#      compressed change chunk listing 20,000,000 empty other actors.
+#      This proves the inputs and the cap reproduce the crash.
 #   2. With the default limit, the same inputs through every path (text
 #      input, the bytea cast, merge(automerge, bytea), automerge_contains,
-#      COPY) get a clean ERROR 53400 with its DETAIL and HINT, and nothing
+#      COPY) get a clean ERROR 53400 with its DETAIL and HINT (the actor
+#      list "at least": the scan stops at its declared length), and nothing
 #      restarts: no new "terminated by signal" in the log, a session opened
 #      before is still connected, pg_postmaster_start_time() unchanged, and
 #      ordinary writes still work.
@@ -73,6 +75,7 @@ ssql -c "CREATE EXTENSION pg_automerge" \
 
 TEXT="pg_read_binary_file('$IN/text.bin')"
 OPS="pg_read_binary_file('$IN/ops.bin')"
+OTHERS="pg_read_binary_file('$IN/others.bin')"
 
 wait_ready() {
     for _ in $(seq 1 300); do
@@ -83,7 +86,7 @@ wait_ready() {
 }
 
 if [[ "${LIMITS_SKIP_CRASH:-0}" != 1 ]]; then
-    for input in "$TEXT" "$OPS"; do
+    for input in "$TEXT" "$OPS" "$OTHERS"; do
         log "no limit: $input aborts the backend and restarts the cluster"
         before="$(crashes)"
         if out="$(ssql -c "SET pg_automerge.max_load_memory = -1" \
@@ -123,11 +126,15 @@ for stmt in \
     "UPDATE docs SET doc = doc || $OPS WHERE id = 1" \
     "SELECT automerge_contains(doc, $OPS) FROM docs" \
     "INSERT INTO docs VALUES (2, $TEXT)" \
-    "COPY docs (doc) FROM '$WORK/text.copy'"; do
+    "COPY docs (doc) FROM '$WORK/text.copy'" \
+    "SELECT $OTHERS::automerge" \
+    "UPDATE docs SET doc = merge(doc, $OTHERS) WHERE id = 1" \
+    "SELECT automerge_contains(doc, $OTHERS) FROM docs"; do
     out="$(ssql -v VERBOSITY=verbose -c "$stmt" 2>&1)" && fail "no error: ${stmt:0:80}"
     grep -q 'ERROR:  53400: estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (2048 MB)' \
         <<<"$out" || fail "${stmt:0:80}: $out"
-    grep -q "DETAIL:  Loading it could take up to [0-9]* MB (" <<<"$out" || fail "${stmt:0:80}: no DETAIL: $out"
+    grep -Eq "DETAIL:  Loading it could take (up to|at least) [0-9]* MB \(" <<<"$out" \
+        || fail "${stmt:0:80}: no DETAIL: $out"
     grep -q 'HINT:  A superuser can raise "pg_automerge.max_load_memory".' <<<"$out" \
         || fail "${stmt:0:80}: no HINT: $out"
 done

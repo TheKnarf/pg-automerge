@@ -30,7 +30,9 @@
 //!   summed (successors, dependencies), and [`DocCounts::gmax`] is found
 //!   by merging the object, key, insert and successor columns run by run.
 //! - A change chunk (compressed or not): its dependencies, actors and op
-//!   columns.
+//!   columns. Its list of other actors is priced per entry, duplicates
+//!   included (Automerge keeps every entry); a list longer than the limit
+//!   pays for stops the scan ([`InputCounts::truncated`]).
 //! - Bundle chunks are not read: [`InputCounts::bundle`], which callers
 //!   reject (an experimental Automerge format).
 //!
@@ -102,6 +104,13 @@ const INSERT: u64 = 0x34;
 /// Bytes charged per inflated input byte (values and strings are copied
 /// into the document, 5-7 bytes each measured).
 const PER_BYTE: u64 = 10;
+/// Bytes charged per entry of a change's list of other actors, duplicates
+/// included, besides its bytes: Automerge parses the list into a vector
+/// of 32-byte `ActorId`s that doubles as it fills (`length_prefixed`),
+/// while an entry (an empty actor id) takes one input byte. Measured up
+/// to 63 per entry; 96 is three `ActorId`s, the old and the new buffer
+/// of a growth step both held.
+const PER_OTHER_ACTOR: u128 = 100;
 /// Bytes charged for any load or apply, whatever it holds: Automerge's
 /// fixed structures, which the per-unit costs do not cover for tiny
 /// documents.
@@ -177,6 +186,10 @@ pub struct ChangeCounts {
     pub deps: u64,
     /// Distinct actors (a change's own and its other actors).
     pub actors: u64,
+    /// Entries of the changes' lists of other actors, duplicates
+    /// included: Automerge keeps one `ActorId` per entry while it parses
+    /// a change, and an entry can take a single byte.
+    pub other_actor_entries: u64,
     /// Bytes of the chunks' data, inflated.
     pub inflated: u64,
 }
@@ -220,6 +233,7 @@ impl DocCounts {
             changes: self.changes,
             deps: self.deps,
             actors: self.actors,
+            other_actor_entries: 0,
             inflated: 0,
         }
     }
@@ -234,6 +248,9 @@ impl ChangeCounts {
         self.changes = self.changes.saturating_add(other.changes);
         self.deps = self.deps.saturating_add(other.deps);
         self.actors = self.actors.saturating_add(other.actors);
+        self.other_actor_entries = self
+            .other_actor_entries
+            .saturating_add(other.other_actor_entries);
         self.inflated = self.inflated.saturating_add(other.inflated);
     }
 }
@@ -297,7 +314,8 @@ pub fn doc_estimate(d: &DocCounts) -> u64 {
 
 /// Estimated peak bytes of parsing and applying changes with these counts
 /// to a document with `base`'s changes and actors: 1000 per op, 80 per
-/// pred, 2500 per change, 200 per dependency and per actor, 0.3 per
+/// pred, 2500 per change, 200 per dependency and per actor, 100 per entry
+/// of a change's list of other actors (duplicates included), 0.3 per
 /// change × actor of the result's clock cache, 10 per inflated byte, and
 /// 64 kB.
 pub fn changes_estimate(c: &ChangeCounts, base: Base) -> u64 {
@@ -316,6 +334,7 @@ pub fn changes_estimate(c: &ChangeCounts, base: Base) -> u64 {
         + 2500 * changes
         + 200 * deps
         + 200 * actors
+        + PER_OTHER_ACTOR * u128::from(c.other_actor_entries)
         + 3 * (changes * (base_actors + actors) + base_changes * actors) / 10
         + u128::from(PER_BYTE) * inflated)
 }
@@ -335,8 +354,9 @@ pub struct InputCounts {
     pub changes: ChangeCounts,
     /// The scan stopped because inflating deflated data produced more than
     /// a tenth of the limit (each such byte is charged 10 bytes, so the
-    /// input exceeds the limit whatever else it describes); the counts are
-    /// only a lower bound.
+    /// input exceeds the limit whatever else it describes), or because a
+    /// change lists more other actors than the limit pays for (each entry
+    /// is charged 110 bytes); the counts are only a lower bound.
     pub truncated: bool,
     /// The input does not parse (framing, lengths, column metadata, a
     /// deflated column that does not inflate); the counts cover what comes
@@ -1082,11 +1102,14 @@ struct Column<'a> {
 enum Stop {
     /// It does not parse.
     Malformed,
-    /// The inflated bytes exceed the cap.
+    /// The inflated bytes exceed the cap, or a list of other actors is
+    /// longer than the limit pays for.
     Truncated,
 }
 
 struct Scanner {
+    /// The limit, `None` without one.
+    limit: Option<u64>,
     /// The largest number of bytes inflation may still produce (the limit
     /// over [`PER_BYTE`]), `None` without a limit.
     cap: Option<u64>,
@@ -1104,9 +1127,10 @@ struct Scanner {
 }
 
 impl Scanner {
-    fn new(cap: Option<u64>, exact_gmax: bool) -> Self {
+    fn new(limit: Option<u64>, exact_gmax: bool) -> Self {
         Scanner {
-            cap,
+            limit,
+            cap: limit.map(|l| l / PER_BYTE),
             inflated: 0,
             deflated_out: 0,
             actors: HashSet::new(),
@@ -1139,6 +1163,14 @@ impl Scanner {
         match self.cap {
             Some(cap) if self.deflated_out > cap => Err(Stop::Truncated),
             _ => Ok(out),
+        }
+    }
+
+    /// Note an actor id (by name: counted once however often it is
+    /// listed; a repeat allocates nothing).
+    fn actor(&mut self, id: &[u8]) {
+        if !self.actors.contains(id) {
+            self.actors.insert(id.to_vec());
         }
     }
 
@@ -1236,6 +1268,7 @@ impl Scanner {
         }
         counts.actors = actors as u64;
         for _ in 0..actors {
+            self.ticker.tick();
             let len = r.usize_c().ok_or_else(malformed)?;
             r.take(len).ok_or_else(malformed)?;
         }
@@ -1284,21 +1317,34 @@ impl Scanner {
         r.take(deps.checked_mul(32).ok_or_else(malformed)?)
             .ok_or_else(malformed)?;
         let len = r.usize_c().ok_or_else(malformed)?;
-        self.actors
-            .insert(r.take(len).ok_or_else(malformed)?.to_vec());
+        self.actor(r.take(len).ok_or_else(malformed)?);
         r.uleb().ok_or_else(malformed)?; // seq
         r.uleb().ok_or_else(malformed)?; // start op
         r.sleb().ok_or_else(malformed)?; // time
         let len = r.usize_c().ok_or_else(malformed)?;
         r.take(len).ok_or_else(malformed)?; // message
         let others = r.usize_c().ok_or_else(malformed)?;
-        if others > data.len() {
+        if others > data.len() - r.pos {
             return Err(Stop::Malformed);
         }
+        // The entries alone (each at least a byte) exceed the limit: stop
+        // before stepping through them (millions of one-byte entries
+        // inflate from a few kB).
+        if self.limit.is_some_and(|l| {
+            others as u128 * (PER_OTHER_ACTOR + u128::from(PER_BYTE)) > u128::from(l)
+        }) {
+            return Err(Stop::Truncated);
+        }
+        // Every entry is priced, duplicates too (Automerge keeps them
+        // all), including those before a point where the list stops
+        // parsing (Automerge has allocated for them when it fails).
         for _ in 0..others {
-            let len = r.usize_c().ok_or_else(malformed)?;
-            self.actors
-                .insert(r.take(len).ok_or_else(malformed)?.to_vec());
+            self.ticker.tick();
+            let Some(id) = r.usize_c().and_then(|len| r.take(len)) else {
+                return Err(Stop::Malformed);
+            };
+            counts.other_actor_entries = counts.other_actor_entries.saturating_add(1);
+            self.actor(id);
         }
         let meta = Self::metadata(&mut r).ok_or_else(malformed)?;
         let cols = self.columns(&mut r, &meta, false)?;
@@ -1470,7 +1516,7 @@ pub fn scan_input_exact(bytes: &[u8], limit: Option<u64>) -> InputCounts {
 }
 
 fn scan(bytes: &[u8], limit: Option<u64>, exact_gmax: bool) -> InputCounts {
-    let mut scanner = Scanner::new(limit.map(|l| l / PER_BYTE), exact_gmax);
+    let mut scanner = Scanner::new(limit, exact_gmax);
     let mut counts = InputCounts::default();
     let mut r = Reader::new(bytes);
     let mut chunks = 0usize;
@@ -1514,11 +1560,12 @@ fn scan(bytes: &[u8], limit: Option<u64>, exact_gmax: bool) -> InputCounts {
                     let mut ar = Reader::new(data);
                     if let Some(n) = ar.uleb() {
                         for _ in 0..n.min(data.len() as u64) {
+                            scanner.ticker.tick();
                             let Some(len) = ar.uleb().and_then(|l| usize::try_from(l).ok()) else {
                                 break;
                             };
                             let Some(id) = ar.take(len) else { break };
-                            scanner.actors.insert(id.to_vec());
+                            scanner.actor(id);
                         }
                     }
                 }

@@ -226,7 +226,19 @@ fn check_normalize(name: &str, input: &[u8], loads: bool) -> u64 {
     let limit = estimate.max(stored_estimate);
 
     set_limit(Some(Some(limit)));
+    let start = std::time::Instant::now();
     let (result, peak) = peak_of(|| normalize(input));
+    let elapsed = start.elapsed().as_secs_f64();
+    // Time follows the estimate (docs/DESIGN.md: about 8 s per GB at
+    // most); only meaningful in a release build (`cargo test --release`),
+    // the dev build does not optimize this crate.
+    let per_gb = elapsed / (limit as f64 / f64::from(1u32 << 30));
+    if !cfg!(debug_assertions) {
+        assert!(
+            elapsed <= 8.0 * limit as f64 / f64::from(1u32 << 30) + 0.25,
+            "{name}: {elapsed:.2} s for an estimate of {limit} ({per_gb:.1} s per GB)"
+        );
+    }
     assert!(
         limit_error(result.clone()).is_none(),
         "{name}: rejected at its own estimate: {result:?}"
@@ -238,7 +250,7 @@ fn check_normalize(name: &str, input: &[u8], loads: bool) -> u64 {
         peak as f64 / limit as f64
     );
     eprintln!(
-        "{name}: {} bytes, estimate {limit}, peak {peak} ({:.2})",
+        "{name}: {} bytes, estimate {limit}, peak {peak} ({:.2}), {elapsed:.3} s ({per_gb:.2} s per GB)",
         input.len(),
         peak as f64 / limit as f64
     );
@@ -297,6 +309,43 @@ fn crafted_inputs_are_priced_before_they_load() {
     );
     check_normalize("crafted deps 1000x1000", &craft::deps(1_000), false);
     check_normalize("crafted succ 200k", &craft::succ(200_000), false);
+    // Length-prefixed header lists, which Automerge parses into vectors
+    // entry by entry, duplicates included: other actors that are empty
+    // (one byte each) or all the same, and dependencies (unknown: the
+    // change is left missing its dependencies). Counts just past a power
+    // of two, where a doubling vector overshoots most.
+    for n in [1_100_000, 2_200_000] {
+        check_normalize(
+            &format!("crafted {n} empty other actors"),
+            &craft::listing(0, n, 0),
+            false,
+        );
+        check_normalize(
+            &format!("crafted {n} empty other actors, compressed"),
+            &craft::compressed_listing(0, n, 0),
+            false,
+        );
+    }
+    check_normalize(
+        "crafted 1.1M duplicate other actors",
+        &craft::listing(0, 1_100_000, 16),
+        false,
+    );
+    check_normalize(
+        "crafted 300k duplicate deps",
+        &craft::listing(300_000, 0, 0),
+        false,
+    );
+    check_normalize(
+        "crafted 1.1M duplicate deps, compressed",
+        &craft::compressed_listing(1_100_000, 0, 0),
+        false,
+    );
+    check_normalize(
+        "crafted 300k deps and 1.1M other actors",
+        &craft::listing(300_000, 1_100_000, 0),
+        false,
+    );
     // Trailing change chunks after a save: many changes, each a chunk.
     let mut doc = generated("changes", 100);
     let base = doc.save();
@@ -345,6 +394,38 @@ fn rle_bombs_are_rejected_with_a_tiny_peak() {
         );
         assert!(peak < 64 << 10, "{name}: contains_changes peak {peak}");
     }
+    set_limit(None);
+}
+
+#[test]
+fn header_list_bombs_are_rejected_before_they_are_walked() {
+    // 20,000,000 empty other actors in a 19 kB compressed change chunk:
+    // 2.2 GB at 110 bytes per entry, over the default limit. The scan
+    // stops at the declared count, after the inflation (20 MB), without
+    // stepping through the entries; the uncompressed chunk too.
+    set_limit(Some(Some(budget::DEFAULT_LIMIT)));
+    for (name, input) in [
+        ("compressed", craft::compressed_listing(0, 20_000_000, 0)),
+        ("plain", craft::listing(0, 20_000_000, 0)),
+    ] {
+        let start = std::time::Instant::now();
+        let (result, peak) = peak_of(|| normalize(&input));
+        let err = limit_error(result).unwrap_or_else(|| panic!("{name}: not rejected"));
+        assert!(err.at_least, "{name}: the scan stopped early");
+        assert!(peak < 3 * (20 << 20), "{name}: peak {peak}");
+        assert!(
+            start.elapsed().as_secs() < 2,
+            "{name}: took {:?}",
+            start.elapsed()
+        );
+        let base = Automerge::new().save_nocompress();
+        let (result, peak) = peak_of(|| loaded::merge_changes(Input::Stored(&base), &input));
+        assert!(limit_error(result).is_some(), "{name}: merge_changes");
+        assert!(peak < 3 * (20 << 20), "{name}: merge_changes peak {peak}");
+        let result = loaded::contains_changes(Input::Stored(&base), &input);
+        assert!(limit_error(result).is_some(), "{name}: contains_changes");
+    }
+    assert!(craft::compressed_listing(0, 20_000_000, 0).len() < 20_000);
     set_limit(None);
 }
 
