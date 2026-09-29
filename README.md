@@ -53,13 +53,14 @@ found only through `search_path` (or as `OPERATOR(x.||)`); the casts work
 regardless.
 
 It is **not trusted** (`trusted = false`): only a superuser can install
-it, not a database owner. The reason is a denial of service: a few kB of
-crafted (or merely compressed, highly repetitive) Automerge input can make
-a single load allocate gigabytes, and a failed Rust allocation aborts the
-backend, which restarts the whole cluster. Anyone who can write to an
-`automerge` column can send such input (see
-[Limitations](#limitations-and-gotchas)), so installing it into a
-database is a superuser's decision. Details in
+it, not a database owner. A few kB of crafted (or merely compressed,
+highly repetitive) Automerge input can describe a document that takes
+gigabytes to load, and a failed Rust allocation aborts the backend, which
+restarts the whole cluster. Every write is priced before it is loaded and
+refused over [`pg_automerge.max_load_memory`](#configuration), but that
+bound rests on measured costs, memory stays outside Postgres' accounting
+and a load cannot be cancelled, so installing it into a database remains
+a superuser's decision. Details in
 [DESIGN.md](docs/DESIGN.md#installation-schema-and-privileges).
 
 There are no published packages yet (tag builds in CI attach a tarball,
@@ -211,9 +212,9 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `bytea → automerge` | I S P | Assignment cast (validates). |
 | `automerge → bytea` | | Explicit binary-coercible cast: the stored Automerge bytes. |
 | `automerge → jsonb` | I S P | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
-| `merge(a, b)`, `a \|\| b` | I S P | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. Two histories with different changes under one actor id cannot be merged (22000, see [Limitations](#limitations-and-gotchas)). |
+| `merge(a, b)`, `a \|\| b` | I S P | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. Two histories with different changes under one actor id cannot be merged (22000, see [Limitations](#limitations-and-gotchas)); a result over `pg_automerge.max_load_memory` is refused (53400). |
 | `merge(doc, changes bytea)`, `doc \|\| changes` | I S P | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them in the DETAIL). |
-| `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. Loads a document only to merge it: a single row, or a version plus older ones, costs no load or one. |
+| `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. Loads a document only to merge it: a single row, or a version plus older ones, costs no load or one. A merged state over `pg_automerge.max_load_memory` is refused (53400). |
 | `automerge_heads(automerge) → text[]` | I S P | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
 | `automerge_contains(a, b) → bool` | I S P | Whether `a` already has every change of `b`. Decided without loading when the heads or the change counts can tell (`b` newer than or concurrent with `a`); otherwise loads `a`. |
 | `automerge_contains(doc, changes bytea) → bool` | I S P | Whether `merge(doc, changes)` would add nothing (every change in the save or change chunks is already in `doc`). Usually decided without loading the document; when it loads, changes that reuse an actor id of `doc` with different content fail as in `merge` (22000). |
@@ -240,7 +241,37 @@ concurrent values show Automerge's winner. Details in
 
 | Setting | Default | Who can change it | Effect |
 |---|---|---|---|
+| `pg_automerge.max_load_memory` | `2GB` | superusers, or roles granted `SET` on it; also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Refuse client input and merge results whose estimated load exceeds this (kB, like `work_mem`; `-1`: no limit) |
 | `pg_automerge.verify_writes` | `on` | superusers, or roles granted `SET` on it (`GRANT SET ON PARAMETER pg_automerge.verify_writes TO writer`); also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Load back the normalized save of every value built from client bytes (text input, binary receive, the `bytea` cast, `merge(automerge, bytea)` results) before it is stored or sent |
+
+`pg_automerge.max_load_memory` protects the server from input that
+describes far more than it holds (see
+[Limitations](#limitations-and-gotchas)). Every value built from client
+bytes (text input, `COPY`, binary parameters, the `bytea` cast,
+`merge(doc, $bytes)`, `automerge_contains(doc, $bytes)`) is priced from
+its headers before it is loaded, and so is every merge result (`merge`,
+`||`, `merge_agg`, PL/pgSQL chains); over the limit it fails with
+SQLSTATE `53400`:
+
+```text
+ERROR:  estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (2048 MB)
+DETAIL:  Loading it could take up to 9537 MB (10000001 operations, 1 change, 1 actor, 123 bytes uncompressed).
+HINT:  A superuser can raise "pg_automerge.max_load_memory".
+```
+
+The estimate is deliberately pessimistic (plain text is priced at about
+five times its real cost): the 2 GB default admits about 4.4 million
+characters of text, whose load really takes about 0.4 GB and up to 16 s.
+Each session can use up to the limit at once, so size it like
+`work_mem`. Reading stored values is never limited, so lowering the limit
+never makes data unreadable, and writes that add nothing (re-sent saves or
+changes) are not refused. But merging two documents that each fit can
+fail when the result would not, and restoring a dump into a server with a
+lower limit refuses the larger rows: restore with
+`PGOPTIONS='-c pg_automerge.max_load_memory=-1' pg_restore ...` as a
+superuser. On a logical replication subscriber, set it for the
+subscription's owner at least as high as on the publisher. Details in
+[DESIGN.md](docs/DESIGN.md#resource-limits).
 
 With `pg_automerge.verify_writes = off`, incremental writes
 (`merge(doc, $changes)`) cost one load instead of two, and input that is not
@@ -308,14 +339,20 @@ Details in
   4.3 s and 390 MB to load, and memory grows linearly with what the input
   describes, not with its size. That memory is outside Postgres'
   accounting, and when an allocation fails the backend aborts and the
-  postmaster restarts every session. There is no size limit yet; let only
-  roles you trust write `automerge` values (input functions and casts
-  cannot be revoked) and keep memory overcommit in mind.
+  postmaster restarts every session. `pg_automerge.max_load_memory`
+  refuses such input before it is loaded (see
+  [Configuration](#configuration)); what it cannot do is bound several
+  sessions together, or catch a load that costs more than its measured
+  model predicts (an Automerge upgrade re-measures it). Keep memory
+  overcommit in mind, and `-1` only for trusted writers.
+- **Bundle chunks** (Automerge's experimental format that packs many
+  changes into one chunk) are refused as input (`0A000`).
 - **A load is not interruptible.** The jsonb conversion and the history
   functions check for interrupts as they go (and `merge_agg` between
   rows), but a single Automerge load, merge or save runs to the end
   before a cancel or `statement_timeout` takes effect: 2.5 s for a 3 MB
-  document, longer for documents of tens of MB.
+  document, longer for documents of tens of MB (at most about 16 s for
+  input within the default `pg_automerge.max_load_memory`).
 - **Every writer needs its own actor id.** Two writers (or two copies of
   a document) that commit with the same actor id produce different changes
   with the same sequence number, and Automerge cannot merge them. Every
@@ -331,7 +368,8 @@ Details in
 - Malformed input is SQLSTATE `22P02` (`invalid automerge document`),
   including input that passes Automerge's checksums but panics its decoder;
   input that is well formed but holds two conflicting histories of one
-  actor is `22000` (above).
+  actor is `22000` (above), input (or a merge result) over
+  `pg_automerge.max_load_memory` is `53400`.
   One rare case is reported late: a result of `merge(doc, bytea)` is checked
   to survive a save and load when it is first stored, sent or cast, not
   inside `merge` (a `BEGIN .. EXCEPTION` around just the `merge` does not
@@ -360,7 +398,10 @@ Details in
   these caveats:
   - The subscriber needs the extension, and validates every replicated
     value again on the way in: one load per row and column (2.5 s for a 3
-    MB document), whichever mode.
+    MB document), whichever mode, within the subscriber's
+    `pg_automerge.max_load_memory` (set it for the subscription's owner
+    at least as high as on the publisher, or the apply worker fails on a
+    larger row and retries).
   - Use a primary key (or unique index) as the replica identity. With
     `REPLICA IDENTITY FULL` the subscriber cannot match rows for `UPDATE`
     and `DELETE` ("could not identify an equality operator for type
@@ -371,8 +412,10 @@ Details in
     TRIGGER` (or `ENABLE REPLICA`).
 - **Dump and restore** (`tests/dump.sh`): plain and custom-format dumps
   restore with the extension in any schema; a restore and `COPY FROM`
-  validate every value (one load each) and recompute stored generated
-  columns (one more conversion each).
+  validate every value (one load each, within
+  `pg_automerge.max_load_memory`: raise it for a restore into a server
+  with a lower limit) and recompute stored generated columns (one more
+  conversion each).
 
 ## Performance
 
@@ -403,7 +446,7 @@ Tooling runs through [mise](https://mise.jdx.dev):
 
 ```sh
 mise run pgrx-init   # once: build the Postgres pgrx develops against
-mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump, upgrade and extension scripts
+mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump, upgrade, extension and limits scripts
 mise run regress     # pg_regress examples in tests/pg_regress (checks their fixtures first)
 mise run lint        # CI/packaging checks, rustfmt, clippy -D warnings (all build configurations), rustdoc
 mise run ci          # lint + test + regress: what CI runs
@@ -412,6 +455,7 @@ mise run notify      # only: a real LISTEN session receiving automerge_notify() 
 mise run dump        # only: pg_dump/pg_restore and COPY round trips of every object kind
 mise run upgrade     # only: ALTER EXTENSION UPDATE from every released version
 mise run extension   # only: relocation (SCHEMA, SET SCHEMA, dump), install and setting privileges
+mise run limits      # only: the load memory limit against real crashes in a memory-capped scratch cluster
 mise run replication # logical replication in a scratch cluster (not part of test)
 mise run fuzz        # a long mutation-fuzzing session of the core (not part of test)
 mise run bench-sql   # median timings of the everyday SQL paths on a release build (minutes)

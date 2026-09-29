@@ -8,7 +8,8 @@ writes. Only Postgres 18 is supported.
 Contents: [Scope](#scope) · [Architecture](#architecture) ·
 [The `automerge` type](#the-automerge-type) ·
 [SQL API and semantics](#sql-api-and-semantics) ·
-[jsonb mapping](#jsonb-mapping) · [Error codes](#error-codes) ·
+[jsonb mapping](#jsonb-mapping) · [Resource limits](#resource-limits) ·
+[Error codes](#error-codes) ·
 [Performance](#performance) · [Implementation notes](#implementation-notes) ·
 [Testing](#testing) ·
 [Installation, schema and privileges](#installation-schema-and-privileges) ·
@@ -92,7 +93,9 @@ Two crates:
   loaded documents (`loaded`: `Input`, `LoadedDoc`, `merge`,
   `merge_changes`, `contains`, `contains_changes`), the `merge_agg` state
   (`MergeAccumulator`), the stored-header parser behind the heads fast path
-  and the change-chunk splitter (`header`), the history functions
+  and the change-chunk splitter (`header`), the scan that prices a load
+  before Automerge allocates (`budget`, see
+  [Resource limits](#resource-limits)), the history functions
   (`history`), the jsonb mapping as a walk into a `JsonSink` (`json`), the
   notification payload builder (`notify`), text encodings (`encoding`) and,
   with the `test-hooks` feature, test instrumentation (`test_hooks`).
@@ -180,6 +183,11 @@ Data flow:
   when they are first flattened (see
   [The deferred verification](#the-deferred-verification)); a full save
   merged that way takes the same shortcut when it is the result.
+- **Fit the limit when written.** Every value built from client bytes,
+  and every merge result, was priced before it was built and stored
+  within `pg_automerge.max_load_memory` as it was set at that time (see
+  [Resource limits](#resource-limits)). Loading a stored value is never
+  checked, so a lower limit later never makes data unreadable.
 - **Immutable.** Nothing modifies a stored value in place: `merge` returns
   a new value, and an expanded value's document is only ever replaced as a
   whole, and only through a read-write pointer.
@@ -370,7 +378,11 @@ enforces it).
        Automerge writes with value columns right after their metadata;
        anything it does not recognize takes the loading path, where
        Automerge decides). So a chunk with known heads and a malformed
-       body is `22P02`, as that load would make it.
+       body is `22P02`, as that load would make it. The check is part of
+       the load memory scan of the input (see
+       [Resource limits](#resource-limits)), which also prices this
+       answer at what parsing the chunk takes (its inflated columns,
+       nothing for an uncompressed save).
     2. When the headers say the save has no more changes than a stored `a`
        (an older save) and the chunk parses, `a` is loaded first and
        checked for those heads, again as that load would.
@@ -1157,16 +1169,308 @@ like jsonb's own size limits): the walk itself uses an explicit stack, but
 clear error instead). The document is valid and can still be stored,
 merged and read as `bytea`; only its jsonb view fails.
 
+## Resource limits
+
+Automerge input is deflated and run-length encoded, so its size says
+little about what loading it takes: a 4 kB compressed save of a
+4,000,000-character text takes 390 MB and 4.3 s to load, a 113-byte
+change chunk can describe 10,000,000 operations (about 5 GB), and memory
+grows with what the input describes (see [Input amplification
+measurements](#input-amplification-measurements-2026-09-29)). Automerge
+allocates with the Rust global allocator, and a failed Rust allocation
+aborts the backend, after which the postmaster restarts every session of
+the cluster. Anyone who can write an `automerge` value can send such input
+(input functions are called without an `EXECUTE` check, so `REVOKE` does
+not help), and a single load cannot be cancelled. So every path that takes
+client bytes prices the load from what can be read cheaply, before
+Automerge allocates anything, and refuses it with an ERROR when the
+estimate exceeds a limit.
+
+### The `pg_automerge.max_load_memory` setting
+
+An integer in kB (like `work_mem`; `SET pg_automerge.max_load_memory =
+'512MB'`), **2 GB** by default, `-1` for no limit, superuser-only
+(`PGC_SUSET`, for the reason `verify_writes` is: one session with a higher
+limit can abort a backend, which restarts the cluster for everyone; a
+superuser can set it per role or database, or `GRANT SET ON PARAMETER`).
+Like `verify_writes`, only the library defines it: `SHOW` works once the
+library is loaded, and `SET` before that leaves a placeholder that
+Postgres checks when the library loads.
+
+It bounds an *estimate* of the peak memory of one load (or merge), in
+bytes. One setting, not separate caps on operations, changes or actors:
+memory has a changes × actors term, and the same operation costs 5 to 10
+times more as a bare change than inside a saved document, so separate caps
+would either let through what the estimate refuses or refuse ordinary
+documents.
+
+The default admits about 4.4 million characters of plain text (whose real
+peak is about 0.4 GB: the estimate over-counts plain text about five
+times, see below); the tests' 3,000,000-character document estimates at
+1.38 GB, so a 1 GB default would refuse it. Time follows the estimate at
+up to about 8 s per GB on the test machine, so at the default an
+uncancellable load takes at most about 16 s. Every session can use up to
+the limit at once (plus the stored documents a merge loads, which are not
+priced), so size it like `work_mem`. Every estimate includes 64 kB, so a
+limit of 64 kB or less refuses every write (the tests use it for that).
+
+The limit decides whether a write can be refused; it never changes a
+result's bytes, so the functions stay `IMMUTABLE`, as with
+`verify_writes` (a plan folded under one setting may raise, or not,
+under another, like `statement_timeout`).
+
+### What is checked where
+
+| Path | Priced before Automerge runs | Then |
+|---|---|---|
+| Text input (literals, `COPY`, a restore, a logical replication subscriber) | A literal whose decoded length alone exceeds the limit at 10 bytes per byte, before its hex is decoded; then as binary input | |
+| Binary input (`COPY .. BINARY`, binary parameters), the `bytea` cast | The load of the input on its own | The normalized document, as it will be stored |
+| `merge(automerge, bytea)`, `\|\|` | Bare change chunks: parsing and applying them to the document. A save whose header heads the document has (the no-op answer): only parsing it (the bytes inflation produces, once; nothing for an uncompressed save). A save loaded on its own: its load; its missing changes: applying them. A save whose trailing changes need the document: loading it after the document | Every new result, as it will be stored |
+| `automerge_contains(automerge, bytea)` | What it parses or loads, as for `merge` | |
+| `merge(automerge, automerge)`, `\|\|`, `merge_agg` (every step), PL/pgSQL `d := merge(d, x)` | Applying the changes one side adds, counted from their change chunks (`Change::raw_bytes()`) | The result, as it will be stored |
+| Reads (`::jsonb`, history, heads), the stored side of every merge, `merge_agg` inputs | never | |
+
+Refusals are `53400` (configuration_limit_exceeded):
+
+```text
+ERROR:  estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (2048 MB)
+DETAIL:  Loading it could take up to 9537 MB (10000001 operations, 1 change, 1 actor, 123 bytes uncompressed).
+HINT:  A superuser can raise "pg_automerge.max_load_memory".
+```
+
+with "merged automerge document" for a merge result ("Loading it"), "for
+applying automerge changes" for the changes a merge applies ("Applying
+them"), "Loading the document it normalizes to" in the DETAIL of an input
+whose normalized form is over the limit, and "at least" when the scan
+stopped early (below). The limit is shown in MB when it is a whole number
+of them, otherwise in kB.
+
+Why `53400` and not `54000` (program_limit_exceeded): Postgres raises
+`53400` when `temp_file_limit` is exceeded, the closest analogue, a limit
+an administrator configures; `54000` is for fixed limits and stays for the
+jsonb and nesting limits of the jsonb view. Retrying does not help unless
+the limit is raised.
+
+Bundle chunks (Automerge's experimental format that packs many changes
+into one chunk) in client input are refused with `0A000`
+(feature_not_supported) whatever the limit: pricing them would need a
+parser of their own, and Automerge does not write them unless asked to.
+
+### The estimate
+
+In bytes, saturating, from counts read from the chunks:
+
+- **A document chunk** (a save, or the loaded document a merge result will
+  be saved as): 450 per op + 30 per successor entry + 600 × Gmax + 1600 per
+  change + min(130 × (ops + successors), 1600 × changes) + 200 per
+  dependency entry + 200 per actor + 0.3 × changes × actors + 3 × min(changes,
+  (ops + successors) / 16) × actors.
+- **Change chunks, or changes about to be applied** to a document with
+  *base* changes and actors: 1000 per op + 80 per pred entry + 2500 per
+  change + 200 per dependency + 200 per distinct actor + 0.3 × (changes ×
+  (base actors + new actors) + base changes × new actors).
+- **Plus** 10 per byte of the chunks with their columns inflated, and 64 kB
+  (Automerge's fixed structures, which the per-unit costs do not cover for
+  tiny documents).
+
+A load of input on its own is the first document chunk as a document plus
+everything after it as changes applied to it (Automerge turns a later
+document chunk into changes: it is charged both as a document and as its
+changes). Loading after a document (`a ++ changes`) or applying chunks to
+it charges every chunk of the input as changes, with the document as the
+base.
+
+The counts: ops are the largest row count of the known op columns (not
+the members of a group); Automerge sizes some allocations by one column's
+length before it checks the columns against each other, so the largest
+counts. Successors, preds and dependencies are the sums of their group
+columns (or the member columns' rows, if larger). Ops of every action are
+counted alike (deletes too; the flat 450 covers them). Actors of change
+chunks are counted by name, once each. **Gmax** is the largest number of
+successor entries in one (object, key) group of rows: a new group starts at
+the first row, at an insert row, when the object changes, or when the key
+changes and the previous row was not an insert (a key overwritten or
+deleted many times, which Automerge resolves with a pending queue per
+key).
+
+The constants are the worst measured cost of each unit (the appendix);
+every generated and crafted input tried stays below the estimate, at
+most 0.80 of it (ops prepended to a list of maps). Known over-estimates:
+plain text about 5 times (appended characters cost about 90 bytes, the 450
+per op is forced by out-of-order ops at about 335; a tighter bound would
+mean simulating Automerge's per-change reorder queue), and a key
+overwritten many times in one change about 10 times (Gmax cannot tell
+deletes from successors that are rows). The estimate is only as good as
+its measurements: upgrading Automerge means re-running
+`crates/pg_automerge_core/tests/memory_bounds.rs` and the fuzz harness
+(below), which check it.
+
+### The scan
+
+`pg_automerge_core::budget::scan_input` reads the chunk headers, the
+actors and dependency lists, and the column metadata and data of every
+chunk:
+
+- Deflated columns and compressed change chunks are inflated one at a
+  time, and in total at most to a tenth of the limit: each inflated byte
+  costs 10 in the estimate, so more than that exceeds it whatever else the
+  input holds, and the scan stops there (a deflate bomb costs a tenth of
+  the limit in scan memory, at most, and is reported "at least"). An
+  uncompressed chunk is read in place.
+- Columns are counted run by run, never expanded: a run of `n` values is
+  one step whatever `n` is, and literal values are only stepped over.
+  Decoding is lenient, as Automerge's streaming decoders are: a run that
+  cannot be read ends the column.
+- Gmax is first taken at its upper bound, the chunk's successor entries
+  (0 when there are none). Only when that bound is what puts an estimate
+  over the limit is the input scanned again with Gmax computed exactly:
+  the object, key, insert and successor columns merged by runs (within a
+  stretch where each is one run, the rows are either all groups of their
+  own, being inserts or a key counter that changes every row, or all add
+  to the current group). A property test checks it against the
+  row-by-row definition. Documents far below the limit never pay for it
+  (on the 877 kB list document the exact pass costs about as much as the
+  rest of the scan).
+- The loops run the interrupt check (a cancel stops a scan).
+- It never fails. Framing it cannot parse (bad magic, lengths, column
+  metadata, a column that does not inflate, an unknown chunk type) stops
+  it with the counts of what came before, which is all Automerge can
+  allocate before it fails on the same bytes (it parses a chunk
+  completely before it reconstructs or applies it); the caller checks
+  those and lets Automerge reject the input with its own message (`22P02`,
+  as before). The fuzz harness checks that input Automerge loads is never
+  taken for unparseable.
+
+The same pass answers whether a single document chunk passes Automerge's
+chunk parse (`header::document_parses`, the condition of the no-op
+answers of `merge(automerge, bytea)` and `automerge_contains`), so those
+paths inflate a compressed save once, as before. Without a limit, input
+and the `bytea` cast walk only the chunk types (for bundles), merges of
+documents count nothing, and `merge(automerge, bytea)` and
+`automerge_contains(automerge, bytea)` still scan the input (without a
+cap) for the parse check and the bundle check.
+
+### Merge results
+
+Each loaded document carries its counts (`LoadedDoc`, the `merge_agg`
+state): exact when scanned from a save (a stored value, the input it was
+loaded from), and for a merge result an upper bound, the target's counts
+plus the changes applied (ops and dependencies added, every pred a
+successor entry and possibly all on one key, so added to Gmax too, every
+actor possibly new, the bytes added). Only when that bound exceeds the
+limit is the result saved and scanned exactly, and refused if that is
+over too; the save is kept and becomes the value's stored bytes (after the
+check of `verify_writes`, for a result of client bytes). So PL/pgSQL
+chains and `merge_agg` pay no save per step, and a merge that stays well
+within the limit costs a scan of the changes applied (and of the stored
+target, to know its counts).
+
+Consequences: merging two documents that each fit can fail with `53400`
+(the result would not), and so can `merge_agg`; repeated small writes
+cannot grow a document past the limit. The bytes term of the bound is an
+approximation (the merged columns may encode less compactly than the
+sum), so a result can be stored somewhat over the limit when its bound is
+just under it; every other term is an upper bound.
+
+### Stored values and lowering the limit
+
+Every stored value fit the limit when it was written (or was written
+with a higher limit, or none), and loading a stored value is never
+checked: reads peak at 1.0 to 1.5 times a load of the value, which was
+accepted when it was written. A separate ceiling for reads was considered
+and rejected: it would make data unreadable after the fact, which is worse
+than the memory the read takes. So lowering the limit never makes data
+unreadable, and writes that add nothing are not refused either: `UPDATE ..
+SET doc = doc`, `merge(doc, doc)`, re-sent change chunks, an older save,
+and a re-sent uncompressed save (parsed in place) load nothing new. A
+re-sent *compressed* save costs its inflation (once), refused only when
+that alone exceeds a tenth of the limit.
+
+What does get refused under a lower limit is *writing* such a value
+again as new input, which is what a restore does:
+
+- **Dump and restore**: `pg_restore`, `psql < dump` and `COPY FROM`
+  validate every value against the restoring session's limit. To restore
+  documents written under a higher limit (or none), raise it for the
+  restore: `PGOPTIONS='-c pg_automerge.max_load_memory=-1' pg_restore ...`
+  as a superuser, or `ALTER ROLE restorer SET pg_automerge.max_load_memory
+  = ...` beforehand.
+- **Logical replication**: the subscriber validates every replicated
+  value with the apply worker's setting; set it for the subscription's
+  owner or the database (`ALTER ROLE .. SET`, `ALTER DATABASE .. SET`) at
+  least as high as the publisher's, otherwise the apply worker fails on
+  such a row and retries until the setting is fixed.
+
+### What the limit cannot do
+
+- Turn an allocation failure into an ERROR. `std::alloc::
+  set_alloc_error_hook` is unstable in Rust 1.98, a `#[global_allocator]`
+  must not unwind, and allocating through `palloc` would `longjmp` over
+  Automerge's frames on failure (or abort anyway). The estimate before the
+  load is the only defence; memory beyond it (a bug in the estimate, an
+  Automerge upgrade that costs more) still aborts.
+- Bound what concurrent sessions take together (each can use up to the
+  limit), or the stored documents a merge loads besides the changes it
+  applies.
+- Make a load cancellable; it bounds its length (about 8 s per GB of the
+  estimate).
+
+### Tests
+
+- `crates/pg_automerge_core/tests/memory_bounds.rs`: a counting allocator
+  (per thread) measures the peak of every path (normalize of saves,
+  compressed saves and change chunks, `merge_changes`, `contains_changes`,
+  `merge` of two documents, the accumulator) on generated documents of
+  every shape the estimate prices differently and on crafted chunks (RLE
+  op, change, dependency, successor and pred bombs, many actors, a save
+  with 2,000 trailing change chunks): at the limit set to the estimate
+  the input is accepted (or refused by Automerge, for crafted input that
+  does not load) with a peak below it; one byte lower it is refused before
+  loading with a peak that is a small fraction of it. Also deflate bombs
+  (256 MB of zeros, as a deflated column and as a compressed change chunk)
+  refused quickly with a small peak, the scan's counts against Automerge's
+  `stats()` and its own change parser, Gmax against the row-by-row
+  definition on random histories, merge results outgrowing the limit, the
+  guarantees under a lowered limit, bundles, and the messages.
+- The fuzz harness (`tests/fuzz.rs`): input Automerge loads is never
+  marked unparseable by the scan, `normalize`'s measured peak stays below
+  the estimate, and it refuses input only when the estimate is over.
+- `src/tests/limits.rs` (pg_tests): the setting's default, unit and
+  privileges; `53400` with its message, DETAIL and HINT on every SQL path
+  (text input, `COPY` text and binary, the `bytea` cast, `merge` and `||`
+  with a save, a compressed save and change chunks, PL/pgSQL,
+  `automerge_contains`, a literal refused before decoding, a deflate
+  bomb); merge results over the limit through `merge`, `||`, `merge_agg`
+  and a PL/pgSQL chain (whose variable survives the failed step); stored
+  values readable and no-op writes accepted under a lowered limit; `-1`;
+  bundles refused whatever the limit.
+- `tests/limits.sh` (`mise run limits`, part of `mise run test`): a scratch
+  cluster with its address space capped (`ulimit -v`, about 1 GB). With
+  the limit off, the 12 kB compressed save of a 12,000,000-character text
+  and a 113-byte crafted change chunk each abort the backend ("memory
+  allocation of 1543503872 bytes failed", signal 6) and the cluster
+  restarts, which shows the inputs and the cap reproduce the crash. With
+  the default limit, the same inputs through text input, the `bytea` cast,
+  `merge`, `||`, `automerge_contains`, `INSERT` and `COPY` get `53400`
+  with DETAIL and HINT, no backend is terminated by a signal, a session
+  opened before is still connected, `pg_postmaster_start_time()` is
+  unchanged and ordinary writes work.
+- `tests/extension.sh`: the setting stays superuser-only for a
+  non-superuser database owner (as `verify_writes`).
+- The pg_regress example shows the error.
+
 ## Error codes
 
 Every error the extension raises, by SQLSTATE. The core crate's `Error`
 enum carries the class (`InvalidInput`, `MissingDependencies`,
-`ConflictingChanges`, `InvalidParameter`, `LimitExceeded`, `Internal`),
+`ConflictingChanges`, `InvalidParameter`, `LimitExceeded`, `LoadLimit`,
+`Unsupported`, `Internal`),
 and `src/error.rs` maps it; errors that only the glue can detect (NULL
 array elements, trigger usage, jsonb limits) are built there directly.
 
 | SQLSTATE | When | Message (DETAIL / HINT) |
 |---|---|---|
+| `0A000` feature_not_supported | A bundle chunk (Automerge's experimental format) in client input, whatever the limit | `automerge bundle chunks are not supported` |
 | `22P02` invalid_text_representation | Bad text input; bytes that are not a loadable Automerge save or change sequence (including decoder panics); a result that does not survive a save and load | `invalid input syntax for type automerge: ...`, `invalid automerge document: ...`, `invalid automerge changes: ...` |
 | `22P02` | `merge(automerge, bytea)` with changes whose dependencies are in neither input | `invalid automerge changes: missing N dependencies that neither the document nor the input contains` (DETAIL: `Missing changes: <hashes>.`) |
 | `22P02` | A change hash that is not 64 hex digits | `invalid automerge change hash "...": expected 64 hexadecimal digits` |
@@ -1176,6 +1480,7 @@ array elements, trigger usage, jsonb limits) are built there directly.
 | `22023` invalid_parameter_value | `automerge_to_jsonb(doc, heads)` with a head the document lacks; bad `automerge_notify` arguments (count, channel length, key column listed twice or of type `automerge`) | `automerge document does not contain change <hash>`, `automerge_notify(): ...` (HINT on how to declare the trigger, or which columns to name) |
 | `39P01` trigger_protocol_violated | `automerge_notify()` not fired `AFTER ... FOR EACH ROW` for INSERT/UPDATE/DELETE, or called outside a trigger | `automerge_notify() must be fired ...`, `automerge_notify() can only be called as a trigger` (HINT: the correct `CREATE TRIGGER`) |
 | `42703` undefined_column | `automerge_notify()` key column that does not exist | `automerge_notify(): key column "x" does not exist in table ...` |
+| `53400` configuration_limit_exceeded | Client input, changes a merge applies, or a merge result whose estimated load exceeds `pg_automerge.max_load_memory` (see [Resource limits](#resource-limits)) | `estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (2048 MB)`, `estimated memory to load merged automerge document exceeds ...`, `estimated memory for applying automerge changes exceeds ...` (DETAIL: `Loading it could take up to N MB (X operations, Y changes, Z actors, B bytes uncompressed).`, "at least" when the scan stopped early; HINT: `A superuser can raise "pg_automerge.max_load_memory".`) |
 | `54000` program_limit_exceeded | A document nested deeper than 1000 levels, or with more elements, pairs or a longer string than jsonb allows, read as jsonb | `automerge document is nested more than 1000 levels deep`, `number of jsonb array elements exceeds the maximum allowed (N)`, `string too long to represent as jsonb string` (DETAIL, as jsonb's) |
 | `XX000` internal_error | A stored value that does not load (corruption, or a value stored with `pg_automerge.verify_writes` off that does not survive a save and load), broken invariants (bugs) | `corrupt stored automerge value: ...`, `automerge failed on a stored value: ...`, others naming the invariant |
 
@@ -1375,6 +1680,12 @@ What costs a load, per call:
   `pglz`, so it can trim that part of writes; it is not measured here (the
   pgrx-managed Postgres is built without lz4) and the default is left
   alone.
+- Pricing a write (see [Resource limits](#resource-limits)) costs a scan
+  of the input and, for a merge, of the stored target: 1.7 ms for the
+  877 kB list document stored, 3.7 ms for its compressed save, 0.2 / 0.4
+  ms at 83 kB; the 3 MB text document scans in under 0.1 ms stored and
+  22 ms compressed (inflating its columns, which the load does again).
+  Against a load of 160 ms and 2.5 s, about 1 to 2%.
 - Merge results are expanded values: nested merges, `merge(...)::jsonb`,
   `merge_agg(...)::jsonb` and PL/pgSQL loops doing `d := merge(d, x)` keep
   the document loaded between steps. Measured with `mise run
@@ -1429,7 +1740,8 @@ What costs a load, per call:
   `or_raise()` are `#[track_caller]`, so the error's LOCATION is the line
   that raised it.
 - Interrupts: the core's long loops (the jsonb walk, building history rows
-  and ordering them) call an interrupt check every 1024 steps, which the
+  and ordering them, the load memory scan) call an interrupt check every
+  1024 steps, which the
   extension registers in `_PG_init` as `CHECK_FOR_INTERRUPTS()`
   (`set_interrupt_check`); `automerge_merge_agg_trans` checks between inputs. A
   cancel or `statement_timeout` raises its ERROR there, which unwinds
@@ -1460,6 +1772,9 @@ What costs a load, per call:
 - `pg_automerge.verify_writes` is defined in `_PG_init` and registered with
   the core (`set_verification_check`), which asks it whenever it would run
   the save-and-load check (`verification_enabled`).
+  `pg_automerge.max_load_memory` likewise (`budget::set_limit_source`,
+  read as bytes by `budget::limit` at every check; the core alone, as in
+  its tests, uses the 2 GB default).
 
 ## Testing
 
@@ -1475,7 +1790,9 @@ What costs a load, per call:
   history, for stored values and saves), `history.rs` (checked against
   Automerge's `fork_at` / `get_changes` and a dependency-graph walk, and the
   change count against the loaded change graph), `loaded.rs` (loaded
-  documents are byte-identical to the flat path). `common/` holds the
+  documents are byte-identical to the flat path), `memory_bounds.rs` (the
+  load memory limit: measured peaks against the estimate, see
+  [Resource limits](#resource-limits)). `common/` holds the
   random-history generator and stored-bytes wrappers around the
   `Input`-based API.
 - `#[pg_test]`s (`cargo pgrx test pg18`) for SQL behaviour, in
@@ -1483,7 +1800,8 @@ What costs a load, per call:
   (`loads.rs` counts the `Automerge::load` calls of each write path and of
   `automerge_contains`, and
   covers the release of the cast's expanded values and the
-  `pg_automerge.verify_writes` setting). They are `include!`d
+  `pg_automerge.verify_writes` setting; `limits.rs` the load memory limit,
+  see [Resource limits](#resource-limits)). They are `include!`d
   into the `#[pg_schema] mod tests` in `lib.rs` rather than declared as
   submodules, because pgrx runs each test as a function of the `tests`
   schema and only items of that exact module go there. Test documents are
@@ -1514,7 +1832,10 @@ What costs a load, per call:
   `||` and `merge_agg`, and a TOASTed value; checks fingerprints (bytes,
   heads, jsonb), that the indexes are valid and used and that the trigger
   fires after the restore; binary and text `COPY` round trips, and a
-  corrupt value failing `COPY FROM` with `22P02`. A restore and `COPY
+  corrupt value failing `COPY FROM` with `22P02`; a restore into a
+  database with a lower `pg_automerge.max_load_memory` failing with
+  `53400`, and succeeding with `PGOPTIONS='-c
+  pg_automerge.max_load_memory=-1'`. A restore and `COPY
   FROM` validate every value (one load each; the generated column is
   recomputed, one more conversion).
 - `tests/upgrade.sh` (`mise run upgrade`, part of `mise run test`): see
@@ -1525,7 +1846,11 @@ What costs a load, per call:
   `CREATE EXTENSION .. SCHEMA`, `ALTER EXTENSION .. SET SCHEMA` under
   dependent objects, a dump and restore of the moved extension, a
   non-superuser's refused `CREATE EXTENSION`, and
-  `pg_automerge.verify_writes` staying superuser-only.
+  `pg_automerge.verify_writes` and `pg_automerge.max_load_memory` staying
+  superuser-only.
+- `tests/limits.sh` (`mise run limits`, part of `mise run test`): the load
+  memory limit against a real crash, in a scratch cluster whose address
+  space is capped (see [Resource limits](#resource-limits)).
 - `tests/replication.sh` (`mise run replication`, not part of `mise run
   test`: it runs its own scratch cluster with `wal_level = logical`):
   logical replication in text and binary mode (see the README's
@@ -1536,8 +1861,10 @@ What costs a load, per call:
   checksums, so the mutations reach the decoders. For every input:
   nothing panics out of the core, `normalize` agrees exactly with a plain
   load-save-load, its results are stored values (load, header heads,
-  idempotent), and `merge(automerge, bytea)` results load back with their
-  heads. 1,500 inputs per `cargo test`; `mise run fuzz` runs 200,000 (or
+  idempotent), `merge(automerge, bytea)` results load back with their
+  heads, the load memory scan never takes input Automerge loads for
+  unparseable, and `normalize`'s peak (a counting allocator) stays below
+  the estimate. 1,500 inputs per `cargo test`; `mise run fuzz` runs 200,000 (or
   `FUZZ_ITERS`) and can save findings (`FUZZ_SAVE_DIR`) for
   `tests/corpus/`, which runs first. In 300,000 inputs it caught 4,903
   decoder panics (all `22P02`) and 19 inputs that load but whose re-save
@@ -1656,38 +1983,44 @@ A trusted extension can be installed by any role with `CREATE` on the
 database; its script runs as the bootstrap superuser. The review, per the
 PostgreSQL documentation's "Security Considerations for Extensions":
 
-- **Blocker: input amplification.** A few bytes of Automerge input can
-  describe a document that takes orders of magnitude more memory and time
-  to load. A compressed save of one 4,000,000-character text is 4 kB
-  (Automerge deflates the columns; about 1,000 characters per byte); the
-  bytea cast validates it (load and save) in 4.3 s (one uninterruptible Automerge call, see
+- **Input amplification: was the blocker, now bounded.** A few bytes of
+  Automerge input can describe a document that takes orders of magnitude
+  more memory and time to load. A compressed save of one 4,000,000-character
+  text is 4 kB (Automerge deflates the columns; about 1,000 characters per
+  byte); the bytea cast validates it (load and save) in 4.3 s (one
+  uninterruptible Automerge call, see
   [Implementation notes](#implementation-notes)) with a peak of 390 MB of
-  backend memory, outside Postgres' memory accounting. It scales
-  linearly, so a 1 MB input asks for about 100 GB. Automerge allocates
-  with the Rust global allocator, and a failed Rust allocation aborts the
-  process: reproduced with a server limited to 700 MB of address space
-  and a 12 kB input, the backend died with `memory allocation of
-  768000064 bytes failed` / signal 6, and the postmaster restarted every
-  session of the cluster. The panic guard cannot catch an abort, and an
-  OOM kill does the same. Every path that loads client bytes is exposed:
-  text and binary input (`INSERT`, `COPY`), the `bytea` cast,
-  `merge(automerge, bytea)`, `automerge_contains(automerge, bytea)`. Type
-  input functions are called without an `EXECUTE` check, so this cannot
-  be closed with `REVOKE`: anyone who can write to an `automerge` column
-  can do it. With `superuser = true` a superuser decides whether to
-  expose that in a database; with `trusted = true` any database owner
-  could.
-- What would make `trusted = true` defensible: bounds checked before
-  Automerge allocates, computed from the chunk headers and column
-  metadata. Measurements ([Input amplification
-  measurements](#input-amplification-measurements-2026-09-29)) show that
-  a cap on the inflated size and on the op and change counts is not
-  enough: dependency and successor entries, actors times changes, and
-  whether ops arrive in a document chunk or as change chunks (5 to 10
-  times more memory per op) each drive memory on their own. Turning an
-  allocation failure into an ERROR is not possible on stable Rust
-  (`set_alloc_error_hook` is unstable, and a global allocator must not
-  unwind). Until such bounds exist the flag stays `false`.
+  backend memory, outside Postgres' memory accounting, and it scales
+  linearly. Automerge allocates with the Rust global allocator, and a
+  failed Rust allocation aborts the process: reproduced with a server
+  limited to 700 MB of address space and a 12 kB input, the backend died
+  with `memory allocation of 768000064 bytes failed` / signal 6, and the
+  postmaster restarted every session of the cluster. The panic guard
+  cannot catch an abort, and an OOM kill does the same. Type input
+  functions are called without an `EXECUTE` check, so `REVOKE` cannot
+  close this: anyone who can write to an `automerge` column can send such
+  input. Every path that takes client bytes (text and binary input, `COPY`,
+  the `bytea` cast, `merge(automerge, bytea)`,
+  `automerge_contains(automerge, bytea)`) and every merge result is now
+  priced from its chunk headers and column metadata before Automerge
+  allocates, and refused over `pg_automerge.max_load_memory` with `53400`
+  (see [Resource limits](#resource-limits)); `tests/limits.sh` reproduces
+  the crash in a memory-capped cluster with the limit off and gets clean
+  errors with it on. The setting is `PGC_SUSET`, which Postgres enforces
+  whoever installed the extension, so a database owner could not raise it
+  in a trusted install either.
+- **Why it stays `trusted = false` for now.** The bounds rest on a cost
+  model of Automerge 0.12 made of the worst measured cost of each unit
+  (every generated, crafted and fuzzed input stays at or below 0.81 of the
+  estimate), not on a proof: an input shape the battery does not cover
+  could cost more than estimated, and then a failed allocation still
+  aborts the backend. Memory stays outside Postgres' accounting, every
+  session can use up to the limit at the same time (plus the stored
+  documents a merge loads, which are not priced), and a load still cannot
+  be cancelled (up to about 16 s at the default). Those are acceptable
+  when a superuser decides to install the extension into a database;
+  `trusted = true` would let any database owner decide it. Revisit when
+  the model has had more exposure (and loads can be cancelled).
 
 The rest of the review found nothing that would stop it:
 
@@ -1712,9 +2045,9 @@ The rest of the review found nothing that would stop it:
   the members would belong to the bootstrap superuser, so the installing
   role could not, for example, add a `WITHOUT FUNCTION` cast from `bytea`
   that skips validation (that needs ownership of a type).
-- `pg_automerge.verify_writes` is `PGC_SUSET`, which Postgres enforces
-  whoever installed the extension. Tested for a non-superuser that owns
-  the database: `SET` before the library is loaded leaves a placeholder
+- `pg_automerge.verify_writes` and `pg_automerge.max_load_memory` are
+  `PGC_SUSET`, which Postgres enforces whoever installed the extension.
+  Tested for a non-superuser that owns the database (both settings): `SET` before the library is loaded leaves a placeholder
   that Postgres discards with a WARNING when the library defines the
   setting; `SET` afterwards, `ALTER ROLE .. SET` and `ALTER DATABASE ..
   SET` fail with `42501`; `GRANT SET ON PARAMETER` still delegates it.
@@ -1722,7 +2055,8 @@ The rest of the review found nothing that would stop it:
   1000 (`json::MAX_DEPTH`); the history functions and the header parser do
   not recurse. Set-returning functions materialize their rows in Rust
   memory (for `automerge_changes`, the rebuilt change bytes), bounded by
-  the document's history, which is subject to the same amplification.
+  the document's history, which fit the load memory limit when it was
+  written (reads peak at 1.0 to 1.5 times a load).
 
 ## Versioning and upgrades
 
@@ -2096,3 +2430,81 @@ failure itself cannot be turned into an ERROR: `std::alloc::
 set_alloc_error_hook` is unstable in Rust 1.98, a `#[global_allocator]`
 must not unwind, and allocating with `palloc` would `longjmp` through
 Automerge's frames.
+
+### Load memory limit (2026-09-29)
+
+`pg_automerge.max_load_memory` (see [Resource limits](#resource-limits)),
+implemented from the measurements of the previous entry.
+
+Measured peaks against the estimate (`tests/memory_bounds.rs`, dev build
+with optimized dependencies, counting allocator; peak / estimate):
+
+| Input | save | compressed | change chunks |
+|---|---|---|---|
+| 200,000 characters of text | 0.20 | 0.20 | 0.57 |
+| 3,000 typed characters (3,000 changes) | 0.40 | 0.40 | 0.41 |
+| 50,000 characters deleted | 0.21 | 0.21 | 0.39 |
+| 40,000 ints prepended to a list | 0.69 | 0.70 | 0.63 |
+| 20,000 maps prepended to a list | 0.80 | 0.80 | 0.67 |
+| 40,000 map keys | 0.62 | 0.65 | 0.54 |
+| one key overwritten 40,000 times | 0.10 | 0.10 | 0.45 |
+| one key set and deleted 20,000 times | 0.55 | 0.56 | 0.34 |
+| 5,000 one-op changes | 0.33 | 0.33 | 0.46 |
+| 1,000 actors / 1,000 conflicting forks | 0.30 / 0.38 | 0.31 / 0.41 | 0.43 / 0.43 |
+| 400 actors, then 400 changes of 16 ops | 0.32 | 0.32 | 0.41 |
+| 6,000 characters with 2,000 marks | 0.39 | 0.42 | 0.67 |
+| 1 MB of bytes | 0.49 | 0.61 | 0.69 |
+
+Crafted chunks (bytes, peak / estimate): a document chunk of 20,000 empty
+changes (77 bytes) 0.71, of 1,000 changes with 1,000 dependencies each (70
+bytes) 0.68, of one op with 200,000 successors (136 bytes) 0.48, of a
+200,000-item list (141 bytes) 0.17; a change chunk of 100,000 ops (104
+bytes) 0.58, of one op with 1,000,000 preds (71 bytes) 0.08 (priced as the
+document it normalizes to, where the preds become successors on one key);
+a save followed by 2,000 change chunks 0.34. Merges of two concurrent
+documents (both loaded, the other's changes applied): 0.21 to 0.38 of the
+two loads plus the apply estimate. Refused inputs peak below 64 kB for the
+run-length bombs (100 to 221 bytes describing 10^8 to 2^62 rows) and below
+a quarter of the limit for deflate bombs (256 MB of zeros, stopped at a
+tenth of a 100 MB limit). A 200,000-input release fuzz session (the
+properties of [Testing](#testing)) found no violation.
+
+`tests/limits.sh`: under `ulimit -v 1000000`, with the limit off, the
+12 kB compressed save of a 12,000,000-character text and a 113-byte change
+chunk describing 20,000,000 ops each abort the backend (`memory allocation
+of 1543503872 bytes failed`, signal 6) and the cluster restarts; with the
+default limit both are refused with `53400` through every path and nothing
+restarts. 32 s, most of it generating the text.
+
+Cost (release build, median; before is the previous commit, two runs
+each). `mise run bench-core`, ms:
+
+| | before | after |
+|---|---|---|
+| normalize, 3 MB text stored / compressed | 2498 / 2526 | 2495 / 2567 |
+| normalize, 877 kB list stored / compressed | 161 / 166 | 166 / 172 |
+| normalize, 83 kB list stored / compressed | 16.0 / 16.6 | 16.1 / 17.4 |
+| the scan alone, 877 kB list stored / compressed | - | 1.7 / 3.7 |
+| the scan alone, 3 MB text stored / compressed | - | 0.0 / 21.6 |
+
+`mise run bench-sql` (`BENCH_REPS=5`, ms; before: the mean of two runs):
+
+| case | 83 kB before | after | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|---|---|
+| R1 read (unchanged code) | 25 | 26 | 261 | 265 | 2789 | 2780 |
+| R2 three reads (unchanged code) | 77 | 78 | 781 | 806 | 8362 | 8333 |
+| I1 insert of a compressed save | 21 | 22 | 205 | 210 | 2756 | 2752 |
+| W1 merge(doc, changes) | 38 | 38 | 364 | 368 | 5204 | 5223 |
+| W2 merge(doc, newer save) | 22 | 23 | 209 | 211 | 2771 | 2791 |
+| W3 merge(doc, save::automerge) | 22 | 24 | 206 | 214 | 2765 | 2793 |
+| W4 upsert | 41 | 39 | 369 | 382 | 5283 | 5318 |
+| W6 W3 as a text parameter | 39 | 39 | 374 | 383 | 5312 | 5382 |
+| A2 merge_agg of two versions | 18 | 18 | 172 | 176 | 2547 | 2532 |
+| R3, W5, A1, C1, C2 (no load) | unchanged | | | | | |
+
+The differences are of the size of the drift of the read-only cases R1
+and R2, whose code did not change (up to 3%). The first version of the
+scan decoded every value and computed Gmax exactly for every document,
+10.7 ms on the 877 kB list (+6% on its writes); counting literal runs
+without decoding them and taking Gmax at its bound unless that decides a
+refusal brought it to 1.7 ms.
