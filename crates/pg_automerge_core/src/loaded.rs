@@ -213,6 +213,19 @@ impl<'a> Input<'a> {
         guard_stored(|| self.heads_unguarded())
     }
 
+    /// The number of changes: read from the change actor column of a
+    /// stored value (`None` when that column cannot be read that way, see
+    /// [`header::change_count_from_bytes`]), from the change graph of a
+    /// loaded one. Never loads.
+    pub fn change_count(&self) -> Option<u64> {
+        match self {
+            Input::Stored(bytes) => header::change_count_from_bytes(bytes),
+            Input::Loaded(doc) => {
+                guard_stored(|| Ok(automerge::ReadDoc::stats(doc.doc()).num_changes)).ok()
+            }
+        }
+    }
+
     /// The same value: identical bytes or the same loaded document.
     fn same(&self, other: &Input<'_>) -> bool {
         match (self, other) {
@@ -576,8 +589,17 @@ pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
             return Ok(chunks.iter().all(|c| has_change(loaded.doc(), &c.hash)));
         }
         // One document chunk (a save): whether `a` has its heads, as a
-        // load of `a ++ changes` decides it, without reading the save.
+        // load of `a ++ changes` decides it, without reading the save; a
+        // save listing at least as many changes as a stored `a` has (and
+        // other heads) is not in it (see `contains_input_by_header`).
         if let Some(chunk) = header::document_chunk(changes) {
+            if let (Input::Stored(_), Some(count_a), Some(count)) =
+                (a, a.change_count(), chunk.change_count)
+                && count >= count_a
+                && !is_subset(&chunk.heads, &heads_a)
+            {
+                return Ok(false);
+            }
             return Ok(is_subset(&chunk.heads, &heads_a)
                 || match a {
                     Input::Loaded(loaded) => has_all(loaded.doc(), &chunk.heads),
@@ -606,6 +628,18 @@ pub fn contains(a: Input<'_>, b: Input<'_>) -> Result<bool, Error> {
         let heads_a = a.heads_unguarded()?;
         let heads_b = b.heads_unguarded()?;
         if let Some(answer) = crate::contains_by_heads(&heads_a, &heads_b) {
+            return Ok(answer);
+        }
+        // A stored `a` would have to be loaded: first see whether the
+        // change counts decide.
+        if let Input::Stored(_) = a
+            && let Some(answer) = crate::contains_by_heads_and_counts(
+                &heads_a,
+                &heads_b,
+                a.change_count(),
+                b.change_count(),
+            )
+        {
             return Ok(answer);
         }
         match a {

@@ -102,9 +102,16 @@ fn merging_a_full_save_loads_only_the_save() {
     // Incremental changes: the stored document, and the check.
     assert_eq!(loads_of(&update("changes")), 2);
     // automerge_contains(doc, save): the header heads against the stored
-    // document, never the save.
+    // document, never the save; a save listing at least as many changes as
+    // the document (a newer or a concurrent one) is not in it, without a
+    // load.
     reset_ld();
-    for (name, contained, n) in [("newer", false, 1), ("older", true, 1), ("base", true, 0)] {
+    for (name, contained, n) in [
+        ("newer", false, 0),
+        ("concurrent", false, 0),
+        ("older", true, 1),
+        ("base", true, 0),
+    ] {
         let before = loads();
         let got: bool = one(
             &format!(
@@ -376,4 +383,34 @@ fn merge_agg_loads_only_what_it_merges() {
     let none: Option<Vec<u8>> =
         Spi::get_one("SELECT merge_agg(doc)::bytea FROM ld WHERE false").unwrap();
     assert!(none.is_none());
+}
+
+#[pg_test]
+fn contains_decides_newer_and_concurrent_versions_without_loading() {
+    loads_fixture();
+    // Every version as a stored (normalized) value.
+    Spi::run(
+        "CREATE TEMP TABLE lv AS SELECT name, b::automerge AS doc FROM ld_in WHERE name <> 'changes'",
+    )
+    .unwrap();
+    for (a, b, contained, n) in [
+        // Fewer changes than b: not contained, nothing loaded.
+        ("base", "newer", false, 0),
+        ("older", "base", false, 0),
+        // As many changes, other heads: concurrent, nothing loaded.
+        ("base", "concurrent", false, 0),
+        ("concurrent", "base", false, 0),
+        // More changes: only a's history can tell.
+        ("newer", "base", true, 1),
+        ("newer", "concurrent", false, 1),
+        // Same heads.
+        ("base", "base", true, 0),
+    ] {
+        let before = loads();
+        let got: bool = one(
+            "SELECT automerge_contains(a.doc, b.doc) FROM lv a, lv b WHERE a.name = $1 AND b.name = $2",
+            &[a.into(), b.into()],
+        );
+        assert_eq!((got, loads() - before), (contained, n), "{a} contains {b}");
+    }
 }

@@ -14,6 +14,8 @@
 #   W6  W3 with the save as a text parameter (extended protocol, \bind)
 #   A1  merge_agg over one row
 #   A2  merge_agg over the row and a newer version of it (stored rows)
+#   C1  automerge_contains(doc, newer save bytea)   (false)
+#   C2  automerge_contains(doc, newer stored version)   (false)
 #
 # "newer" is the base document loaded from its save, one change by another
 # actor, saved compressed (Automerge.save()); "changes" is save_after(base
@@ -76,6 +78,9 @@ case_ W6 "SELECT '\\x' || encode(save, 'hex') AS newer_hex FROM bench_newer WHER
 case_ A1 "" "SELECT cardinality(automerge_heads(merge_agg(doc))) FROM docs WHERE name = :'d';"
 case_ A2 "INSERT INTO docs VALUES (:'d' || 'n', $NEWER);" \
     "SELECT cardinality(automerge_heads(merge_agg(doc ORDER BY name))) FROM docs WHERE name IN (:'d', :'d' || 'n');"
+case_ C1 "" "SELECT automerge_contains(doc, $NEWER) FROM docs WHERE name = :'d';"
+case_ C2 "INSERT INTO docs VALUES (:'d' || 'n', $NEWER);" \
+    "SELECT automerge_contains(a.doc, b.doc) FROM docs a, docs b WHERE a.name = :'d' AND b.name = :'d' || 'n';"
 
 # One psql session per case and document: REPS transactions, each timing
 # only the case's statement. Prints the times (ms), one per line.

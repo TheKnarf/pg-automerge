@@ -433,6 +433,27 @@ pub fn contains_by_heads(a: &[ChangeHash], b: &[ChangeHash]) -> Option<bool> {
     }
 }
 
+/// [`contains_by_heads`], also deciding from the numbers of changes when
+/// both are known: if the heads cannot say and `b` has at least as many
+/// changes as `a`, `a` does not contain `b`. (Containment is `changes(b) ⊆
+/// changes(a)`; with `|b| >= |a|` that makes the two sets equal, and equal
+/// histories have equal heads, which the heads would have shown.) This
+/// decides `contains(older, newer)` and two concurrent versions with the
+/// same number of changes without a load. The counts come from the change
+/// actor column ([`header::change_count_from_prefix`]), a small prefix of
+/// a stored value.
+pub fn contains_by_heads_and_counts(
+    a: &[ChangeHash],
+    b: &[ChangeHash],
+    count_a: Option<u64>,
+    count_b: Option<u64>,
+) -> Option<bool> {
+    contains_by_heads(a, b).or(match (count_a, count_b) {
+        (Some(count_a), Some(count_b)) if count_b >= count_a => Some(false),
+        _ => None,
+    })
+}
+
 /// Result of loading `a ++ changes` ([`apply_changes`]).
 pub(crate) enum Applied {
     /// Nothing new: the heads are those of `a`.
@@ -532,14 +553,37 @@ pub fn contains_changes_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Opti
 /// [`loaded::merge_changes`]). Needs only `a`'s heads, so callers can
 /// answer before they fetch or load `a`.
 pub fn contains_input_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Option<bool> {
+    contains_input_by_header(heads_a, || None, changes)
+}
+
+/// [`contains_input_by_heads`], also deciding a save from change counts
+/// when `count_a` gives the number of changes of `a` (called only for a
+/// save the heads do not decide): a save whose
+/// header heads are not all heads of `a` and whose header lists at least
+/// as many changes as `a` has is not contained (`Some(false)`; see
+/// [`contains_by_heads_and_counts`]: a document chunk that loads has
+/// exactly the changes of its heads' history, so `a` having them all would
+/// make the histories equal). This decides "is this newer or concurrent
+/// save already in the stored document" without loading it. Only the
+/// header of the save is read, as for its heads: a save whose header
+/// disagrees with its content is not loadable, and `merge` rejects it.
+pub fn contains_input_by_header(
+    heads_a: &[ChangeHash],
+    count_a: impl FnOnce() -> Option<u64>,
+    changes: &[u8],
+) -> Option<bool> {
     if changes.is_empty() {
         return Some(true);
     }
     if let Some(answer) = contains_changes_by_heads(heads_a, changes) {
         return Some(answer);
     }
-    match header::document_chunk(changes) {
-        Some(chunk) if is_subset(&chunk.heads, heads_a) => Some(true),
+    let chunk = header::document_chunk(changes)?;
+    if is_subset(&chunk.heads, heads_a) {
+        return Some(true);
+    }
+    match (chunk.change_count, count_a()) {
+        (Some(count), Some(count_a)) if count >= count_a => Some(false),
         _ => None,
     }
 }

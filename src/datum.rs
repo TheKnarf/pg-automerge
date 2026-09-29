@@ -229,6 +229,17 @@ impl AutomergeArg {
         }
     }
 
+    /// The number of changes: from the change graph of an expanded value;
+    /// for a flat one read from a prefix (the header and the change actor
+    /// column, see `header::change_count_from_prefix`), `None` when it
+    /// cannot be read that way. Never detoasts in full, never loads.
+    pub(crate) fn change_count(&self) -> Option<u64> {
+        match self.loaded() {
+            Some(doc) => Input::Loaded(doc).change_count(),
+            None => self.read_prefix(header::change_count_from_prefix),
+        }
+    }
+
     /// Whether the value has nothing that is not already in `since`: every
     /// head of the value is in `since`. Reads only the heads.
     pub(crate) fn nothing_since(&self, since: &[ChangeHash]) -> bool {

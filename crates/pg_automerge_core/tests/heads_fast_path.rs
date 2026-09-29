@@ -4,12 +4,20 @@
 
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, Automerge, ChangeHash, ROOT, ReadDoc};
-use pg_automerge_core::header::{HeadsPrefix, heads_from_bytes, heads_from_prefix};
-use pg_automerge_core::{MergeAccumulator, contains_by_heads, normalize, stored_heads};
+use pg_automerge_core::header::{
+    HeadsPrefix, change_count_from_bytes, heads_from_bytes, heads_from_prefix,
+};
+use pg_automerge_core::{
+    MergeAccumulator, contains_by_heads, contains_by_heads_and_counts, contains_input_by_header,
+    normalize, stored_heads,
+};
 
 mod common;
 
-use common::{Merged, StoredAccumulator, contains, contains_loaded, heads, merge, random_replicas};
+use common::{
+    Merged, StoredAccumulator, contains, contains_changes, contains_loaded, heads, merge,
+    random_replicas,
+};
 
 fn load_heads(bytes: &[u8]) -> Vec<ChangeHash> {
     let mut h = Automerge::load(bytes).unwrap().get_heads();
@@ -102,6 +110,8 @@ fn fast_heads_fall_back_for_other_encodings() {
 
 #[test]
 fn shortcuts_agree_with_the_slow_paths() {
+    // Pairs the heads cannot decide but the change counts do.
+    let mut by_counts = 0;
     for seed in 200..260u64 {
         let replicas = random_replicas(seed);
         let empty = normalize(&[]).unwrap();
@@ -125,6 +135,23 @@ fn shortcuts_agree_with_the_slow_paths() {
                 if let Some(fast) = contains_by_heads(&load_heads(a), &hb) {
                     assert_eq!(fast, slow, "seed {seed}: heads shortcut wrong");
                 }
+                let (count_a, count_b) = (change_count_from_bytes(a), change_count_from_bytes(b));
+                assert!(count_a.is_some() && count_b.is_some());
+                if let Some(fast) =
+                    contains_by_heads_and_counts(&load_heads(a), &hb, count_a, count_b)
+                {
+                    assert_eq!(fast, slow, "seed {seed}: counts shortcut wrong");
+                    if contains_by_heads(&load_heads(a), &hb).is_none() {
+                        by_counts += 1;
+                    }
+                }
+                // The same for `b` as a compressed save (bytea input): the
+                // header shortcut, and the full check.
+                let save_b = Automerge::load(b).unwrap().save();
+                if let Some(fast) = contains_input_by_header(&load_heads(a), || count_a, &save_b) {
+                    assert_eq!(fast, slow, "seed {seed}: save header shortcut wrong");
+                }
+                assert_eq!(contains_changes(a, &save_b).unwrap(), slow, "seed {seed}");
                 // merge's no-op results are exactly the containment cases,
                 // and the merged heads are those of a real Automerge merge.
                 let merged = merge(a, b).unwrap();
@@ -140,6 +167,7 @@ fn shortcuts_agree_with_the_slow_paths() {
             }
         }
     }
+    assert!(by_counts > 20, "{by_counts}");
 }
 
 /// Which inputs the no-op checks load, observed through a stored value whose
@@ -173,7 +201,26 @@ fn no_op_checks_load_only_what_they_need() {
     assert_eq!(merge(&bad_old, &new).unwrap(), Merged::Right);
     assert_eq!(merge(&new, &bad_old).unwrap(), Merged::Left);
     assert!(contains(&new, &bad_old).unwrap());
+    // The older value does not contain the newer one: it has fewer
+    // changes, so nothing is loaded, as for a newer save.
+    assert!(!contains(&bad_old, &new).unwrap());
+    assert!(!contains_changes(&bad_old, &doc.save()).unwrap());
+    // Concurrent versions with as many changes each: neither contains the
+    // other, again without a load.
+    let mut fork = AutoCommit::load(&old)
+        .unwrap()
+        .with_actor(ActorId::from([2u8; 16]));
+    fork.put(ROOT, "z", 3i64).unwrap();
+    let fork = normalize(&fork.save()).unwrap();
+    assert_eq!(
+        change_count_from_bytes(&fork),
+        change_count_from_bytes(&new)
+    );
+    assert!(!contains(&bad_new, &fork).unwrap());
+    assert!(!contains(&corrupt(&fork), &new).unwrap());
+    assert!(!contains_changes(&bad_new, &fork).unwrap());
     // ... and a value that must be loaded still reports the corruption.
     assert!(merge(&old, &bad_new).is_err());
     assert!(contains(&bad_new, &old).is_err());
+    assert!(contains_changes(&bad_new, &old).is_err());
 }

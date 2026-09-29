@@ -193,7 +193,7 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `merge(doc, changes bytea)`, `doc \|\| changes` | I S P | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them in the DETAIL). |
 | `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. Loads a document only to merge it: a single row, or a version plus older ones, costs no load or one. |
 | `automerge_heads(automerge) → text[]` | I S P | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
-| `automerge_contains(a, b) → bool` | I S P | Whether `a` already has every change of `b`. |
+| `automerge_contains(a, b) → bool` | I S P | Whether `a` already has every change of `b`. Decided without loading when the heads or the change counts can tell (`b` newer than or concurrent with `a`); otherwise loads `a`. |
 | `automerge_contains(doc, changes bytea) → bool` | I S P | Whether `merge(doc, changes)` would add nothing (every change in the save or change chunks is already in `doc`). Usually decided without loading the document. |
 | `automerge_notify('channel', 'key_col' [, ...])` | volatile, parallel unsafe | `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW` trigger: `NOTIFY channel` with the row key and the new/previous heads of `automerge` columns whose heads changed. |
 | `automerge_changes(doc, since_heads text[] DEFAULT '{}')` | I S P | `SETOF automerge_change (hash, actor, seq, start_op, op_count, time, message, deps, change bytea)`: every change not reachable from `since_heads` (all by default), dependencies first. Rebuilds change bytes (costly on big documents). |
@@ -342,6 +342,7 @@ document (3,000,000-character text; release build, warm cache):
 | `doc->>'status'` (load, then jsonb) | 2.8 s |
 | `automerge_heads`, `automerge_change_count` (header only) | 0.3 ms, 2 ms |
 | `merge(doc, x)` when `x` adds nothing | 1 ms (heads from a prefix; an `UPDATE` keeps the TOAST value) |
+| `automerge_contains(doc, newer save or version)` (false) | 1-9 ms (heads and change counts from a prefix; the other way round, one load) |
 | `UPDATE .. SET doc = merge(doc, one change set)` | 5.2 s (load, save, verification load); 2.7 s with `pg_automerge.verify_writes = off` |
 | `UPDATE .. SET doc = merge(doc, newer full save)` | 2.8 s (one load, of the save) |
 | `INSERT .. ON CONFLICT DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc)`, newer save | 5.3 s (two loads) |

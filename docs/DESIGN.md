@@ -473,7 +473,20 @@ implicit).
   from the two headers when `heads(b) ⊆ heads(a)` (true) or
   `heads(a) ⊊ heads(b)` (false: a head of `b` missing from `a`'s heads has
   no successor in `b`, so it cannot be an ancestor of a head of `a`);
+  otherwise, for a stored `a`, from the two change counts (see below);
   otherwise `a` is loaded and `b` never is.
+  - Change counts: when the heads do not decide and `b` has at least as
+    many changes as `a`, the answer is `false`. Containment means
+    `changes(b) ⊆ changes(a)`; with `|b| ≥ |a|` the two sets would be
+    equal, and equal histories have equal heads, which the first test
+    would have seen. Both counts come from a prefix of each value (the
+    change actor column, as for `automerge_change_count`; see
+    [Heads fast path](#heads-fast-path)), or from the change graph of an
+    expanded value. This decides the two common `false` cases without a
+    load: an older version asked whether it contains a newer one, and two
+    concurrent versions with as many changes each (the same edit count on
+    both sides of a fork). A stored count is exact: stored values are
+    saves of a loaded document, one change actor entry per change.
 - `automerge_contains(a automerge, changes bytea) → bool`: whether `a`
   already has every change in `changes` (the same inputs as
   `merge(automerge, bytea)`), i.e. whether `merge(a, changes)` returns `a`
@@ -494,8 +507,13 @@ implicit).
   - For an expanded `a` and bare change chunks, each chunk's hash is looked
     up in the loaded document.
   - For exactly one document chunk (a save) with a valid checksum: whether
-    `a` has the heads its header lists, from `a`'s heads, or else from its
-    history (a stored `a` is loaded; the save never is). That is what the
+    `a` has the heads its header lists, from `a`'s heads; else `false`
+    when the save's header lists at least as many changes as a stored `a`
+    has (by the change-count argument above: a save that loads has
+    exactly the changes of its heads' history, one change actor entry
+    each, and a save whose header disagrees with its content is rejected
+    by `merge`); else from `a`'s history (a stored `a` is loaded; the save
+    never is). That is what the
     no-op check of `merge(automerge, bytea)`, and a load of `a ++ changes`,
     decide from the same header.
   - Otherwise (older changes, a save plus change chunks, compressed chunks)
@@ -549,7 +567,10 @@ prefix before they detoast a value (see [Merging](#merging)).
 
 Deciding containment for a linear history (newer contains older) still
 needs a load of the newer document: the headers only list heads, and
-change hashes are only available after reconstructing the changes.
+change hashes are only available after reconstructing the changes. The
+opposite answer (an older or a concurrent version does not contain the
+other) usually needs none: `automerge_contains` compares the two change
+counts, read from the same prefix (see [Reading](#reading)).
 
 ### History (read-only)
 
@@ -1135,8 +1156,14 @@ What costs a load, per call:
 - `automerge_contains(doc, changes bytea)` and the no-op check of
   `merge(doc, changes bytea)` need no load for re-sent latest changes, a
   re-sent save of the document, and (for `automerge_contains`) new changes
-  on top of the current heads; for any other single save
+  on top of the current heads, and a newer or concurrent save (its header
+  lists at least as many changes as the document has); for an older save
   `automerge_contains` loads the stored document, never the save.
+  `automerge_contains(a, b)` of two `automerge` values likewise answers
+  `false` without a load when `b` has at least as many changes as `a` and
+  other heads (bench-sql C1/C2, 877 kB list / 3 MB text: 167 / 2568 ms →
+  1.2 / 9 ms for a newer save as `bytea`, where 9 ms is the save's
+  checksum; 164 / 2549 ms → 1.2 / 1.1 ms for a newer stored version).
 - History (the 3 MB document plus 200 small changes, 201 changes):
   `automerge_change_count` 2 ms; `automerge_changes_meta` 2.8 s (one load);
   `automerge_changes` and `automerge_changes_bytes` for all changes 5.1 s
@@ -1257,7 +1284,9 @@ What costs a load, per call:
   `automerge_contains(automerge, bytea)`), `heads_fast_path.rs` (the header
   parser against `Automerge::load().get_heads()` over hundreds of generated
   documents: empty, up to 12 actors, random forks and merges, merge and
-  `merge_agg` outputs, arbitrary prefixes), `history.rs` (checked against
+  `merge_agg` outputs, arbitrary prefixes, and the heads and change-count
+  shortcuts of `merge` and `automerge_contains` against the loaded
+  history, for stored values and saves), `history.rs` (checked against
   Automerge's `fork_at` / `get_changes` and a dependency-graph walk, and the
   change count against the loaded change graph), `loaded.rs` (loaded
   documents are byte-identical to the flat path). `common/` holds the
@@ -1265,7 +1294,8 @@ What costs a load, per call:
   `Input`-based API.
 - `#[pg_test]`s (`cargo pgrx test pg18`) for SQL behaviour, in
   `src/tests/{io,merge,history,notify,expanded,hardening,loads}.rs`
-  (`loads.rs` counts the `Automerge::load` calls of each write path, and
+  (`loads.rs` counts the `Automerge::load` calls of each write path and of
+  `automerge_contains`, and
   covers the release of the cast's expanded values and the
   `pg_automerge.verify_writes` setting). They are `include!`d
   into the `#[pg_schema] mod tests` in `lib.rs` rather than declared as
@@ -1334,7 +1364,8 @@ What costs a load, per call:
   `mise run test`) installs a release build and times the SQL workloads
   of [Performance](#performance) on three generated documents;
   `tests/bench_sql.sh` (`mise run bench-sql`) times the everyday paths
-  (reads, inserts, the merge and upsert forms of a write, `merge_agg`) one statement at
+  (reads, inserts, the merge and upsert forms of a write, `merge_agg`,
+  `automerge_contains`) one statement at
   a time through psql, writes in `BEGIN .. ROLLBACK`, median of three
   runs; `mise run bench-core` times the Rust primitives
   (`examples/bench_core.rs`).
@@ -1565,3 +1596,22 @@ session:
 |---|---|---|---|---|
 | R1 `doc->>'status'` | 268, 268 | 257, 261 | 28, 26 | 26, 25 |
 | R2 three accessors in one `SELECT` | 807, 809 | 782, 777 | 80, 77 | 76, 80 |
+
+### Containment decided by change counts (2026-09-29)
+
+`automerge_contains` loaded the stored document to answer `false` for a
+newer or concurrent version, as a stored value or as a save in a `bytea`
+(one load, 164-167 ms on the 877 kB list, 2.5 s on the 3 MB text). When
+the heads do not decide, it now compares change counts read from a
+prefix of each value (or a save's header): a version with at least as
+many changes as `a` and other heads is not in `a` (see
+[Reading](#reading)). Older versions still cost one load (true needs the
+history). `mise run bench-sql`, release build, median of five, ms:
+
+| Case | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|
+| C1 `automerge_contains(doc, newer save bytea)` | 167 | 1.2 | 2568 | 9.0 |
+| C2 `automerge_contains(doc, newer stored version)` | 164 | 1.2 | 2549 | 1.1 |
+
+C1 on the 3 MB text is the save's checksum (a SHA-256 over 3 MB) and the
+parameter's detoast. No other path changed.

@@ -393,9 +393,11 @@ fn full_saves_load_once_when_they_contain_the_document() {
         loads_of(|| contains_changes(&a, &older).unwrap()),
         (true, 1)
     );
+    // A newer save lists more changes than `a` has: not contained, and
+    // nothing is loaded.
     assert_eq!(
         loads_of(|| contains_changes(&a, &newer.save()).unwrap()),
-        (false, 1)
+        (false, 0)
     );
     assert_eq!(loads_of(|| contains_changes(&a, &a).unwrap()), (true, 0));
 
