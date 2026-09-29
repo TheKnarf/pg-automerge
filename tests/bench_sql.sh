@@ -87,7 +87,9 @@ case_ C2 "INSERT INTO docs VALUES (:'d' || 'n', $NEWER);" \
 run_case() {
     local doc="$1" setup="$2" stmt="$3" script="$WORK/case.sql"
     {
-        printf '%s\n' "${BENCH_SETTINGS:-}"
+        # Terminated here, so a settings string without its own ';' works
+        # (an extra empty statement is harmless).
+        [[ -z "${BENCH_SETTINGS:-}" ]] || printf '%s;\n' "$BENCH_SETTINGS"
         for _ in $(seq 1 "$REPS"); do
             printf 'BEGIN;\n%s\n\\timing on\n%s\n\\timing off\nROLLBACK;\n' "$setup" "$stmt"
         done
