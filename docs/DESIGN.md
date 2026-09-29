@@ -1380,7 +1380,12 @@ inflated until the normalized save has been compared with them (see
 [Invariants](#invariants)), so it is inflated twice, by the scan and by
 Automerge's load, as it was before the limit (by the load and by the
 comparison); what is held meanwhile is at most the inflated bytes, each
-charged 10 in the estimate. Without a limit, input
+charged 10 in the estimate, and they are held only once that estimate
+has been checked: `merge(automerge, bytea)` drops them before it loads a
+stored `a` to look for the heads of a save with no more changes than `a`
+(the save is priced only after that load, and may still be rejected),
+and without a limit nothing is kept (nothing charges them), the
+comparison inflates the input again. Without a limit, input
 and the `bytea` cast walk only the chunk types (for bundles), merges of
 documents count nothing, and `merge(automerge, bytea)` and
 `automerge_contains(automerge, bytea)` still scan the input (without a
@@ -2601,8 +2606,9 @@ changes:
   (`budget::scan_input_keep`) and `header::inflated_document_is` compares
   the normalized save with them in place: 0.19 ms instead of 4.1 ms (on
   the 3 MB text 0.7 ms instead of 28 ms), so a compressed save is
-  inflated twice, as before the limit. The columns are held through the
-  load, at most the inflated bytes, each charged 10: the compressed saves
+  inflated twice, as before the limit (without a limit, three times:
+  nothing is kept). The columns are held through the load, after its
+  estimate is checked, at most the inflated bytes, each charged 10: the compressed saves
   of the memory battery peak a little higher (1 MB of bytes 0.61 → 0.71
   of the estimate, 40,000 map keys 0.65 → 0.67), the worst input is still
   0.80.

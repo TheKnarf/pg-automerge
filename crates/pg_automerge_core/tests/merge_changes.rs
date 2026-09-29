@@ -486,7 +486,7 @@ fn loads_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
 #[test]
 fn full_saves_load_once_when_they_contain_the_document() {
     use pg_automerge_core::loaded::{self, Input, LoadedDoc};
-    use pg_automerge_core::test_hooks::reload_checks;
+    use pg_automerge_core::test_hooks::{reinflations, reload_checks};
 
     let mut base = AutoCommit::new().with_actor(actor(1));
     base.put(ROOT, "pad", "long enough to compress ".repeat(40))
@@ -503,17 +503,21 @@ fn full_saves_load_once_when_they_contain_the_document() {
 
     // A newer save, compressed or canonical: one load (the save), no
     // check, and the result is the save's own stored bytes; with a limit
-    // (the scan's inflated columns compared) and without one (inflated
-    // again).
+    // (the scan's inflated columns compared) and without one (the
+    // compressed save inflated again, `header::inflate_document`).
+    let compressed = newer.save();
     for (limit, input) in [None, Some(None)]
         .into_iter()
-        .flat_map(|limit| [(limit, newer.save()), (limit, newer_stored.clone())])
+        .flat_map(|limit| [(limit, compressed.clone()), (limit, newer_stored.clone())])
     {
         pg_automerge_core::test_hooks::set_limit(limit);
         let checks = reload_checks();
+        let inflations = reinflations();
         let (got, n) = loads_of(|| loaded::merge_changes(Input::Stored(&a), &input).unwrap());
         let got = got.expect("new changes");
         assert_eq!(n, 1);
+        let inflated_again = usize::from(limit == Some(None) && input == compressed);
+        assert_eq!(reinflations() - inflations, inflated_again);
         assert!(!got.is_unverified());
         assert_eq!(got.cached_stored(), Some(newer_stored.as_slice()));
         assert_eq!(reload_checks(), checks);

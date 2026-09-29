@@ -2,8 +2,8 @@
 //! extension's pg_tests and the core's own tests enable): observe and force
 //! the save-and-load check that keeps unloadable values out of storage
 //! (see [`crate::normalize`] and [`crate::loaded::LoadedDoc::stored`]),
-//! switch it off, count document loads, and override the load memory
-//! limit ([`crate::budget::limit`]).
+//! switch it off, count document loads and re-inflations of input, and
+//! override the load memory limit ([`crate::budget::limit`]).
 //!
 //! Per thread: core tests run in parallel threads, a backend has one.
 
@@ -14,6 +14,7 @@ thread_local! {
     static FAIL_RELOAD_CHECK: Cell<bool> = const { Cell::new(false) };
     static VERIFICATION: Cell<Option<bool>> = const { Cell::new(None) };
     static LOADS: Cell<usize> = const { Cell::new(0) };
+    static REINFLATIONS: Cell<usize> = const { Cell::new(0) };
     static LIMIT: Cell<Option<Option<u64>>> = const { Cell::new(None) };
 }
 
@@ -35,6 +36,17 @@ pub fn loads() -> usize {
 
 pub(crate) fn count_load() {
     LOADS.with(|n| n.set(n.get() + 1));
+}
+
+/// How many times this thread has inflated input again to compare it
+/// with its normalized save (`loads_as_saved` without the scan's inflated
+/// columns).
+pub fn reinflations() -> usize {
+    REINFLATIONS.with(Cell::get)
+}
+
+pub(crate) fn count_reinflation() {
+    REINFLATIONS.with(|n| n.set(n.get() + 1));
 }
 
 /// Override [`crate::verification_enabled`] on this thread (`None`: use

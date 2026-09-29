@@ -424,7 +424,11 @@ pub(crate) fn loads_as_saved(input: &[u8], saved: &[u8], inflated: Option<&[Vec<
     }
     match inflated {
         Some(columns) => header::inflated_document_is(input, columns, saved),
-        None => header::inflate_document(input).as_deref() == Some(saved),
+        None => {
+            #[cfg(feature = "test-hooks")]
+            test_hooks::count_reinflation();
+            header::inflate_document(input).as_deref() == Some(saved)
+        }
     }
 }
 

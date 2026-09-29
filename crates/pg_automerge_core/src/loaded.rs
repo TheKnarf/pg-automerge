@@ -566,7 +566,14 @@ pub fn merge_changes(a: Input<'_>, changes: &[u8]) -> Result<Option<LoadedDoc>, 
             return Ok(None);
         }
         let limit = budget::limit();
-        let mut scanned = budget::scan_input_keep(changes, limit);
+        // The inflated columns of a compressed save are kept only under a
+        // limit, as `normalize` keeps them: they are charged in the
+        // estimate. Without one nothing caps them, and the comparison of
+        // `from_loaded_input` inflates the input again after the load.
+        let mut scanned = match limit {
+            Some(_) => budget::scan_input_keep(changes, limit),
+            None => budget::scan_input(changes, limit),
+        };
         budget::check_no_bundle(&scanned)?;
         if let Some(chunks) = header::change_chunks(changes) {
             return apply_change_chunks(a, &heads_a, changes, &chunks, &scanned, limit);
@@ -708,6 +715,12 @@ fn merge_save(
         && count <= count_a
         && parses()?
     {
+        // Nothing has priced the input yet, and it may still be rejected:
+        // the scan's inflated columns are not held through the load of
+        // `a`. (A save with no more changes than `a` that contains `a`
+        // has `a`'s heads, answered here; otherwise `from_loaded_input`
+        // inflates the input again.)
+        drop(scanned.inflated_columns.take());
         let doc = load_stored_unguarded(bytes)?;
         if has_all(&doc, &chunk.heads) {
             return Ok(SaveMerge::Unchanged);
@@ -716,9 +729,9 @@ fn merge_save(
     }
     budget::check_load(scanned, changes, limit)?;
     let b = load_bytes(changes).map_err(invalid_changes)?;
-    // The scan's inflated columns (of a compressed save), held through
-    // the load for the comparison of `from_loaded_input`; dropped on every
-    // other path.
+    // The scan's inflated columns (of a compressed save, under a limit),
+    // held through the load (charged in the estimate just checked) for the
+    // comparison of `from_loaded_input`; dropped on every other path.
     let inflated = scanned.inflated_columns.take();
     if ensure_complete(&b).is_err() {
         return Ok(SaveMerge::Concatenate);

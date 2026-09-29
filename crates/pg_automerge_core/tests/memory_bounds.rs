@@ -20,8 +20,9 @@
 //!
 //! Also: deflate bombs are rejected quickly, the scan's counts equal
 //! Automerge's own, the run-level `gmax` equals the row-level definition,
-//! merge results that outgrow the limit are rejected, and the bundle
-//! chunk is refused.
+//! merge results that outgrow the limit are rejected, a save rejected
+//! after the stored document was loaded does not hold its inflated
+//! columns through that load, and the bundle chunk is refused.
 //!
 //! This is the test that has to be re-run when Automerge is upgraded:
 //! the estimate's constants are measured costs of Automerge 0.12.
@@ -648,6 +649,46 @@ fn merge_results_that_outgrow_the_limit_are_rejected() {
             .is_some()
     );
     set_limit(None);
+}
+
+/// `merge_changes` of a compressed save with no more changes than the
+/// stored `a` loads `a` first, before the save is priced (to answer "`a`
+/// has it" as a load of `a ++ save` would). The columns the scan inflated
+/// are not held through that load: when the save is then rejected, the
+/// peak is the load of `a`, not that plus the inflated save.
+#[test]
+fn a_save_rejected_after_loading_a_does_not_hold_its_columns() {
+    const SIZE: usize = 4 << 20;
+    let mut doc = AutoCommit::new().with_actor(actor(1));
+    doc.put(ROOT, "small", 1i64).unwrap();
+    doc.commit();
+    let bytes: Vec<u8> = (0..SIZE).map(|i| (i * 7919 % 251) as u8).collect();
+    doc.put(ROOT, "big", ScalarValue::Bytes(bytes)).unwrap();
+    doc.commit();
+    let a = doc.document().save_nocompress();
+    let mut other = AutoCommit::new().with_actor(actor(2));
+    other
+        .put(ROOT, "big", ScalarValue::Bytes(vec![7; SIZE]))
+        .unwrap();
+    other.commit();
+    let input = other.save();
+    assert!(input.len() < SIZE / 100, "compresses well");
+
+    set_limit(Some(None));
+    let (loaded_a, load_a) = peak_of(|| LoadedDoc::from_stored(&a).unwrap());
+    drop(loaded_a);
+    let estimate = scan_input(&input, None).load_estimate();
+    set_limit(Some(Some(estimate - 1)));
+    let loads = pg_automerge_core::test_hooks::loads();
+    let (result, peak) = peak_of(|| loaded::merge_changes(Input::Stored(&a), &input));
+    set_limit(None);
+    assert_eq!(limit_error(result).map(|e| e.kind), Some(LimitKind::Input));
+    // Rejected after loading `a` (step 2), before loading the save.
+    assert_eq!(pg_automerge_core::test_hooks::loads() - loads, 1);
+    assert!(
+        peak < load_a + (SIZE as u64) / 4,
+        "peak {peak}, load of a {load_a}, inflated save {SIZE}"
+    );
 }
 
 fn sorted_heads(bytes: &[u8]) -> Vec<automerge::ChangeHash> {
