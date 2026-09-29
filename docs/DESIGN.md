@@ -1678,11 +1678,16 @@ PostgreSQL documentation's "Security Considerations for Extensions":
   expose that in a database; with `trusted = true` any database owner
   could.
 - What would make `trusted = true` defensible: bounds checked before
-  Automerge allocates (a cap on the inflated size of deflated columns and
-  on the op and change counts, all readable from the chunk headers with
-  the existing header parser), and ideally allocation failure turned into
-  an ERROR (not possible with the default allocator on stable Rust).
-  Until then the flag stays `false`.
+  Automerge allocates, computed from the chunk headers and column
+  metadata. Measurements ([Input amplification
+  measurements](#input-amplification-measurements-2026-09-29)) show that
+  a cap on the inflated size and on the op and change counts is not
+  enough: dependency and successor entries, actors times changes, and
+  whether ops arrive in a document chunk or as change chunks (5 to 10
+  times more memory per op) each drive memory on their own. Turning an
+  allocation failure into an ERROR is not possible on stable Rust
+  (`set_alloc_error_hook` is unstable, and a global allocator must not
+  unwind). Until such bounds exist the flag stays `false`.
 
 The rest of the review found nothing that would stop it:
 
@@ -2024,3 +2029,70 @@ Release build, median of seven, ms:
 
 The added time is the inflation of the save's columns; loading the save
 instead would cost 200 ms / 2.8 s.
+
+### Input amplification measurements (2026-09-29)
+
+What a load of client bytes costs, measured to design the size limits
+(release build; peak bytes allocated through the Rust global allocator,
+counted by a counting allocator in a scratch harness; "doc" is
+`Automerge::load` of a document chunk, "chunks" is the same history
+loaded as bare change chunks, as `merge(doc, bytea)` applies them).
+
+Small inputs that describe a lot. Automerge's columns are run-length
+encoded, so a run of `n` identical (or equally spaced) values costs a
+few bytes whatever `n` is, before any deflate:
+
+| Input | Bytes | Describes | Peak | Time |
+|---|---|---|---|---|
+| one change chunk, loads fine (a list of nulls) | 104 | 1,000,001 ops | 561 MB | 3.4 s |
+| save of a list of 400,000 nulls (`save_nocompress`) | 174 | 400,001 ops | 36 MB doc, 231 MB chunks | 0.4 s, 1.6 s |
+| save of 200,000 one-op changes | 196 | 200,000 changes | 194 MB | 1.3 s |
+| compressed save of a 1,000,000-character repetitive text | 1,165 | 1,000,001 ops | 93 MB | 1.0 s |
+| crafted document chunk: 1,000 changes with 10,000 deps each | 66 | 10^7 deps | 1.41 GB | 3.4 s, then rejected |
+| crafted document chunk: one op with 10^6 successors | 134 | 10^6 succ entries | 328 MB | 3.7 s, then rejected |
+| crafted document chunk: 100,000 empty changes | 71 | 100,000 changes | 128 MB | 0.3 s, then rejected |
+| crafted change: 2 ops, one with 10^6 preds | 71 | 10^6 preds | 50 MB | 0.2 s |
+| crafted document chunk: `max_op` 10^8, 3 ops | 115 | nothing | 14 kB | - |
+
+So neither the stored size (174 bytes for any number of nulls), nor the
+inflated size, nor a declared `max_op` bounds memory. The crafted
+documents fail only after reconstruction ("mismatching heads"), with the
+memory already spent. Memory is linear in each of these quantities
+(checked at 10^7 ops: 910 MB and 11.3 s as a document, 6.5 GB and 49 s
+as change chunks), with these costs per unit (peak bytes):
+
+| Unit (readable from headers) | doc | chunks |
+|---|---|---|
+| op, appended in counter order (text typed or pasted, list append) | 89-91 | 530-650 |
+| op out of counter order, object creation, distinct map key, mark | 280-372 | 550-810 |
+| change | 900-1,275 | 1,400-2,300 |
+| dependency entry | 141 | - |
+| successor entry (text deletes: one per element) | 13 | - |
+| successor entries pending on one key (put/delete toggling, crafted) | 328-590 | - |
+| pred entry | - | 50 |
+| inflated byte (string, bytes values) | 5-7 | 7 |
+| change × actor (Automerge's clock cache every 16 changes) | 0.25-0.3 | 0.25-0.3 |
+| change with more than ~16 ops × actor (reconstruction) | 3 | - |
+
+Most of a load's peak is transient: after loading, a 1,000,000-character
+text holds 1 MB (the op set is columnar); the peak comes from rebuilding
+every change. Reads of a stored value stay within 1.0-1.5 times its
+load's peak (`automerge_changes`, `automerge_changes_meta`, the jsonb
+walk into a `serde_json::Value`), and a merge of two concurrent
+1,000,000-character documents peaks at 566 MB, almost all of it applying
+the other document's changes (the chunks cost). Time follows memory: at
+most about 8 s per GB of the estimate below on the test machine.
+
+A linear estimate over these quantities with the worst measured cost of
+each (450 bytes per op, 1,600 per change and an encoder term, 200 per
+dependency, 30 per successor plus 600 per successor pending on one
+(object, key) group, 200 per actor, 10 per inflated byte, 0.3 per change
+× actor and 3 per large change × actor; for change chunks 1,000 per op,
+80 per pred, 2,500 per change) stays above the measured peak for every
+generated and crafted input tried: actual/estimate is at most 0.80 (ops
+prepended to a list of maps), about 0.2 for appended text and lists, and
+0.1 for a key overwritten 200,000 times in one change. Allocation
+failure itself cannot be turned into an ERROR: `std::alloc::
+set_alloc_error_hook` is unstable in Rust 1.98, a `#[global_allocator]`
+must not unwind, and allocating with `palloc` would `longjmp` through
+Automerge's frames.
