@@ -216,7 +216,7 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. Loads a document only to merge it: a single row, or a version plus older ones, costs no load or one. |
 | `automerge_heads(automerge) → text[]` | I S P | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
 | `automerge_contains(a, b) → bool` | I S P | Whether `a` already has every change of `b`. Decided without loading when the heads or the change counts can tell (`b` newer than or concurrent with `a`); otherwise loads `a`. |
-| `automerge_contains(doc, changes bytea) → bool` | I S P | Whether `merge(doc, changes)` would add nothing (every change in the save or change chunks is already in `doc`). Usually decided without loading the document. |
+| `automerge_contains(doc, changes bytea) → bool` | I S P | Whether `merge(doc, changes)` would add nothing (every change in the save or change chunks is already in `doc`). Usually decided without loading the document; when it loads, changes that reuse an actor id of `doc` with different content fail as in `merge` (22000). |
 | `automerge_notify('channel', 'key_col' [, ...])` | volatile, parallel unsafe | `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW` trigger: `NOTIFY channel` with the row key and the new/previous heads of `automerge` columns whose heads changed. |
 | `automerge_changes(doc, since_heads text[] DEFAULT '{}')` | I S P | `SETOF automerge_change (hash, actor, seq, start_op, op_count, time, message, deps, change bytea)`: every change not reachable from `since_heads` (all by default), dependencies first. Rebuilds change bytes (costly on big documents). |
 | `automerge_changes_meta(doc, since_heads DEFAULT '{}')` | I S P | The same rows without `change` (`SETOF automerge_change_meta`); needs only the change graph. |
@@ -318,14 +318,20 @@ Details in
   document, longer for documents of tens of MB.
 - **Every writer needs its own actor id.** Two writers (or two copies of
   a document) that commit with the same actor id produce different changes
-  with the same sequence number, and Automerge cannot merge them: `merge`,
-  `merge_agg` and `merge(doc, changes)` fail with SQLSTATE `22000`
-  (`conflicting automerge changes: actor ... has two different changes
-  with seq N`, with a HINT). Retrying does not help; the fix is in the
-  writer. Automerge picks a random actor id per document instance unless
-  you set one.
-- Malformed input is always SQLSTATE `22P02` (`invalid automerge document`),
-  including input that passes Automerge's checksums but panics its decoder.
+  with the same sequence number, and Automerge cannot merge them. Every
+  path that meets both histories fails with SQLSTATE `22000` (data_exception,
+  not `22P02`; `conflicting automerge changes: actor ... has two different
+  changes with seq N`, with a HINT): `merge` / `||` of two documents,
+  `merge_agg`, `merge(doc, changes)` / `doc || changes`,
+  `automerge_contains(doc, changes)` when it has to load the document, and
+  text input or the `bytea → automerge` cast of bytes that hold both
+  histories (a save followed by the other writer's change chunk).
+  Retrying does not help; the fix is in the writer. Automerge picks a
+  random actor id per document instance unless you set one.
+- Malformed input is SQLSTATE `22P02` (`invalid automerge document`),
+  including input that passes Automerge's checksums but panics its decoder;
+  input that is well formed but holds two conflicting histories of one
+  actor is `22000` (above).
   One rare case is reported late: a result of `merge(doc, bytea)` is checked
   to survive a save and load when it is first stored, sent or cast, not
   inside `merge` (a `BEGIN .. EXCEPTION` around just the `merge` does not

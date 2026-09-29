@@ -297,6 +297,62 @@ fn reused_actor_id_is_a_conflict_on_every_path() {
     );
 }
 
+/// The other actor conflict Automerge reports, `DuplicateAuthor`: an
+/// actor that already has an author (set on its seq 1 change) gets a later
+/// change that assigns one again. Automerge itself writes the author only
+/// on seq 1, so a second assignment arises only from a writer that reuses
+/// an actor id across authors or crafts its changes; the change here is
+/// crafted by adding an author footer to an ordinary seq 2 change.
+#[test]
+fn reassigned_author_is_a_conflict() {
+    let author = automerge::Author::from(vec![0xab, 0xcd]);
+    let mut doc = AutoCommit::new().with_author(Some(author.clone()));
+    doc.set_actor(actor(1));
+    doc.put(ROOT, "x", 1i64).unwrap();
+    doc.commit();
+    let base = stored(&mut doc);
+    doc.put(ROOT, "x", 2i64).unwrap();
+    doc.commit();
+    let head = doc.get_heads()[0];
+    let seq2 = doc.get_change_by_hash(&head).unwrap().clone();
+    assert_eq!(seq2.seq(), 2);
+    assert!(seq2.author().is_none());
+    let mut expanded = automerge::ExpandedChange::from(&seq2);
+    expanded.extra_bytes = [&[1u8, 2][..], author.as_bytes()].concat();
+    let mut crafted = automerge::Change::from(expanded);
+    assert_eq!(crafted.author(), Some(author));
+    let crafted = crafted.bytes().to_vec();
+
+    // automerge_contains(doc, bytea) decides this one from the heads
+    // without loading (a change on top of them is missing), so it raises
+    // nothing; it reports a conflict only when it has to load.
+    assert!(!contains_changes(&base, &crafted).unwrap());
+    let expected = format!(
+        "conflicting automerge changes: actor {} is assigned an author again at seq 2",
+        actor(1)
+    );
+    for (what, err) in [
+        (
+            "merge(doc, changes)",
+            merge_changes(&base, &crafted).unwrap_err(),
+        ),
+        (
+            "normalize",
+            normalize(&[base.clone(), crafted.clone()].concat()).unwrap_err(),
+        ),
+    ] {
+        let Error::ConflictingChanges(msg) = &err else {
+            panic!("{what}: expected ConflictingChanges, got {err:?}");
+        };
+        assert_eq!(msg, &expected, "{what}");
+        assert!(err.detail().is_some(), "{what}");
+        assert!(
+            err.hint().is_some_and(|h| h.contains("its own actor id")),
+            "{what}"
+        );
+    }
+}
+
 /// Other errors of Automerge keep their class: only the actor conflicts
 /// are [`Error::ConflictingChanges`].
 #[test]

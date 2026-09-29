@@ -143,7 +143,9 @@ Data flow:
   re-saved with `save_nocompress()`. A stored value is therefore always a
   single uncompressed document chunk, whatever the producer sent. Empty
   input (`''::bytea`, `'\x'`) is the empty document, whose jsonb is `{}`.
-- **Validated.** Input that does not load is rejected (`22P02`), and so is
+- **Validated.** Input that does not load is rejected (`22P02`; `22000`
+  when it is well formed but holds two conflicting histories of one actor,
+  see [Error codes](#error-codes)), and so is
   input whose changes have missing dependencies: no orphaned changes are
   stored.
 - **Nothing unloadable is stored** (while `pg_automerge.verify_writes` is
@@ -272,8 +274,8 @@ identity; `automerge_heads` is.
 Errors are raised with `ereport(ERROR)` and a SQLSTATE (see
 [Error codes](#error-codes)); nothing panics across FFI. Client input that
 is malformed (bytes, text, hashes) is always `22P02`; well-formed input
-whose history conflicts with the document it meets (a reused actor id) is
-`22000`; stored values that fail are `XX000`.
+whose history conflicts with the document it meets, or that holds two
+conflicting histories itself (a reused actor id), is `22000`; stored values that fail are `XX000`.
 
 The automerge decoder is not panic-free: input whose chunk checksums are
 valid but whose column data is malformed can hit `unwrap`s, index panics
@@ -1168,7 +1170,7 @@ array elements, trigger usage, jsonb limits) are built there directly.
 | `22P02` invalid_text_representation | Bad text input; bytes that are not a loadable Automerge save or change sequence (including decoder panics); a result that does not survive a save and load | `invalid input syntax for type automerge: ...`, `invalid automerge document: ...`, `invalid automerge changes: ...` |
 | `22P02` | `merge(automerge, bytea)` with changes whose dependencies are in neither input | `invalid automerge changes: missing N dependencies that neither the document nor the input contains` (DETAIL: `Missing changes: <hashes>.`) |
 | `22P02` | A change hash that is not 64 hex digits | `invalid automerge change hash "...": expected 64 hexadecimal digits` |
-| `22000` data_exception | Two histories that disagree about one actor's changes (a reused actor id): two different changes with the same (actor, seq), or a second author assignment, met by `merge`, `\|\|`, `merge_agg`, `merge(automerge, bytea)`, `automerge_contains(automerge, bytea)` when it loads, or one input holding both (text input, the `bytea` cast) | `conflicting automerge changes: actor <hex> has two different changes with seq N` (DETAIL: `An actor's changes form one sequence; these inputs hold two different ones, which cannot be merged.` HINT: `Each writer must use its own actor id. Automerge picks a random one for every document instance unless the application sets it.`) |
+| `22000` data_exception | Two histories that disagree about one actor's changes (a reused actor id): two different changes with the same (actor, seq), or a second author assignment, met by `merge`, `\|\|`, `merge_agg`, `merge(automerge, bytea)`, `automerge_contains(automerge, bytea)` when it loads, or one input holding both (text input, the `bytea` cast) | `conflicting automerge changes: actor <hex> has two different changes with seq N`, or for a second author assignment (Automerge writes an actor's author only on its seq 1 change, so this takes a writer that reuses an actor id across authors or crafts changes) `conflicting automerge changes: actor <hex> is assigned an author again at seq N`; both with DETAIL: `An actor's changes form one sequence; these inputs hold two different ones, which cannot be merged.` HINT: `Each writer must use its own actor id. Automerge picks a random one for every document instance unless the application sets it.`) |
 | `22003` numeric_value_out_of_range | A change's `seq`, `start_op` or `op_count`, or the change count, above `bigint`'s range (Automerge rejects such changes on load, so this is not expected to occur) | `automerge seq N is out of range for type bigint` (DETAIL: the change) |
 | `22004` null_value_not_allowed | A NULL element in `since_heads` / `heads` | `since_heads must not contain NULL` |
 | `22023` invalid_parameter_value | `automerge_to_jsonb(doc, heads)` with a head the document lacks; bad `automerge_notify` arguments (count, channel length, key column listed twice or of type `automerge`) | `automerge document does not contain change <hash>`, `automerge_notify(): ...` (HINT on how to declare the trigger, or which columns to name) |
@@ -1219,6 +1221,12 @@ concatenated input, applying change chunks, merging two documents); other
 Automerge errors keep their class. So input that holds both histories on
 its own (a save followed by the other writer's change chunk, through text
 input or the `bytea` cast) is also `22000` now, where it was `22P02`.
+Both variants are tested in the core crate (`merge_changes.rs`:
+`reused_actor_id_is_a_conflict_on_every_path` for `DuplicateSeqNumber`,
+`reassigned_author_is_a_conflict` for `DuplicateAuthor`, with a change
+crafted by adding an author footer to a seq 2 change); the SQL tests
+check the SQLSTATE, DETAIL and HINT for the first, which share one mapping
+in `src/error.rs`.
 
 ### Other reclassifications (0.1.0, unreleased)
 
