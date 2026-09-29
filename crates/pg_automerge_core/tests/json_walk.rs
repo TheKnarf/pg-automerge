@@ -196,3 +196,41 @@ fn nesting_limit_is_the_same() {
         }
     }
 }
+
+/// Objects created concurrently by several actors share op counters and
+/// differ only in the actor (actors joining in the reverse of their byte
+/// order), which is where the sweep's object index (ids ordered by
+/// counter, then actor) must agree with the order Automerge visits
+/// objects in; in memory and loaded, every object is found.
+#[test]
+fn objects_sharing_counters_across_actors() {
+    let actors = [[0x30u8; 16], [0x20; 16], [0x10; 16]];
+    let mut base = AutoCommit::new().with_actor(ActorId::from(actors[0]));
+    let list = base.put_object(ROOT, "list", ObjType::List).unwrap();
+    base.commit();
+    let mut replicas: Vec<AutoCommit> = actors
+        .iter()
+        .map(|a| base.fork().with_actor(ActorId::from(*a)))
+        .collect();
+    for (r, doc) in replicas.iter_mut().enumerate() {
+        for i in 0..20 {
+            let m = doc.insert_object(&list, i, ObjType::Map).unwrap();
+            doc.put(&m, "r", r as i64).unwrap();
+            let t = doc.put_object(&m, "t", ObjType::Text).unwrap();
+            doc.splice_text(&t, 0, 0, &format!("{r}-{i}")).unwrap();
+            let l = doc.put_object(&m, "l", ObjType::List).unwrap();
+            doc.insert(&l, 0, i as i64).unwrap();
+        }
+        doc.put_object(ROOT, format!("m{r}"), ObjType::Map).unwrap();
+        doc.commit();
+    }
+    let mut merged = replicas.remove(0);
+    for mut other in replicas {
+        merged.merge(&mut other).unwrap();
+    }
+    assert_same(merged.document(), "in memory");
+    let loaded = Automerge::load(&merged.save()).unwrap();
+    assert_same(&loaded, "loaded");
+    let events = events(&loaded, None, json::write_json_at).unwrap();
+    assert_eq!(events.iter().filter(|e| *e == "key \"r\"").count(), 60);
+}

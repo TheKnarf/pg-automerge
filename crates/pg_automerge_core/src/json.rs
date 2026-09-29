@@ -6,7 +6,6 @@
 //! `serde_json::Value` ([`doc_to_json`], used by tests and tools).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use automerge::iter::{DocItem, ListRange, MapRange, Span};
@@ -94,7 +93,7 @@ pub fn doc_to_json_at(doc: &Automerge, heads: Option<&[ChangeHash]>) -> Result<V
 /// emitted depth first from the root. Setting up a `map_range` /
 /// `list_range` iterator per object ([`write_json_per_object`]) costs about
 /// 5 µs per object, which dominated documents made of many small objects
-/// (a list of 20,000 small maps: 144 ms per-object, 75 ms in one sweep).
+/// (a list of 20,000 small maps: 141 ms per-object, 64 ms in one sweep).
 /// Text comes from the sweep's spans: string runs, and U+FFFC for each
 /// block marker, exactly the characters `ReadDoc::text` returns (both put
 /// U+FFFC for anything in a text that is not a string, and nothing for
@@ -124,16 +123,32 @@ pub fn write_json_at<S: JsonSink + ?Sized>(
 }
 
 /// The visible content of every reachable object, from one sweep.
+///
+/// Laid out for a document of many small objects (a list of 20,000 small
+/// maps: 80,000 items), where this bookkeeping cost a third of the walk
+/// with a `Vec` of entries per object and a `HashMap` from object id to
+/// content: all entries go to one `Vec` (the iterator yields each object's
+/// items together, so an object's entries are one range of it), and
+/// objects are found by binary search in an index sorted by id rather than
+/// by hashing their ids (SipHash of the id's actor bytes, twice per
+/// object). The index costs no sort in practice (see [`ObjIndex`]), and a
+/// lookup is O(log n) whatever ids a document holds.
 struct Sweep<'a> {
-    objects: Vec<Content<'a>>,
-    index: HashMap<ObjId, usize>,
+    /// Per object, in the order visited.
+    objects: Vec<Content>,
+    /// The entries of every map and list, each object's in one range.
+    entries: Vec<Entry<'a>>,
+    /// The characters of every text object.
+    texts: Vec<String>,
+    index: ObjIndex,
 }
 
-enum Content<'a> {
-    /// A map's or list's entries, in order.
-    Entries(Vec<Entry<'a>>),
-    /// A text's characters.
-    Text(String),
+#[derive(Clone, Copy)]
+enum Content {
+    /// A map's or list's entries, in order: `entries[start..end]`.
+    Entries { start: usize, end: usize },
+    /// A text's characters: `texts[i]`.
+    Text(usize),
 }
 
 struct Entry<'a> {
@@ -147,29 +162,62 @@ enum EntryValue<'a> {
     Object(ObjId, ObjType),
 }
 
+/// Object id → position among the visited objects: the ids sorted by
+/// `ObjId`'s own order (counter, then actor bytes; consistent with its
+/// equality), searched by bisection.
+///
+/// Automerge's document iterator visits objects in the order of its
+/// internal ids (counter, then index in the document's sorted actor
+/// table), which is the same order, so the ids arrive sorted and the check
+/// in [`ObjIndex::new`] is all it costs; should they ever not, they are
+/// sorted there. Holds the iterator's shared per-object ids (`Arc`), not
+/// copies.
+struct ObjIndex(Vec<(Arc<ObjId>, usize)>);
+
+impl ObjIndex {
+    /// The index of `(id, position)` pairs, one per object (ids distinct).
+    fn new(mut ids: Vec<(Arc<ObjId>, usize)>) -> Self {
+        if !ids.is_sorted_by(|a, b| a.0 < b.0) {
+            ids.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        }
+        Self(ids)
+    }
+
+    fn get(&self, id: &ObjId) -> Option<usize> {
+        self.0
+            .binary_search_by(|(probe, _)| (**probe).cmp(id))
+            .ok()
+            .map(|i| self.0[i].1)
+    }
+}
+
 impl<'a> Sweep<'a> {
     /// `None` if the document has a `Table` object.
     fn collect(doc: &'a Automerge, heads: Option<&[ChangeHash]>) -> Option<Self> {
         let mut ticker = crate::Ticker::default();
-        let mut sweep = Sweep {
-            objects: Vec::new(),
-            index: HashMap::new(),
-        };
+        let mut objects = Vec::new();
+        let mut entries = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        let mut ids = Vec::new();
         let mut current: Option<Arc<ObjId>> = None;
         for item in doc.iter_at(ROOT, heads) {
             ticker.tick();
             // The iterator yields each object's items together, and hands
             // out one shared id per object.
             if current.as_ref().is_none_or(|c| !Arc::ptr_eq(c, &item.obj)) {
-                let content = match item.item {
-                    DocItem::Text(_) => Content::Text(String::new()),
-                    DocItem::Map(_) | DocItem::List(_) => Content::Entries(Vec::new()),
-                };
-                sweep.index.insert((*item.obj).clone(), sweep.objects.len());
-                sweep.objects.push(content);
+                objects.push(match item.item {
+                    DocItem::Text(_) => {
+                        texts.push(String::new());
+                        Content::Text(texts.len() - 1)
+                    }
+                    DocItem::Map(_) | DocItem::List(_) => Content::Entries {
+                        start: entries.len(),
+                        end: entries.len(),
+                    },
+                });
+                ids.push((Arc::clone(&item.obj), objects.len() - 1));
                 current = Some(item.obj);
             }
-            let content = sweep.objects.last_mut().expect("pushed above");
             let (key, value, id) = match item.item {
                 DocItem::Map(m) => {
                     let id = matches!(m.value, ValueRef::Object(_)).then(|| m.id());
@@ -180,7 +228,8 @@ impl<'a> Sweep<'a> {
                     (None, l.value, id)
                 }
                 DocItem::Text(span) => {
-                    if let Content::Text(text) = content {
+                    if let (Some(Content::Text(_)), Some(text)) = (objects.last(), texts.last_mut())
+                    {
                         match span {
                             Span::Text { text: run, .. } => text.push_str(&run),
                             Span::Block(_) => text.push('\u{FFFC}'),
@@ -195,21 +244,27 @@ impl<'a> Sweep<'a> {
                 (ValueRef::Object(typ), Some(id)) => EntryValue::Object(id, typ),
                 (ValueRef::Object(_), None) => unreachable!("objects get an id above"),
             };
-            if let Content::Entries(entries) = content {
+            if let Some(Content::Entries { end, .. }) = objects.last_mut() {
                 entries.push(Entry { key, value });
+                *end = entries.len();
             }
         }
-        Some(sweep)
+        Some(Sweep {
+            objects,
+            entries,
+            texts,
+            index: ObjIndex::new(ids),
+        })
     }
 
-    fn content(&self, id: &ObjId) -> Option<&Content<'a>> {
-        self.index.get(id).map(|&i| &self.objects[i])
+    fn content(&self, id: &ObjId) -> Option<Content> {
+        self.index.get(id).map(|i| self.objects[i])
     }
 
     /// The entries of a map or list (none if it has no visible entries).
     fn entries(&self, id: &ObjId) -> &[Entry<'a>] {
         match self.content(id) {
-            Some(Content::Entries(entries)) => entries,
+            Some(Content::Entries { start, end }) => &self.entries[start..end],
             _ => &[],
         }
     }
@@ -237,7 +292,7 @@ impl<'a> Sweep<'a> {
             match &entry.value {
                 EntryValue::Scalar(scalar) => write_scalar(scalar, sink),
                 EntryValue::Object(id, ObjType::Text) => match self.content(id) {
-                    Some(Content::Text(text)) => sink.string(&sanitize(text)),
+                    Some(Content::Text(i)) => sink.string(&sanitize(&self.texts[i])),
                     _ => sink.string(""),
                 },
                 EntryValue::Object(id, typ) => {
@@ -643,6 +698,56 @@ mod tests {
                 "empty_map": {}
             })
         );
+    }
+
+    /// The object index finds every id and only those, whether the ids
+    /// arrive sorted (as from Automerge's iterator) or not, including ids
+    /// that share a counter and differ only in the actor, and ids whose
+    /// actor-table index disagrees with the actor order.
+    #[test]
+    fn object_index_finds_exactly_its_ids() {
+        let actors: Vec<ActorId> = [[0x30u8; 16], [0x10; 16], [0x20; 16]]
+            .into_iter()
+            .map(ActorId::from)
+            .collect();
+        let mut ids = vec![ObjId::Root];
+        for counter in [7u64, 1, 900, 3, 7_000_000_000] {
+            for (i, actor) in actors.iter().enumerate() {
+                ids.push(ObjId::Id(counter, actor.clone(), i));
+            }
+        }
+        let absent = [
+            ObjId::Id(2, actors[0].clone(), 0),
+            ObjId::Id(7, ActorId::from([0x40u8; 16]), 3),
+            ObjId::Id(u64::MAX, actors[1].clone(), 1),
+        ];
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        for round in 0..20 {
+            let mut order: Vec<usize> = (0..ids.len()).collect();
+            if round == 0 {
+                order.sort_by(|&a, &b| ids[a].cmp(&ids[b]));
+            } else {
+                for i in (1..order.len()).rev() {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    order.swap(i, (rng % (i as u64 + 1)) as usize);
+                }
+            }
+            let index = ObjIndex::new(
+                order
+                    .iter()
+                    .map(|&i| (Arc::new(ids[i].clone()), i * 10))
+                    .collect(),
+            );
+            for (i, id) in ids.iter().enumerate() {
+                assert_eq!(index.get(id), Some(i * 10), "{id:?}");
+            }
+            for id in &absent {
+                assert_eq!(index.get(id), None, "{id:?}");
+            }
+        }
+        assert_eq!(ObjIndex::new(Vec::new()).get(&ObjId::Root), None);
     }
 
     #[test]

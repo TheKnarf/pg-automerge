@@ -1027,7 +1027,13 @@ Postgres errors inside those calls unwind through the walk untouched (see
 The walk makes one sweep over the document with Automerge's document
 iterator (`ReadDoc::iter_at`), buffering each object's visible entries
 (borrowed from the document), then emits them depth first from the root.
-One sweep avoids setting up a `map_range`/`list_range` iterator per object
+The entries of all maps and lists go to one vector (the iterator yields an
+object's items together, so each object's entries are one range of it),
+and an object is found by bisecting its id in an index of the visited ids
+ordered by `ObjId`'s own order (counter, then actor bytes), not by hashing
+it: Automerge visits objects in that order (its actor table is kept
+sorted), so building the index costs one pass that checks the order, and
+sorts only if it ever does not hold. One sweep avoids setting up a `map_range`/`list_range` iterator per object
 (about 5 µs each). Text comes from the sweep's spans: string runs, and
 U+FFFC for each block marker, which is exactly what `text()` returns (both
 emit U+FFFC for anything in a text that is not a string and nothing for
@@ -1542,3 +1548,20 @@ and another 11% in glibc's `malloc`/`free`, mostly for Automerge's
 allocations; linking mimalloc as the Rust global allocator instead was
 tried with the core benchmark and rejected (the 877 kB load about 5%
 faster, the 3 MB text load about 6% slower).
+
+### One-sweep walk without per-object vectors and hashing (2026-09-29)
+
+The sweep's bookkeeping (a `Vec` of entries per object and a SipHash
+`HashMap` from object id to content, about a third of the walk on the
+877 kB list) became one entry vector and a sorted id index searched by
+bisection (see [jsonb mapping](#jsonb-mapping)); the events are
+unchanged. `mise run bench-core`, release build, median of three,
+milliseconds: jsonb walk (no-op sink) 74.3 → 64.3 on the 877 kB list,
+6.6 → 5.7 on the 83 kB list, 250 → 250 on the 3 MB text (one object).
+`mise run bench-sql`, median of seven, two before/after pairs in one
+session:
+
+| Path | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|
+| R1 `doc->>'status'` | 268, 268 | 257, 261 | 28, 26 | 26, 25 |
+| R2 three accessors in one `SELECT` | 807, 809 | 782, 777 | 80, 77 | 76, 80 |
