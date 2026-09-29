@@ -2541,3 +2541,29 @@ scan decoded every value and computed Gmax exactly for every document,
 10.7 ms on the 877 kB list (+6% on its writes); counting literal runs
 without decoding them and taking Gmax at its bound unless that decides a
 refusal brought it to 1.7 ms.
+
+Remeasured at the final verification, interleaved (the 72e8d57 build,
+then this one, three pairs of `mise run bench-sql` runs, 5 to 9
+repetitions each; mean of the medians, ms), the write cost is above the
+drift after all on the smaller documents, while the read-only R1 stays
+within 0.5%:
+
+| case | 83 kB before | after | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|---|---|
+| R1 read (unchanged code) | 26.0 | 26.0 | 260 | 261 | 2781 | 2765 |
+| I1 insert of a compressed save | 21.3 | 23.0 (+8%) | 201 | 213 (+6%) | 2754 | 2765 (+0.4%) |
+| W1 merge(doc, changes) | 37.7 | 41.0 (+9%) | 360 | 374 (+4%) | 5196 | 5219 (+0.4%) |
+| W2 merge(doc, newer save) | 22.3 | 23.7 (+6%) | 208 | 215 (+4%) | 2788 | 2790 (+0.1%) |
+| W3 merge(doc, save::automerge) | 22.0 | 23.0 (+5%) | 205 | 215 (+5%) | 2770 | 2802 (+1.2%) |
+| W6 W3 as a text parameter | 38.3 | 40.3 (+5%) | 373 | 390 (+5%) | 5345 | 5363 (+0.3%) |
+
+(3 MB: one pair.) `bench-core`, two pairs: normalize of the 877 kB list
+161.9 → 164.6 ms stored, 167.7 → 175.6 ms compressed (+5%), of the 3 MB
+text within 1%. So the price of the limit is about 4-6% on writes of
+list-shaped documents of 0.1-1 MB (1-2 ms at 83 kB, 7-15 ms at 877 kB,
+of which the scans of a compressed input and of its normalized result
+account for 5.4 ms; the rest was not attributed), and about 1% on a
+large text, whose columns are few long runs. Not tuned further at this
+stage. Reads are unchanged; a
+merge of stored values pays the scan of its result (A2, `merge_agg` of
+two versions: 174 → 181 ms at 877 kB, one pair).
