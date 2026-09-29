@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:62
+-- src/io.rs:65
 -- creates:
 --   Type(pg_automerge::io::AutomergeDatum)
 --   Type(pg_automerge::io::AutomergeArg)
@@ -36,7 +36,7 @@ CREATE TYPE automerge (
 );
 
 COMMENT ON TYPE automerge IS
-    'An Automerge CRDT document (uncompressed save format). Implicitly castable to jsonb.';
+    'An Automerge CRDT document (uncompressed save format). Implicitly castable to jsonb. New values must fit pg_automerge.max_load_memory.';
 COMMENT ON FUNCTION automerge_in(cstring) IS
     'Input function of type automerge: \x followed by the hex of an Automerge save.';
 COMMENT ON FUNCTION automerge_out(automerge) IS
@@ -83,7 +83,7 @@ COMMENT ON TYPE automerge_change_meta IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/notify.rs:133
+-- src/notify.rs:135
 -- requires:
 --   automerge_type
 
@@ -172,7 +172,7 @@ AS 'MODULE_PATHNAME', 'automerge_contains_changes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:113
+-- src/io.rs:116
 -- pg_automerge::io::automerge_from_bytea
 CREATE  FUNCTION "automerge_from_bytea"(
 	"bytes" bytea /* & [u8] */
@@ -291,25 +291,25 @@ AS 'MODULE_PATHNAME', 'automerge_merge_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:29
+-- src/io.rs:32
 -- pg_automerge::io::automerge_out
 -- Skipped due to `#[pgrx(sql = false)]`
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:35
+-- src/io.rs:38
 -- pg_automerge::io::automerge_recv
 -- Skipped due to `#[pgrx(sql = false)]`
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:54
+-- src/io.rs:57
 -- pg_automerge::io::automerge_send
 -- Skipped due to `#[pgrx(sql = false)]`
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:119
+-- src/io.rs:122
 -- pg_automerge::io::automerge_to_jsonb
 CREATE  FUNCTION "automerge_to_jsonb"(
 	"doc" automerge /* AutomergeArg */
@@ -320,7 +320,7 @@ AS 'MODULE_PATHNAME', 'automerge_to_jsonb_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:133
+-- src/io.rs:136
 -- requires:
 --   automerge_type
 --   automerge_from_bytea
@@ -335,11 +335,11 @@ CREATE CAST (automerge AS bytea) WITHOUT FUNCTION;
 CREATE CAST (automerge AS jsonb) WITH FUNCTION automerge_to_jsonb(automerge) AS IMPLICIT;
 
 COMMENT ON FUNCTION automerge_from_bytea(bytea) IS
-    'An Automerge save (or change chunks) as an automerge value, validated and normalized; the bytea to automerge cast.';
+    'An Automerge save (or change chunks) as an automerge value, validated (within pg_automerge.max_load_memory) and normalized; the bytea to automerge cast.';
 COMMENT ON FUNCTION automerge_to_jsonb(automerge) IS
     'The current state of the document as jsonb; the implicit automerge to jsonb cast.';
 COMMENT ON CAST (bytea AS automerge) IS
-    'Assignment cast: validates and normalizes an Automerge save.';
+    'Assignment cast: validates (within pg_automerge.max_load_memory) and normalizes an Automerge save.';
 COMMENT ON CAST (automerge AS bytea) IS
     'Explicit cast: the stored Automerge bytes (an uncompressed save).';
 COMMENT ON CAST (automerge AS jsonb) IS

@@ -15,12 +15,13 @@
 //! same code.
 
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use automerge::{Automerge, Change, ChangeHash};
 
+use crate::budget::{self, Base, DocCounts, InputCounts, LimitKind};
 use crate::{
     Applied, Error, apply_changes, contains_changes_by_heads, ensure_complete, guard_for,
     guard_input, guard_stored, has_all, header, invalid_changes, is_subset, load_bytes,
@@ -53,6 +54,13 @@ pub struct LoadedDoc {
     /// document are checked with a load before they are handed out (the
     /// same safeguard as [`crate::normalize`]).
     unverified: bool,
+    /// What the document's save describes (see [`budget`]), once known:
+    /// exact when scanned from a save, an upper bound for a merge result.
+    counts: OnceCell<DocCounts>,
+    /// A save of `doc` made to count it exactly, which [`LoadedDoc::stored`]
+    /// uses instead of saving again (still with the check of an
+    /// unverified document).
+    save: RefCell<Option<Vec<u8>>>,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -77,7 +85,49 @@ impl LoadedDoc {
             heads,
             stored: cell,
             unverified,
+            counts: OnceCell::new(),
+            save: RefCell::new(None),
         }
+    }
+
+    /// Known counts of the document (`None`: computed when needed).
+    fn with_counts(self, counts: Option<DocCounts>) -> Self {
+        if let Some(counts) = counts {
+            let _ = self.counts.set(counts);
+        }
+        self
+    }
+
+    /// A save of the document made while counting it: the stored bytes of
+    /// a verified document, otherwise kept for [`LoadedDoc::stored`].
+    fn with_save(self, save: Option<Vec<u8>>) -> Self {
+        if let Some(save) = save {
+            if self.unverified {
+                *self.save.borrow_mut() = Some(save);
+            } else {
+                let _ = self.stored.set(save);
+            }
+        }
+        self
+    }
+
+    /// What the document's save describes (see [`budget`]): known, or a
+    /// scan of its stored bytes (saving it first if they are not computed
+    /// yet; that save is kept). Unguarded.
+    pub(crate) fn counts(&self) -> DocCounts {
+        *self.counts.get_or_init(|| {
+            if let Some(bytes) = self.stored.get() {
+                return budget::scan_doc(bytes);
+            }
+            let mut save = self.save.borrow_mut();
+            let saved = save.get_or_insert_with(|| self.doc.save_nocompress());
+            budget::scan_doc(saved)
+        })
+    }
+
+    /// The counts, if already known.
+    pub(crate) fn known_counts(&self) -> Option<DocCounts> {
+        self.counts.get().copied()
     }
 
     /// Load a stored value (validated on its way in); its bytes are kept as
@@ -106,23 +156,37 @@ impl LoadedDoc {
     /// As [`crate::normalize`].
     pub fn from_external(bytes: &[u8]) -> Result<Self, Error> {
         guard_input(|| {
-            let (doc, saved) = normalize_unguarded(bytes)?;
-            Ok(Self::new(doc, Some(saved), false))
+            let normalized = normalize_unguarded(bytes)?;
+            Ok(Self::new(normalized.doc, Some(normalized.saved), false)
+                .with_counts(normalized.counts))
         })
     }
 
     /// A document just loaded from external bytes `input` on its own
-    /// (unguarded, like the load). Its save is computed right away: when
-    /// [`loads_as_saved`] proves that it loads back, the document is
-    /// verified and keeps the save as its stored bytes; otherwise it is
-    /// unverified (the check runs when the bytes are first needed).
-    fn from_loaded_input(doc: Automerge, input: &[u8]) -> Self {
+    /// (unguarded, like the load), whose scan found `scanned`. Its save is
+    /// computed right away: when [`loads_as_saved`] proves that it loads
+    /// back, the document is verified and keeps the save as its stored
+    /// bytes; otherwise it is unverified (the check runs when the bytes
+    /// are first needed). Either way the save must fit the limit.
+    fn from_loaded_input(
+        doc: Automerge,
+        input: &[u8],
+        scanned: &InputCounts,
+        limit: Option<u64>,
+    ) -> Result<Self, Error> {
         let saved = doc.save_nocompress();
-        if loads_as_saved(input, &saved) {
+        let as_saved = loads_as_saved(input, &saved);
+        let counts = match limit {
+            Some(_) if as_saved => Some(scanned.first_doc),
+            Some(_) => Some(budget::check_saved(&saved, LimitKind::Normalized, limit)?),
+            None => None,
+        };
+        Ok(if as_saved {
             Self::new(doc, Some(saved), false)
         } else {
-            Self::new(doc, None, true)
+            Self::new(doc, None, true).with_save(Some(saved))
         }
+        .with_counts(counts))
     }
 
     /// A document built in memory (its stored bytes are computed when
@@ -134,6 +198,19 @@ impl LoadedDoc {
     /// [`Error::Internal`] if Automerge fails reading the document.
     pub fn from_doc(doc: Automerge, unverified: bool) -> Result<Self, Error> {
         guard_stored(|| Ok(Self::new(doc, None, unverified)))
+    }
+
+    /// [`LoadedDoc::from_doc`] with the document's counts and a save of
+    /// it, when known (see [`budget`]).
+    pub(crate) fn from_parts(
+        doc: Automerge,
+        unverified: bool,
+        counts: Option<DocCounts>,
+        save: Option<Vec<u8>>,
+    ) -> Self {
+        Self::new(doc, None, unverified)
+            .with_counts(counts)
+            .with_save(save)
     }
 
     /// The Automerge document (read-only: a `LoadedDoc` never changes).
@@ -173,7 +250,11 @@ impl LoadedDoc {
             return Ok(bytes);
         }
         let bytes = guard_for(self.unverified, || {
-            let saved = self.doc.save_nocompress();
+            let saved = self
+                .save
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| self.doc.save_nocompress());
             if self.unverified && verification_enabled() {
                 reload_check(&saved, &self.heads, "invalid automerge changes")?;
             }
@@ -223,6 +304,15 @@ impl<'a> Input<'a> {
             Input::Loaded(doc) => {
                 guard_stored(|| Ok(automerge::ReadDoc::stats(doc.doc()).num_changes)).ok()
             }
+        }
+    }
+
+    /// What the document's save describes (see [`budget`]): a scan of
+    /// stored bytes, or a loaded document's counts. Unguarded.
+    fn counts(&self) -> DocCounts {
+        match self {
+            Input::Stored(bytes) => budget::scan_doc(bytes),
+            Input::Loaded(doc) => doc.counts(),
         }
     }
 
@@ -344,17 +434,32 @@ fn merge_unguarded(a: Input<'_>, b: Input<'_>, unverified: bool) -> Result<Merge
         (Input::Stored(_), Some(doc)) => doc,
         (Input::Stored(_), None) => unreachable!("stored inputs were loaded above"),
     };
-    merge_from(&mut target, other)?;
-    Ok(MergeOutcome::New(Box::new(LoadedDoc::new(
-        target, None, unverified,
-    ))))
+    let limit = budget::limit();
+    let base = limit.map(|_| a.counts());
+    let approx = merge_from(&mut target, base, other, limit)?;
+    let (counts, save) = result_counts(&target, approx, limit)?;
+    Ok(MergeOutcome::New(Box::new(
+        LoadedDoc::new(target, None, unverified)
+            .with_counts(counts)
+            .with_save(save),
+    )))
 }
 
 /// Apply every change of `other` that `target` lacks: what
 /// `Automerge::merge` does, without needing `other` mutably.
-pub(crate) fn merge_from(target: &mut Automerge, other: &Automerge) -> Result<(), Error> {
-    let changes = target.get_changes_added(other);
-    target.apply_changes(changes).map_err(|e| {
+///
+/// With a `limit`, the changes are first counted from their chunks and
+/// the estimate of applying them to `target` (whose counts are `base`) is
+/// checked ([`Error::LoadLimit`]); the result is then an upper bound of
+/// the merged document's counts, for [`result_counts`]. `None` without a
+/// limit.
+pub(crate) fn merge_from(
+    target: &mut Automerge,
+    base: Option<DocCounts>,
+    other: &Automerge,
+    limit: Option<u64>,
+) -> Result<Option<DocCounts>, Error> {
+    let approx = apply_added(target, base, other, limit, |e| {
         crate::automerge_error(e, |e| {
             Error::Internal(format!("could not merge automerge documents: {e}"))
         })
@@ -365,7 +470,51 @@ pub(crate) fn merge_from(target: &mut Automerge, other: &Automerge) -> Result<()
             missing.len(),
             missing[0]
         ))
-    })
+    })?;
+    Ok(approx)
+}
+
+/// [`merge_from`] without the completeness check, with the error mapping
+/// of the caller.
+fn apply_added(
+    target: &mut Automerge,
+    base: Option<DocCounts>,
+    other: &Automerge,
+    limit: Option<u64>,
+    map_err: impl FnOnce(automerge::AutomergeError) -> Error,
+) -> Result<Option<DocCounts>, Error> {
+    let changes = target.get_changes_added(other);
+    let approx = match (limit, base) {
+        (Some(_), Some(base)) => {
+            let delta = budget::scan_changes(changes.iter().map(Change::raw_bytes));
+            budget::check_changes(&delta, Base::from(&base), limit)?;
+            Some(base.plus_changes(&delta))
+        }
+        _ => None,
+    };
+    target.apply_changes(changes).map_err(map_err)?;
+    Ok(approx)
+}
+
+/// The counts of a document built by merging, from `approx`, an upper
+/// bound of them (`None` without a limit): kept when their estimate fits
+/// `limit`; otherwise the document is saved and counted exactly, and
+/// rejected ([`Error::LoadLimit`], a merged document) if that does not fit
+/// either. Returns the counts and the save, if one was made.
+pub(crate) fn result_counts(
+    doc: &Automerge,
+    approx: Option<DocCounts>,
+    limit: Option<u64>,
+) -> Result<(Option<DocCounts>, Option<Vec<u8>>), Error> {
+    let (Some(bound), Some(approx)) = (limit, approx) else {
+        return Ok((None, None));
+    };
+    if budget::doc_estimate(&approx) <= bound {
+        return Ok((Some(approx), None));
+    }
+    let saved = doc.save_nocompress();
+    let exact = budget::check_saved(&saved, LimitKind::Merged, limit)?;
+    Ok((Some(exact), Some(saved)))
 }
 
 /// Apply external bytes to a stored or loaded `a`: `merge(automerge,
@@ -414,20 +563,35 @@ pub fn merge_changes(a: Input<'_>, changes: &[u8]) -> Result<Option<LoadedDoc>, 
         if contains_changes_by_heads(&heads_a, changes) == Some(true) {
             return Ok(None);
         }
+        let limit = budget::limit();
+        let scanned = budget::scan_input(changes, limit);
+        budget::check_no_bundle(&scanned)?;
         if let Some(chunks) = header::change_chunks(changes) {
-            return apply_change_chunks(a, &heads_a, changes, &chunks);
+            return apply_change_chunks(a, &heads_a, changes, &chunks, &scanned, limit);
         }
         if header::starts_with_document(changes) {
-            match merge_save(a, &heads_a, changes)? {
+            match merge_save(a, &heads_a, changes, &scanned, limit)? {
                 SaveMerge::Unchanged => return Ok(None),
                 SaveMerge::New(doc) => return Ok(Some(*doc)),
                 SaveMerge::Concatenate => {}
             }
         }
+        let base = limit.map(|_| a.counts());
+        if let Some(base) = &base {
+            budget::check_apply_input(&scanned, changes, Base::from(base), limit)?;
+        }
         match apply_changes(&a.bytes_for_load(), &heads_a, changes)? {
             Applied::Unchanged => Ok(None),
             Applied::MissingDeps(missing) => Err(Error::MissingDependencies(missing)),
-            Applied::Changed(doc) => Ok(Some(LoadedDoc::new(*doc, None, true))),
+            Applied::Changed(doc) => {
+                let approx = base.map(|base| base.plus_changes(&scanned.as_changes()));
+                let (counts, save) = result_counts(&doc, approx, limit)?;
+                Ok(Some(
+                    LoadedDoc::new(*doc, None, true)
+                        .with_counts(counts)
+                        .with_save(save),
+                ))
+            }
         }
     })
 }
@@ -438,11 +602,17 @@ fn apply_change_chunks(
     heads_a: &[ChangeHash],
     changes: &[u8],
     chunks: &[header::ChangeChunk],
+    scanned: &InputCounts,
+    limit: Option<u64>,
 ) -> Result<Option<LoadedDoc>, Error> {
     if let Input::Loaded(loaded) = a
         && chunks.iter().all(|c| has_change(loaded.doc(), &c.hash))
     {
         return Ok(None);
+    }
+    let base = limit.map(|_| a.counts());
+    if let Some(base) = &base {
+        budget::check_apply_input(scanned, changes, Base::from(base), limit)?;
     }
     let parsed = chunks
         .iter()
@@ -463,7 +633,13 @@ fn apply_change_chunks(
     if is_subset(&doc.get_heads(), heads_a) {
         return Ok(None);
     }
-    Ok(Some(LoadedDoc::new(doc, None, true)))
+    let approx = base.map(|base| base.plus_changes(&scanned.as_changes()));
+    let (counts, save) = result_counts(&doc, approx, limit)?;
+    Ok(Some(
+        LoadedDoc::new(doc, None, true)
+            .with_counts(counts)
+            .with_save(save),
+    ))
 }
 
 /// Result of [`merge_save`].
@@ -500,16 +676,26 @@ enum SaveMerge {
 ///
 /// So a newer full save of the document costs one load (of the save) and
 /// no check.
-fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<SaveMerge, Error> {
+fn merge_save(
+    a: Input<'_>,
+    heads_a: &[ChangeHash],
+    changes: &[u8],
+    scanned: &InputCounts,
+    limit: Option<u64>,
+) -> Result<SaveMerge, Error> {
     let chunk = header::document_chunk(changes);
-    // Whether the chunk parses, checked once and only before a header
-    // answer (it inflates any deflated columns).
-    let mut parsed = None;
-    let mut parses = || *parsed.get_or_insert_with(|| header::document_parses(changes));
+    // Whether the chunk parses (from the scan), and parsing it fits the
+    // limit, checked only before a header answer.
+    let parses = || -> Result<bool, Error> {
+        if scanned.single_doc_parses {
+            budget::check_parse(scanned, limit)?;
+        }
+        Ok(scanned.single_doc_parses)
+    };
     if let Some(chunk) = &chunk {
         let known = is_subset(&chunk.heads, heads_a)
             || matches!(a, Input::Loaded(loaded) if has_all(loaded.doc(), &chunk.heads));
-        if known && parses() {
+        if known && parses()? {
             return Ok(SaveMerge::Unchanged);
         }
     }
@@ -518,7 +704,7 @@ fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<Sa
         && let (Some(count), Some(count_a)) =
             (chunk.change_count, header::change_count_from_bytes(bytes))
         && count <= count_a
-        && parses()
+        && parses()?
     {
         let doc = load_stored_unguarded(bytes)?;
         if has_all(&doc, &chunk.heads) {
@@ -526,6 +712,7 @@ fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<Sa
         }
         doc_a = Some(doc);
     }
+    budget::check_load(scanned, changes, limit)?;
     let b = load_bytes(changes).map_err(invalid_changes)?;
     if ensure_complete(&b).is_err() {
         return Ok(SaveMerge::Concatenate);
@@ -537,8 +724,8 @@ fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<Sa
     }
     if is_subset(heads_a, &heads_b) || has_all(&b, heads_a) {
         return Ok(SaveMerge::New(Box::new(LoadedDoc::from_loaded_input(
-            b, changes,
-        ))));
+            b, changes, scanned, limit,
+        )?)));
     }
     let mut target = match (doc_a, a) {
         (Some(doc), _) => doc,
@@ -553,9 +740,14 @@ fn merge_save(a: Input<'_>, heads_a: &[ChangeHash], changes: &[u8]) -> Result<Sa
     if has_all(&target, &heads_b) {
         return Ok(SaveMerge::Unchanged);
     }
-    let added = target.get_changes_added(&b);
-    target.apply_changes(added).map_err(invalid_changes)?;
-    Ok(SaveMerge::New(Box::new(LoadedDoc::new(target, None, true))))
+    let base = limit.map(|_| a.counts());
+    let approx = apply_added(&mut target, base, &b, limit, invalid_changes)?;
+    let (counts, save) = result_counts(&target, approx, limit)?;
+    Ok(SaveMerge::New(Box::new(
+        LoadedDoc::new(target, None, true)
+            .with_counts(counts)
+            .with_save(save),
+    )))
 }
 
 fn has_change(doc: &Automerge, hash: &ChangeHash) -> bool {
@@ -595,6 +787,9 @@ pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
         if let (Input::Loaded(loaded), Some(chunks)) = (a, header::change_chunks(changes)) {
             return Ok(chunks.iter().all(|c| has_change(loaded.doc(), &c.hash)));
         }
+        let limit = budget::limit();
+        let scanned = budget::scan_input(changes, limit);
+        budget::check_no_bundle(&scanned)?;
         // One document chunk (a save): whether `a` has its heads, as a
         // load of `a ++ changes` decides it once the chunk parses, without
         // reconstructing the save; a
@@ -610,7 +805,8 @@ pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
             }
             // A save that does not parse is left to the load below, which
             // rejects it.
-            if header::document_parses(changes) {
+            if scanned.single_doc_parses {
+                budget::check_parse(&scanned, limit)?;
                 return Ok(is_subset(&chunk.heads, &heads_a)
                     || match a {
                         Input::Loaded(loaded) => has_all(loaded.doc(), &chunk.heads),
@@ -619,6 +815,9 @@ pub fn contains_changes(a: Input<'_>, changes: &[u8]) -> Result<bool, Error> {
                         }
                     });
             }
+        }
+        if limit.is_some() {
+            budget::check_apply_input(&scanned, changes, Base::from(&a.counts()), limit)?;
         }
         Ok(matches!(
             apply_changes(&a.bytes_for_load(), &heads_a, changes)?,

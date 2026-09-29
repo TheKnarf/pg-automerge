@@ -1,0 +1,1709 @@
+//! Bounding the memory a load of client bytes can take, before Automerge
+//! allocates anything (see docs/DESIGN.md, "Resource limits").
+//!
+//! Automerge input is run-length encoded and deflated, so a few bytes can
+//! describe millions of operations, changes or dependencies, and a load
+//! allocates in proportion to what the input describes. A failed Rust
+//! allocation aborts the backend (the postmaster then restarts every
+//! session), so the only defence is to refuse such input up front. This
+//! module reads what is cheap to read (chunk headers, column metadata, the
+//! run-length encoded columns run by run, never row by row) and computes an
+//! upper estimate of the peak memory of loading it, which callers compare
+//! with [`limit`] (the `pg_automerge.max_load_memory` setting).
+//!
+//! The estimate ([`doc_estimate`], [`changes_estimate`]) is linear in what
+//! the input describes, with the worst cost per unit measured for Automerge
+//! 0.12 (docs/DESIGN.md, "Input amplification measurements"). The core test
+//! `tests/memory_bounds.rs` measures real peaks with a counting allocator
+//! and checks that they stay below the estimate; it must be re-run (and the
+//! constants revisited) whenever Automerge is upgraded.
+//!
+//! What is read:
+//!
+//! - A document chunk: its actors and the change and op columns. Deflated
+//!   columns are inflated one at a time, in total at most a tenth of the
+//!   limit (an inflated byte is charged 10 bytes, so more than that exceeds
+//!   the limit anyway: the scan stops there, [`InputCounts::truncated`]).
+//!   Rows of every known column are counted run by run (Automerge sizes
+//!   some allocations by a column's length before it checks the columns
+//!   against each other, so the largest one counts), group columns are
+//!   summed (successors, dependencies), and [`DocCounts::gmax`] is found
+//!   by merging the object, key, insert and successor columns run by run.
+//! - A change chunk (compressed or not): its dependencies, actors and op
+//!   columns.
+//! - Bundle chunks are not read: [`InputCounts::bundle`], which callers
+//!   reject (an experimental Automerge format).
+//!
+//! The scan never fails. Input it cannot parse is marked
+//! [`InputCounts::malformed`], with the counts of everything before the
+//! point where it stopped, which bound what Automerge can allocate before
+//! it fails on the same bytes (it parses a chunk completely before it
+//! reconstructs or applies it); callers then let Automerge reject it with
+//! its own message. Column contents are decoded leniently, as Automerge's
+//! streaming decoders are: a run that cannot be read ends the column. The
+//! fuzz harness checks that input Automerge loads is never marked
+//! malformed and that its measured peak stays below the estimate.
+
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::io::Read;
+use std::sync::OnceLock;
+
+use crate::{Error, Ticker};
+
+const MAGIC: [u8; 4] = [0x85, 0x6f, 0x4a, 0x83];
+const DEFLATE_BIT: u64 = 0x08;
+
+const DOCUMENT_CHUNK: u8 = 0;
+const CHANGE_CHUNK: u8 = 1;
+const COMPRESSED_CHUNK: u8 = 2;
+const BUNDLE_CHUNK: u8 = 3;
+
+// Column types (the low three bits of a column spec).
+const GROUP: u64 = 0;
+const DELTA: u64 = 3;
+const BOOLEAN: u64 = 4;
+const STRING: u64 = 5;
+const VALUE: u64 = 7;
+
+/// Change column specs of a document chunk in the order Automerge 0.12
+/// writes them (`change_graph.rs` `ids`), deflate bit clear: actor, seq,
+/// max op, time, message, deps (group, then values), extra (metadata, then
+/// values).
+const DOC_CHANGE_SPECS: [u64; 9] = [0x01, 0x03, 0x13, 0x23, 0x35, 0x40, 0x43, 0x56, 0x57];
+/// Op column specs of a document chunk in the order Automerge 0.12 writes
+/// them (`op_set2/columns.rs` `ids::ALL_COLUMN_SPECS` sorted): obj (actor,
+/// counter), key (actor, counter, string), id (actor, counter), insert,
+/// action, value (metadata, values), succ (group, actor, counter), expand,
+/// mark name.
+const DOC_OP_SPECS: [u64; 16] = [
+    0x01, 0x02, 0x11, 0x13, 0x15, 0x21, 0x23, 0x34, 0x42, 0x56, 0x57, 0x80, 0x81, 0x83, 0x94, 0xa5,
+];
+/// Op column specs of a change chunk (`storage/change/change_op_columns.rs`):
+/// obj, key, insert, action, value, pred (group, actor, counter), expand,
+/// mark name.
+const CHANGE_OP_SPECS: [u64; 14] = [
+    0x01, 0x02, 0x11, 0x13, 0x15, 0x34, 0x42, 0x56, 0x57, 0x70, 0x71, 0x73, 0x94, 0xa5,
+];
+
+const DEPS_GROUP: u64 = 0x40;
+const DEPS_MEMBER: u64 = 0x43;
+const SUCC_GROUP: u64 = 0x80;
+const SUCC_MEMBERS: [u64; 2] = [0x81, 0x83];
+const PRED_GROUP: u64 = 0x70;
+const PRED_MEMBERS: [u64; 2] = [0x71, 0x73];
+const OBJ_ACTOR: u64 = 0x01;
+const OBJ_CTR: u64 = 0x02;
+const KEY_ACTOR: u64 = 0x11;
+const KEY_CTR: u64 = 0x13;
+const KEY_STR: u64 = 0x15;
+const INSERT: u64 = 0x34;
+
+/// Bytes charged per inflated input byte (values and strings are copied
+/// into the document, 5-7 bytes each measured).
+const PER_BYTE: u64 = 10;
+/// Bytes charged for any load or apply, whatever it holds: Automerge's
+/// fixed structures, which the per-unit costs do not cover for tiny
+/// documents.
+const FIXED: u128 = 64 << 10;
+
+/// The default of `pg_automerge.max_load_memory`: 2 GB.
+pub const DEFAULT_LIMIT: u64 = 2 << 30;
+
+// ---------------------------------------------------------------------------
+// The limit
+// ---------------------------------------------------------------------------
+
+/// The registered source of the limit (see [`set_limit_source`]).
+static LIMIT_SOURCE: OnceLock<fn() -> Option<u64>> = OnceLock::new();
+
+/// Register the function that returns the current limit in bytes (`None`:
+/// no limit). The extension registers the `pg_automerge.max_load_memory`
+/// setting. Only the first registration counts; without one the limit is
+/// [`DEFAULT_LIMIT`].
+pub fn set_limit_source(source: fn() -> Option<u64>) {
+    let _ = LIMIT_SOURCE.set(source);
+}
+
+/// The current limit on the estimated memory of a load, in bytes (`None`:
+/// no limit).
+pub fn limit() -> Option<u64> {
+    #[cfg(feature = "test-hooks")]
+    if let Some(limit) = crate::test_hooks::limit_override() {
+        return limit;
+    }
+    match LIMIT_SOURCE.get() {
+        Some(source) => source(),
+        None => Some(DEFAULT_LIMIT),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Counts and estimates
+// ---------------------------------------------------------------------------
+
+/// What a document chunk describes (or a loaded document, in the form its
+/// save would have).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocCounts {
+    /// Op rows.
+    pub ops: u64,
+    /// Successor entries (the sum of the succ group column).
+    pub succ: u64,
+    /// The largest number of successor entries in one (object, key) group
+    /// of rows (see [`DocCounts`] docs in DESIGN.md: a key overwritten or
+    /// deleted many times).
+    pub gmax: u64,
+    /// Changes.
+    pub changes: u64,
+    /// Dependency entries (the sum of the deps group column).
+    pub deps: u64,
+    /// Actors.
+    pub actors: u64,
+    /// Bytes of the chunk with its columns inflated.
+    pub inflated: u64,
+}
+
+/// What change chunks describe (or changes about to be applied).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChangeCounts {
+    /// Op rows.
+    pub ops: u64,
+    /// Pred entries (the sum of the pred group column).
+    pub preds: u64,
+    /// Changes.
+    pub changes: u64,
+    /// Dependency entries.
+    pub deps: u64,
+    /// Distinct actors (a change's own and its other actors).
+    pub actors: u64,
+    /// Bytes of the chunks' data, inflated.
+    pub inflated: u64,
+}
+
+impl DocCounts {
+    /// Every count added (saturating).
+    fn add(&mut self, other: &DocCounts) {
+        self.ops = self.ops.saturating_add(other.ops);
+        self.succ = self.succ.saturating_add(other.succ);
+        self.gmax = self.gmax.saturating_add(other.gmax);
+        self.changes = self.changes.saturating_add(other.changes);
+        self.deps = self.deps.saturating_add(other.deps);
+        self.actors = self.actors.saturating_add(other.actors);
+        self.inflated = self.inflated.saturating_add(other.inflated);
+    }
+
+    /// An upper bound of the counts of a document with these counts after
+    /// the changes `delta` are applied to it: every op and dependency is
+    /// added, every pred becomes a successor entry (possibly all on one
+    /// key, so it is added to [`DocCounts::gmax`] too), every actor may be
+    /// new. The bytes are added as they are (an approximation: the columns
+    /// of the merged document may encode less compactly).
+    pub fn plus_changes(&self, delta: &ChangeCounts) -> DocCounts {
+        let mut sum = *self;
+        sum.ops = sum.ops.saturating_add(delta.ops);
+        sum.succ = sum.succ.saturating_add(delta.preds);
+        sum.gmax = sum.gmax.saturating_add(delta.preds);
+        sum.changes = sum.changes.saturating_add(delta.changes);
+        sum.deps = sum.deps.saturating_add(delta.deps);
+        sum.actors = sum.actors.saturating_add(delta.actors);
+        sum.inflated = sum.inflated.saturating_add(delta.inflated);
+        sum
+    }
+
+    /// These counts as changes to apply (a document chunk that is not the
+    /// first chunk of a load is turned into changes and applied).
+    fn as_changes(&self) -> ChangeCounts {
+        ChangeCounts {
+            ops: self.ops,
+            preds: self.succ,
+            changes: self.changes,
+            deps: self.deps,
+            actors: self.actors,
+            inflated: 0,
+        }
+    }
+}
+
+impl ChangeCounts {
+    /// Every count added (saturating; actors too, so only an upper bound
+    /// of the distinct actors).
+    pub fn add(&mut self, other: &ChangeCounts) {
+        self.ops = self.ops.saturating_add(other.ops);
+        self.preds = self.preds.saturating_add(other.preds);
+        self.changes = self.changes.saturating_add(other.changes);
+        self.deps = self.deps.saturating_add(other.deps);
+        self.actors = self.actors.saturating_add(other.actors);
+        self.inflated = self.inflated.saturating_add(other.inflated);
+    }
+}
+
+/// The document changes are applied to: its numbers of changes and
+/// actors, which Automerge's clock cache multiplies with the new ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Base {
+    /// Changes of the document.
+    pub changes: u64,
+    /// Actors of the document.
+    pub actors: u64,
+}
+
+impl From<&DocCounts> for Base {
+    fn from(counts: &DocCounts) -> Self {
+        Base {
+            changes: counts.changes,
+            actors: counts.actors,
+        }
+    }
+}
+
+/// `sum` of `terms`, each a product of `factor` and counts, saturating.
+fn sat(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Estimated peak bytes of loading a document chunk with these counts
+/// (`Automerge::load` of a save, or turning a later document chunk into
+/// changes). Worst measured cost per unit (docs/DESIGN.md): 450 per op
+/// (out-of-order ops; appended text costs about 90), 30 per successor, 600
+/// per successor pending on one key, 1600 per change plus up to 130 per
+/// op or successor for rebuilding the changes, 200 per dependency and per
+/// actor, 0.3 per change × actor (Automerge caches a clock every 16
+/// changes), 3 per actor for each change with more than about 16 ops, 10
+/// per inflated byte, and 64 kB whatever the document holds.
+pub fn doc_estimate(d: &DocCounts) -> u64 {
+    let (ops, succ, gmax, changes, deps, actors, inflated) = (
+        u128::from(d.ops),
+        u128::from(d.succ),
+        u128::from(d.gmax),
+        u128::from(d.changes),
+        u128::from(d.deps),
+        u128::from(d.actors),
+        u128::from(d.inflated),
+    );
+    let rows = ops + succ;
+    sat(FIXED
+        + 450 * ops
+        + 30 * succ
+        + 600 * gmax
+        + 1600 * changes
+        + (130 * rows).min(1600 * changes)
+        + 200 * deps
+        + 200 * actors
+        + 3 * changes * actors / 10
+        + 3 * changes.min(rows / 16) * actors
+        + u128::from(PER_BYTE) * inflated)
+}
+
+/// Estimated peak bytes of parsing and applying changes with these counts
+/// to a document with `base`'s changes and actors: 1000 per op, 80 per
+/// pred, 2500 per change, 200 per dependency and per actor, 0.3 per
+/// change × actor of the result's clock cache, 10 per inflated byte, and
+/// 64 kB.
+pub fn changes_estimate(c: &ChangeCounts, base: Base) -> u64 {
+    let (ops, preds, changes, deps, actors, inflated) = (
+        u128::from(c.ops),
+        u128::from(c.preds),
+        u128::from(c.changes),
+        u128::from(c.deps),
+        u128::from(c.actors),
+        u128::from(c.inflated),
+    );
+    let (base_changes, base_actors) = (u128::from(base.changes), u128::from(base.actors));
+    sat(FIXED
+        + 1000 * ops
+        + 80 * preds
+        + 2500 * changes
+        + 200 * deps
+        + 200 * actors
+        + 3 * (changes * (base_actors + actors) + base_changes * actors) / 10
+        + u128::from(PER_BYTE) * inflated)
+}
+
+/// What a scan of external input found (see [`scan_input`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputCounts {
+    /// The first chunk, when it is a document chunk (loaded as the
+    /// document).
+    pub first_doc: DocCounts,
+    /// Document chunks after the first chunk, summed: Automerge turns them
+    /// into changes and applies them (their changes are in
+    /// [`InputCounts::changes`] too).
+    pub later_docs: DocCounts,
+    /// Change chunks, compressed or not, and the changes of later
+    /// document chunks.
+    pub changes: ChangeCounts,
+    /// The scan stopped because inflating deflated data produced more than
+    /// a tenth of the limit (each such byte is charged 10 bytes, so the
+    /// input exceeds the limit whatever else it describes); the counts are
+    /// only a lower bound.
+    pub truncated: bool,
+    /// The input does not parse (framing, lengths, column metadata, a
+    /// deflated column that does not inflate); the counts cover what comes
+    /// before the point where the scan stopped.
+    pub malformed: bool,
+    /// The input holds a bundle chunk (not read).
+    pub bundle: bool,
+    /// The input is exactly one document chunk that passes everything
+    /// Automerge's chunk parse checks (see [`crate::header::document_parses`]).
+    pub single_doc_parses: bool,
+    /// Bytes produced by inflating deflated columns and compressed chunks
+    /// (what parsing allocates beyond the input itself).
+    pub deflated_out: u64,
+    /// Gmax of some document chunk is its upper bound (the chunk's
+    /// successor entries), not computed exactly (see [`scan_input`]).
+    pub gmax_bounded: bool,
+}
+
+impl InputCounts {
+    /// Estimated peak bytes of `Automerge::load` of the input on its own.
+    pub fn load_estimate(&self) -> u64 {
+        let base = Base::from(&self.first_doc);
+        doc_estimate(&self.first_doc)
+            .saturating_add(doc_estimate(&self.later_docs))
+            .saturating_add(changes_estimate(&self.changes, base))
+    }
+
+    /// Estimated peak bytes of loading a document with `base`'s changes
+    /// and actors followed by the input (`a ++ changes`), or of parsing
+    /// the input's chunks and applying them to that document: every
+    /// document chunk of the input is turned into changes, none is the
+    /// document. (The document itself is not counted.)
+    pub fn apply_estimate(&self, base: Base) -> u64 {
+        let mut changes = self.changes;
+        changes.add(&self.first_doc.as_changes());
+        doc_estimate(&self.first_doc)
+            .saturating_add(doc_estimate(&self.later_docs))
+            .saturating_add(changes_estimate(&changes, base))
+    }
+
+    /// Estimated peak bytes of only parsing the input, as a load does for
+    /// a document chunk whose heads the document already has: what
+    /// inflating its deflated columns produces, held once (Automerge
+    /// copies the chunk with its columns inflated into one buffer; an
+    /// uncompressed chunk is parsed in place, for nothing).
+    pub fn parse_estimate(&self) -> u64 {
+        self.deflated_out
+    }
+
+    /// Every chunk of the input as changes applied to a document: change
+    /// chunks, and document chunks turned into changes (an upper bound of
+    /// what a load of `a ++ input` adds to `a`).
+    pub fn as_changes(&self) -> ChangeCounts {
+        let mut changes = self.changes;
+        changes.add(&self.first_doc.as_changes());
+        changes.inflated = self.inflated();
+        changes
+    }
+
+    /// All inflated bytes read.
+    fn inflated(&self) -> u64 {
+        self.first_doc
+            .inflated
+            .saturating_add(self.later_docs.inflated)
+            .saturating_add(self.changes.inflated)
+    }
+
+    /// The input as the document a load of it on its own would build, in
+    /// the form of its counts: the first document chunk plus every change
+    /// (an upper bound).
+    pub fn as_document(&self) -> DocCounts {
+        let mut changes = self.changes;
+        changes.inflated = changes.inflated.saturating_add(self.later_docs.inflated);
+        self.first_doc.plus_changes(&changes)
+    }
+
+    /// The totals shown in an error's DETAIL.
+    fn shown(&self) -> Shown {
+        Shown {
+            ops: self
+                .first_doc
+                .ops
+                .saturating_add(self.later_docs.ops)
+                .saturating_add(self.changes.ops),
+            changes: self
+                .first_doc
+                .changes
+                .saturating_add(self.later_docs.changes)
+                .saturating_add(self.changes.changes),
+            actors: self.first_doc.actors.saturating_add(self.changes.actors),
+            bytes: self.inflated(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Which load an estimate was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitKind {
+    /// Loading client input (text or binary input, the `bytea` cast, the
+    /// bytes of `merge(automerge, bytea)` / `automerge_contains`).
+    Input,
+    /// The document client input normalizes to, as it will be stored.
+    Normalized,
+    /// Applying changes to a document (merging).
+    Apply,
+    /// The result of a merge, as it will be stored.
+    Merged,
+}
+
+/// Counts shown in the DETAIL of a limit error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shown {
+    /// Operations.
+    pub ops: u64,
+    /// Changes.
+    pub changes: u64,
+    /// Actors.
+    pub actors: u64,
+    /// Bytes, uncompressed.
+    pub bytes: u64,
+}
+
+impl From<&DocCounts> for Shown {
+    fn from(d: &DocCounts) -> Self {
+        Shown {
+            ops: d.ops,
+            changes: d.changes,
+            actors: d.actors,
+            bytes: d.inflated,
+        }
+    }
+}
+
+impl From<&ChangeCounts> for Shown {
+    fn from(c: &ChangeCounts) -> Self {
+        Shown {
+            ops: c.ops,
+            changes: c.changes,
+            actors: c.actors,
+            bytes: c.inflated,
+        }
+    }
+}
+
+/// An estimate above the limit: [`Error::LoadLimit`] (SQLSTATE 53400).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitError {
+    /// What would have been loaded.
+    pub kind: LimitKind,
+    /// The limit, in bytes.
+    pub limit: u64,
+    /// The estimate, in bytes.
+    pub estimate: u64,
+    /// The scan stopped early: the estimate is a lower bound.
+    pub at_least: bool,
+    /// What the input describes, if it was read.
+    pub shown: Option<Shown>,
+}
+
+/// `n` bytes for a message: whole MB (rounded up) from 1 MB on, kB below.
+fn format_bytes(n: u64) -> String {
+    const MB: u64 = 1 << 20;
+    if n >= MB {
+        format!("{} MB", n.div_ceil(MB))
+    } else {
+        format!("{} kB", n.div_ceil(1024))
+    }
+}
+
+/// The limit for a message: in MB when it is a whole number of them (as
+/// it is set, in kB, otherwise).
+fn format_limit(n: u64) -> String {
+    const MB: u64 = 1 << 20;
+    if n.is_multiple_of(MB) {
+        format!("{} MB", n / MB)
+    } else {
+        format!("{} kB", n / 1024)
+    }
+}
+
+impl LimitError {
+    /// The primary message.
+    pub fn message(&self) -> String {
+        let what = match self.kind {
+            LimitKind::Input | LimitKind::Normalized => "estimated memory to load automerge input",
+            LimitKind::Apply => "estimated memory for applying automerge changes",
+            LimitKind::Merged => "estimated memory to load merged automerge document",
+        };
+        format!(
+            "{what} exceeds \"pg_automerge.max_load_memory\" ({})",
+            format_limit(self.limit)
+        )
+    }
+
+    /// The DETAIL: the estimate and what it is made of.
+    pub fn detail(&self) -> String {
+        let bound = if self.at_least { "at least" } else { "up to" };
+        let estimate = format_bytes(self.estimate);
+        let subject = match self.kind {
+            LimitKind::Input | LimitKind::Merged => "Loading it",
+            LimitKind::Normalized => "Loading the document it normalizes to",
+            LimitKind::Apply => "Applying them",
+        };
+        let n = |n: u64, what: &str| {
+            if n == 1 {
+                format!("1 {what}")
+            } else {
+                format!("{n} {what}s")
+            }
+        };
+        match self.shown {
+            Some(s) => format!(
+                "{subject} could take {bound} {estimate} ({}, {}, {}, {} uncompressed).",
+                n(s.ops, "operation"),
+                n(s.changes, "change"),
+                n(s.actors, "actor"),
+                n(s.bytes, "byte")
+            ),
+            None => format!("{subject} could take {bound} {estimate}."),
+        }
+    }
+
+    /// The HINT.
+    pub fn hint() -> &'static str {
+        "A superuser can raise \"pg_automerge.max_load_memory\"."
+    }
+}
+
+fn limit_error(
+    kind: LimitKind,
+    limit: u64,
+    estimate: u64,
+    at_least: bool,
+    shown: Option<Shown>,
+) -> Error {
+    Error::LoadLimit(Box::new(LimitError {
+        kind,
+        limit,
+        estimate,
+        at_least,
+        shown,
+    }))
+}
+
+/// The error for a bundle chunk in client input.
+pub(crate) fn bundle_error() -> Error {
+    Error::Unsupported("automerge bundle chunks are not supported".into())
+}
+
+/// Reject a bundle chunk in the input (0A000): only bundles, whatever the
+/// limit.
+pub(crate) fn check_no_bundle(counts: &InputCounts) -> Result<(), Error> {
+    if counts.bundle {
+        Err(bundle_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// `estimate` of `counts`, the scan of `bytes`; when that is over `limit`
+/// with Gmax taken at its bound, of an exact rescan instead (the bound is
+/// only an upper bound). Returns the estimate and the counts it is of.
+fn priced<'c>(
+    counts: &'c InputCounts,
+    bytes: &[u8],
+    limit: u64,
+    estimate: impl Fn(&InputCounts) -> u64,
+) -> (u64, Cow<'c, InputCounts>) {
+    let first = estimate(counts);
+    if first <= limit || !counts.gmax_bounded || counts.truncated {
+        return (first, Cow::Borrowed(counts));
+    }
+    let exact = scan_input_exact(bytes, Some(limit));
+    (estimate(&exact), Cow::Owned(exact))
+}
+
+/// Check that loading the input `bytes` on its own, which the scan found
+/// `counts` in, fits `limit` ([`InputCounts::load_estimate`]); also
+/// rejects bundles.
+pub(crate) fn check_load(
+    counts: &InputCounts,
+    bytes: &[u8],
+    limit: Option<u64>,
+) -> Result<(), Error> {
+    check_no_bundle(counts)?;
+    let Some(limit) = limit else { return Ok(()) };
+    let (estimate, counts) = priced(counts, bytes, limit, InputCounts::load_estimate);
+    if estimate > limit || counts.truncated {
+        return Err(limit_error(
+            LimitKind::Input,
+            limit,
+            estimate.max(limit.saturating_add(1)),
+            counts.truncated,
+            Some(counts.shown()),
+        ));
+    }
+    Ok(())
+}
+
+/// Check that loading the input `bytes` (scanned: `counts`) after a
+/// document with `base`'s counts, or applying it to that document, fits
+/// `limit` ([`InputCounts::apply_estimate`]); also rejects bundles.
+pub(crate) fn check_apply_input(
+    counts: &InputCounts,
+    bytes: &[u8],
+    base: Base,
+    limit: Option<u64>,
+) -> Result<(), Error> {
+    check_no_bundle(counts)?;
+    let Some(limit) = limit else { return Ok(()) };
+    let (estimate, counts) = priced(counts, bytes, limit, |c| c.apply_estimate(base));
+    if estimate > limit || counts.truncated {
+        return Err(limit_error(
+            LimitKind::Input,
+            limit,
+            estimate.max(limit.saturating_add(1)),
+            counts.truncated,
+            Some(counts.shown()),
+        ));
+    }
+    Ok(())
+}
+
+/// Check that only parsing the input fits `limit`
+/// ([`InputCounts::parse_estimate`]); also rejects bundles. A scan that
+/// stopped early (inflation beyond a tenth of the limit) counts as over
+/// it: such input is refused however it is used.
+pub(crate) fn check_parse(counts: &InputCounts, limit: Option<u64>) -> Result<(), Error> {
+    check_no_bundle(counts)?;
+    let Some(limit) = limit else { return Ok(()) };
+    let estimate = counts.parse_estimate();
+    if estimate > limit || counts.truncated {
+        return Err(limit_error(
+            LimitKind::Input,
+            limit,
+            estimate.max(limit.saturating_add(1)),
+            counts.truncated,
+            Some(counts.shown()),
+        ));
+    }
+    Ok(())
+}
+
+/// Check that applying changes with `counts` to a document with `base`'s
+/// counts fits `limit` ([`changes_estimate`]).
+pub(crate) fn check_changes(
+    counts: &ChangeCounts,
+    base: Base,
+    limit: Option<u64>,
+) -> Result<(), Error> {
+    let Some(limit) = limit else { return Ok(()) };
+    let estimate = changes_estimate(counts, base);
+    if estimate > limit {
+        return Err(limit_error(
+            LimitKind::Apply,
+            limit,
+            estimate,
+            false,
+            Some(counts.into()),
+        ));
+    }
+    Ok(())
+}
+
+/// The counts of `saved`, a save about to become a stored value, checked
+/// against `limit` ([`doc_estimate`]; Gmax exactly when its bound would
+/// put it over); `kind` says which document it is.
+pub(crate) fn check_saved(
+    saved: &[u8],
+    kind: LimitKind,
+    limit: Option<u64>,
+) -> Result<DocCounts, Error> {
+    let scanned = scan_input(saved, None);
+    let mut counts = scanned.as_document();
+    if let Some(bound) = limit
+        && doc_estimate(&counts) > bound
+        && scanned.gmax_bounded
+    {
+        counts = scan_doc_exact(saved);
+    }
+    check_doc(&counts, kind, limit)?;
+    Ok(counts)
+}
+
+/// Check that loading a document with `counts` fits `limit`
+/// ([`doc_estimate`]); `kind` says which document it is.
+pub(crate) fn check_doc(
+    counts: &DocCounts,
+    kind: LimitKind,
+    limit: Option<u64>,
+) -> Result<(), Error> {
+    let Some(limit) = limit else { return Ok(()) };
+    let estimate = doc_estimate(counts);
+    if estimate > limit {
+        return Err(limit_error(
+            kind,
+            limit,
+            estimate,
+            false,
+            Some(counts.into()),
+        ));
+    }
+    Ok(())
+}
+
+/// Check that `len` bytes of client input could fit the limit at all
+/// (every byte costs 10 in the estimate): lets the text input function refuse a
+/// huge literal before decoding its hex.
+///
+/// # Errors
+///
+/// [`Error::LoadLimit`] if `len` bytes alone exceed the limit.
+pub fn check_input_len(len: usize) -> Result<(), Error> {
+    let Some(limit) = limit() else { return Ok(()) };
+    let estimate = (len as u64).saturating_mul(PER_BYTE);
+    if estimate > limit {
+        return Err(limit_error(LimitKind::Input, limit, estimate, true, None));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+/// A cursor over bytes; every read is bounds-checked (`None` at the end or
+/// on an over-long LEB128). `canonical` turns false when a LEB128 read with
+/// [`Reader::uleb_c`] is overlong (Automerge rejects those in the places
+/// it reads that way).
+struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    canonical: bool,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Reader {
+            bytes,
+            pos: 0,
+            canonical: true,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+
+    fn uleb(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        for i in 0..10 {
+            let byte = *self.bytes.get(self.pos)?;
+            self.pos += 1;
+            let bits = u64::from(byte & 0x7f);
+            if i == 9 && bits > 1 {
+                return None;
+            }
+            value |= bits << (7 * i);
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// [`Self::uleb`], noting an overlong encoding in `canonical`.
+    fn uleb_c(&mut self) -> Option<u64> {
+        let start = self.pos;
+        let value = self.uleb()?;
+        if self.pos - start > 1 && self.bytes[self.pos - 1] == 0 {
+            self.canonical = false;
+        }
+        Some(value)
+    }
+
+    fn usize_c(&mut self) -> Option<usize> {
+        usize::try_from(self.uleb_c()?).ok()
+    }
+
+    fn sleb(&mut self) -> Option<i64> {
+        let mut value = 0i64;
+        for i in 0..10 {
+            let byte = *self.bytes.get(self.pos)?;
+            self.pos += 1;
+            let bits = i64::from(byte & 0x7f);
+            if i == 9 && !(bits == 0 || bits == 0x7f) {
+                return None;
+            }
+            value |= bits << (7 * i);
+            if byte & 0x80 == 0 {
+                let shift = 7 * (i + 1);
+                if shift < 64 && byte & 0x40 != 0 {
+                    value |= -1i64 << shift;
+                }
+                return Some(value);
+            }
+        }
+        None
+    }
+}
+
+/// A value of a column at some row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Val<'a> {
+    Null,
+    U(u64),
+    I(i128),
+    S(&'a [u8]),
+    B(bool),
+}
+
+/// A stretch of rows of one column: `len` rows whose first value is
+/// `first`; for a delta column each further row adds `step`, otherwise
+/// every row has the same value.
+#[derive(Debug, Clone, Copy)]
+struct Seg<'a> {
+    len: u64,
+    first: Val<'a>,
+    step: i128,
+}
+
+impl<'a> Seg<'a> {
+    /// The value `k` rows into the segment.
+    fn at(&self, k: u64) -> Val<'a> {
+        match self.first {
+            Val::I(v) if self.step != 0 => {
+                Val::I(v.wrapping_add(self.step.wrapping_mul(i128::from(k))))
+            }
+            v => v,
+        }
+    }
+}
+
+/// The segments of a column, run by run: a repeat run is one segment, a
+/// literal run one per value, a null run one. Decoding is lenient, like
+/// Automerge's streaming decoders: anything that cannot be read ends the
+/// column.
+struct Runs<'a> {
+    r: Reader<'a>,
+    ty: u64,
+    /// Values left in the current literal run.
+    literal: u64,
+    /// The running value of a delta column.
+    acc: i128,
+    /// The next value of a boolean column.
+    bool_next: bool,
+    ended: bool,
+}
+
+impl<'a> Runs<'a> {
+    fn new(ty: u64, data: &'a [u8]) -> Self {
+        Runs {
+            r: Reader::new(data),
+            ty,
+            literal: 0,
+            acc: 0,
+            bool_next: false,
+            ended: false,
+        }
+    }
+
+    /// One value of the column's type (not for booleans).
+    fn value(&mut self) -> Option<Val<'a>> {
+        match self.ty {
+            DELTA => Some(Val::I(i128::from(self.r.sleb()?))),
+            STRING => {
+                let len = usize::try_from(self.r.uleb()?).ok()?;
+                Some(Val::S(self.r.take(len)?))
+            }
+            _ => Some(Val::U(self.r.uleb()?)),
+        }
+    }
+
+    fn next_seg(&mut self) -> Option<Seg<'a>> {
+        if self.ended {
+            return None;
+        }
+        let seg = self.read_seg();
+        if seg.is_none() {
+            self.ended = true;
+        }
+        seg
+    }
+
+    fn read_seg(&mut self) -> Option<Seg<'a>> {
+        if self.ty == BOOLEAN {
+            loop {
+                if self.r.done() {
+                    return None;
+                }
+                let len = self.r.uleb()?;
+                let value = self.bool_next;
+                self.bool_next = !value;
+                if len > 0 {
+                    return Some(Seg {
+                        len,
+                        first: Val::B(value),
+                        step: 0,
+                    });
+                }
+            }
+        }
+        if self.ty == VALUE {
+            return None;
+        }
+        loop {
+            if self.literal > 0 {
+                self.literal -= 1;
+                let value = self.value()?;
+                let first = match value {
+                    Val::I(delta) => {
+                        self.acc = self.acc.wrapping_add(delta);
+                        Val::I(self.acc)
+                    }
+                    v => v,
+                };
+                return Some(Seg {
+                    len: 1,
+                    first,
+                    step: 0,
+                });
+            }
+            if self.r.done() {
+                return None;
+            }
+            let n = self.r.sleb()?;
+            if n > 0 {
+                let len = n.unsigned_abs();
+                let value = self.value()?;
+                return Some(match value {
+                    Val::I(delta) => {
+                        let first = self.acc.wrapping_add(delta);
+                        self.acc = self.acc.wrapping_add(delta.wrapping_mul(i128::from(len)));
+                        Seg {
+                            len,
+                            first: Val::I(first),
+                            step: delta,
+                        }
+                    }
+                    v => Seg {
+                        len,
+                        first: v,
+                        step: 0,
+                    },
+                });
+            } else if n < 0 {
+                self.literal = n.unsigned_abs();
+            } else {
+                let len = self.r.uleb()?;
+                if len > 0 {
+                    return Some(Seg {
+                        len,
+                        first: Val::Null,
+                        step: 0,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Rows of a column, and for a group column the sum of its values.
+#[derive(Debug, Clone, Copy, Default)]
+struct ColumnStats {
+    rows: u64,
+    sum: u64,
+}
+
+/// Rows of a column, and for a group column the sum of its values: run
+/// by run, reading literal values only to step over them (a group's are
+/// summed). Lenient like [`Runs`]: anything that cannot be read ends the
+/// column.
+fn column_stats(ty: u64, data: &[u8], ticker: &mut Ticker) -> ColumnStats {
+    let mut stats = ColumnStats::default();
+    let mut r = Reader::new(data);
+    match ty {
+        VALUE => return stats,
+        BOOLEAN => {
+            while !r.done() {
+                ticker.tick();
+                let Some(n) = r.uleb() else { break };
+                stats.rows = stats.rows.saturating_add(n);
+            }
+            return stats;
+        }
+        _ => {}
+    }
+    // One value: its number for a group column, 0 otherwise.
+    let value = |r: &mut Reader<'_>| -> Option<u64> {
+        match ty {
+            STRING => {
+                let len = usize::try_from(r.uleb()?).ok()?;
+                r.take(len)?;
+                Some(0)
+            }
+            DELTA => r.sleb().map(|_| 0),
+            GROUP => r.uleb(),
+            _ => r.uleb().map(|_| 0),
+        }
+    };
+    'runs: while !r.done() {
+        ticker.tick();
+        let Some(n) = r.sleb() else { break };
+        if n > 0 {
+            let Some(v) = value(&mut r) else { break };
+            let n = n.unsigned_abs();
+            stats.rows = stats.rows.saturating_add(n);
+            stats.sum = stats.sum.saturating_add(n.saturating_mul(v));
+        } else if n < 0 {
+            for _ in 0..n.unsigned_abs() {
+                let Some(v) = value(&mut r) else {
+                    break 'runs;
+                };
+                stats.rows = stats.rows.saturating_add(1);
+                stats.sum = stats.sum.saturating_add(v);
+            }
+        } else {
+            let Some(k) = r.uleb() else { break };
+            stats.rows = stats.rows.saturating_add(k);
+        }
+    }
+    stats
+}
+
+/// A column of a chunk: its spec (deflate bit clear) and inflated data.
+struct Column<'a> {
+    spec: u64,
+    data: Cow<'a, [u8]>,
+}
+
+/// Why a chunk's scan stopped.
+enum Stop {
+    /// It does not parse.
+    Malformed,
+    /// The inflated bytes exceed the cap.
+    Truncated,
+}
+
+struct Scanner {
+    /// The largest number of bytes inflation may still produce (the limit
+    /// over [`PER_BYTE`]), `None` without a limit.
+    cap: Option<u64>,
+    /// Bytes read so far, deflated columns and chunks inflated.
+    inflated: u64,
+    /// Bytes produced by inflation so far (bounded by `cap`).
+    deflated_out: u64,
+    /// Distinct actors of change chunks and later document chunks.
+    actors: HashSet<Vec<u8>>,
+    /// Compute Gmax exactly (otherwise its upper bound, the successors).
+    exact_gmax: bool,
+    /// Some Gmax was taken at its bound.
+    gmax_bounded: bool,
+    ticker: Ticker,
+}
+
+impl Scanner {
+    fn new(cap: Option<u64>, exact_gmax: bool) -> Self {
+        Scanner {
+            cap,
+            inflated: 0,
+            deflated_out: 0,
+            actors: HashSet::new(),
+            exact_gmax,
+            gmax_bounded: false,
+            ticker: Ticker::default(),
+        }
+    }
+
+    /// Inflate a deflated column or compressed chunk, within the cap: an
+    /// inflated byte costs [`PER_BYTE`] in every estimate, so more than
+    /// the cap exceeds the limit whatever the input describes.
+    fn inflate(&mut self, raw: &[u8]) -> Result<Vec<u8>, Stop> {
+        let mut out = Vec::new();
+        let decoder = flate2::bufread::DeflateDecoder::new(raw);
+        let result = match self.cap {
+            Some(cap) => {
+                let room = cap.saturating_sub(self.deflated_out);
+                decoder.take(room.saturating_add(1)).read_to_end(&mut out)
+            }
+            None => {
+                let mut decoder = decoder;
+                decoder.read_to_end(&mut out)
+            }
+        };
+        result.map_err(|_| Stop::Malformed)?;
+        let n = out.len() as u64;
+        self.deflated_out = self.deflated_out.saturating_add(n);
+        self.count(n);
+        match self.cap {
+            Some(cap) if self.deflated_out > cap => Err(Stop::Truncated),
+            _ => Ok(out),
+        }
+    }
+
+    /// Count `n` bytes read.
+    fn count(&mut self, n: u64) {
+        self.inflated = self.inflated.saturating_add(n);
+    }
+
+    /// A column metadata block: (spec, length) pairs.
+    fn metadata(r: &mut Reader<'_>) -> Option<Vec<(u64, usize)>> {
+        let count = r.usize_c()?;
+        // Each entry takes at least two bytes.
+        if count > r.bytes.len() / 2 {
+            return None;
+        }
+        let mut cols = Vec::with_capacity(count);
+        for _ in 0..count {
+            let spec = r.uleb_c()?;
+            if spec > u64::from(u32::MAX) {
+                return None;
+            }
+            cols.push((spec, r.usize_c()?));
+        }
+        Some(cols)
+    }
+
+    /// The data of the columns listed in `meta`, inflated. `deflate`: the
+    /// deflate bit is allowed (document chunks), otherwise it makes the
+    /// chunk malformed (change chunks).
+    fn columns<'a>(
+        &mut self,
+        r: &mut Reader<'a>,
+        meta: &[(u64, usize)],
+        deflate: bool,
+    ) -> Result<Vec<Column<'a>>, Stop> {
+        let mut cols = Vec::with_capacity(meta.len());
+        for &(spec, len) in meta {
+            let raw = r.take(len).ok_or(Stop::Malformed)?;
+            let data = if spec & DEFLATE_BIT != 0 {
+                if !deflate {
+                    return Err(Stop::Malformed);
+                }
+                // The raw bytes were counted with the chunk: count the
+                // inflated ones instead.
+                self.inflated = self.inflated.saturating_sub(len as u64);
+                Cow::Owned(self.inflate(raw)?)
+            } else {
+                Cow::Borrowed(raw)
+            };
+            cols.push(Column {
+                spec: spec & !DEFLATE_BIT,
+                data,
+            });
+        }
+        Ok(cols)
+    }
+
+    /// Rows of the known non-member, non-value columns (the largest), and
+    /// for the group `group` the larger of its sum and its members' rows.
+    fn rows_and_group(
+        &mut self,
+        cols: &[Column<'_>],
+        known: &[u64],
+        group: u64,
+        members: &[u64],
+    ) -> (u64, u64) {
+        let (mut rows, mut entries) = (0u64, 0u64);
+        for col in cols.iter().filter(|c| known.contains(&c.spec)) {
+            let ty = col.spec & 7;
+            if ty == VALUE {
+                continue;
+            }
+            let stats = column_stats(ty, &col.data, &mut self.ticker);
+            if col.spec == group {
+                entries = entries.max(stats.sum);
+            }
+            if members.contains(&col.spec) {
+                entries = entries.max(stats.rows);
+            } else {
+                rows = rows.max(stats.rows);
+            }
+        }
+        (rows, entries)
+    }
+
+    /// Scan a document chunk's data. Returns its counts and whether it
+    /// passes everything Automerge's chunk parse checks (conservatively,
+    /// see [`crate::header::document_parses`]).
+    fn doc_chunk(&mut self, data: &[u8], counts: &mut DocCounts) -> Result<bool, Stop> {
+        let mut r = Reader::new(data);
+        let malformed = || Stop::Malformed;
+        let actors = r.usize_c().ok_or_else(malformed)?;
+        if actors > data.len() {
+            return Err(Stop::Malformed);
+        }
+        counts.actors = actors as u64;
+        for _ in 0..actors {
+            let len = r.usize_c().ok_or_else(malformed)?;
+            r.take(len).ok_or_else(malformed)?;
+        }
+        let heads = r.usize_c().ok_or_else(malformed)?;
+        r.take(heads.checked_mul(32).ok_or_else(malformed)?)
+            .ok_or_else(malformed)?;
+        let change_meta = Self::metadata(&mut r).ok_or_else(malformed)?;
+        let op_meta = Self::metadata(&mut r).ok_or_else(malformed)?;
+        let layout =
+            layout_ok(&change_meta, &DOC_CHANGE_SPECS) && layout_ok(&op_meta, &DOC_OP_SPECS);
+        let change_cols = self.columns(&mut r, &change_meta, true)?;
+        let op_cols = self.columns(&mut r, &op_meta, true)?;
+        // The head indices: absent (older JS saves), or one per head, then
+        // the end of the chunk (Automerge rejects leftover data).
+        if !r.done() {
+            for _ in 0..heads {
+                r.uleb_c().ok_or_else(malformed)?;
+            }
+            if !r.done() {
+                return Err(Stop::Malformed);
+            }
+        }
+        let (changes, deps) =
+            self.rows_and_group(&change_cols, &DOC_CHANGE_SPECS, DEPS_GROUP, &[DEPS_MEMBER]);
+        let (ops, succ) = self.rows_and_group(&op_cols, &DOC_OP_SPECS, SUCC_GROUP, &SUCC_MEMBERS);
+        counts.changes = changes;
+        counts.deps = deps;
+        counts.ops = ops;
+        counts.succ = succ;
+        counts.gmax = if succ == 0 {
+            0
+        } else if self.exact_gmax {
+            gmax(&op_cols, ops, &mut self.ticker)
+        } else {
+            self.gmax_bounded = true;
+            succ
+        };
+        Ok(layout && r.canonical)
+    }
+
+    /// Scan a change chunk's data (inflated if it was compressed).
+    fn change_chunk(&mut self, data: &[u8], counts: &mut ChangeCounts) -> Result<(), Stop> {
+        let mut r = Reader::new(data);
+        let malformed = || Stop::Malformed;
+        let deps = r.usize_c().ok_or_else(malformed)?;
+        r.take(deps.checked_mul(32).ok_or_else(malformed)?)
+            .ok_or_else(malformed)?;
+        let len = r.usize_c().ok_or_else(malformed)?;
+        self.actors
+            .insert(r.take(len).ok_or_else(malformed)?.to_vec());
+        r.uleb().ok_or_else(malformed)?; // seq
+        r.uleb().ok_or_else(malformed)?; // start op
+        r.sleb().ok_or_else(malformed)?; // time
+        let len = r.usize_c().ok_or_else(malformed)?;
+        r.take(len).ok_or_else(malformed)?; // message
+        let others = r.usize_c().ok_or_else(malformed)?;
+        if others > data.len() {
+            return Err(Stop::Malformed);
+        }
+        for _ in 0..others {
+            let len = r.usize_c().ok_or_else(malformed)?;
+            self.actors
+                .insert(r.take(len).ok_or_else(malformed)?.to_vec());
+        }
+        let meta = Self::metadata(&mut r).ok_or_else(malformed)?;
+        let cols = self.columns(&mut r, &meta, false)?;
+        let (ops, preds) = self.rows_and_group(&cols, &CHANGE_OP_SPECS, PRED_GROUP, &PRED_MEMBERS);
+        counts.ops = counts.ops.saturating_add(ops);
+        counts.preds = counts.preds.saturating_add(preds);
+        counts.changes = counts.changes.saturating_add(1);
+        counts.deps = counts.deps.saturating_add(deps as u64);
+        Ok(())
+    }
+}
+
+/// The layout rule Automerge's column parser enforces, conservatively:
+/// the specs (deflate bit cleared) are a subsequence of the specs
+/// Automerge writes, in that order, and every value column comes right
+/// after its metadata column (see [`crate::header::document_parses`]).
+fn layout_ok(cols: &[(u64, usize)], known: &[u64]) -> bool {
+    let specs: Vec<u64> = cols.iter().map(|&(spec, _)| spec & !DEFLATE_BIT).collect();
+    let mut rest = known.iter();
+    if !specs.iter().all(|s| rest.any(|k| k == s)) {
+        return false;
+    }
+    specs
+        .iter()
+        .enumerate()
+        .all(|(i, &s)| s & 0x07 != VALUE || (i > 0 && specs[i - 1] == s - 1))
+}
+
+/// A row's object (actor, counter), key (actor, counter, string) and
+/// whether it is an insert.
+type RowKey<'a> = ((Val<'a>, Val<'a>), (Val<'a>, Val<'a>, Val<'a>), bool);
+
+/// A column's segments with a position inside the current one; past its
+/// end a column reads as null (a missing column too).
+struct Cursor<'a> {
+    runs: Option<Runs<'a>>,
+    seg: Option<Seg<'a>>,
+    offset: u64,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(cols: &'a [Column<'a>], spec: u64) -> Self {
+        let mut runs = cols
+            .iter()
+            .find(|c| c.spec == spec)
+            .map(|c| Runs::new(spec & 7, &c.data));
+        let seg = runs.as_mut().and_then(Runs::next_seg);
+        Cursor {
+            runs,
+            seg,
+            offset: 0,
+        }
+    }
+
+    /// Rows left in the current segment (`u64::MAX` past the end).
+    fn left(&self) -> u64 {
+        self.seg.map_or(u64::MAX, |s| s.len - self.offset)
+    }
+
+    /// The value `k` rows ahead within the current segment.
+    fn at(&self, k: u64) -> Val<'a> {
+        self.seg.map_or(Val::Null, |s| s.at(self.offset + k))
+    }
+
+    /// Whether the value changes from row to row in the current segment.
+    fn varying(&self) -> bool {
+        self.seg.is_some_and(|s| s.step != 0)
+    }
+
+    fn advance(&mut self, n: u64) {
+        let Some(seg) = self.seg else { return };
+        self.offset += n;
+        if self.offset >= seg.len {
+            self.offset = 0;
+            self.seg = self.runs.as_mut().and_then(Runs::next_seg);
+        }
+    }
+}
+
+/// [`DocCounts::gmax`]: the largest number of successor entries in one
+/// group of rows, where a new group starts at the first row, at an insert
+/// row, when the object changes, or when the key changes and the previous
+/// row was not an insert. Computed run by run: within a stretch of rows
+/// where every one of these columns is constant (or the key counter
+/// changes by a fixed step), either every row is a group of its own
+/// (inserts, or a key that changes every row) or all rows add to the
+/// current group. `tests/memory_bounds.rs` checks it against the row by
+/// row definition.
+fn gmax(cols: &[Column<'_>], rows: u64, ticker: &mut Ticker) -> u64 {
+    let mut obj_actor = Cursor::new(cols, OBJ_ACTOR);
+    let mut obj_ctr = Cursor::new(cols, OBJ_CTR);
+    let mut key_actor = Cursor::new(cols, KEY_ACTOR);
+    let mut key_ctr = Cursor::new(cols, KEY_CTR);
+    let mut key_str = Cursor::new(cols, KEY_STR);
+    let mut insert = Cursor::new(cols, INSERT);
+    let mut succ = Cursor::new(cols, SUCC_GROUP);
+
+    let (mut best, mut cur) = (0u64, 0u64);
+    // The previous row's object, key, and whether it was an insert.
+    let mut prev: Option<RowKey<'_>> = None;
+    let mut row = 0u64;
+    while row < rows {
+        ticker.tick();
+        let m = [
+            &obj_actor, &obj_ctr, &key_actor, &key_ctr, &key_str, &insert, &succ,
+        ]
+        .iter()
+        .map(|c| c.left())
+        .min()
+        .unwrap_or(u64::MAX)
+        .min(rows - row);
+        let obj = (obj_actor.at(0), obj_ctr.at(0));
+        let key = (key_actor.at(0), key_ctr.at(0), key_str.at(0));
+        let ins = insert.at(0) == Val::B(true);
+        let g = match succ.at(0) {
+            Val::U(g) => g,
+            _ => 0,
+        };
+        let starts_group = match prev {
+            None => true,
+            Some((prev_obj, prev_key, prev_ins)) => {
+                ins || obj != prev_obj || (key != prev_key && !prev_ins)
+            }
+        };
+        if starts_group {
+            cur = 0;
+        }
+        cur = cur.saturating_add(g);
+        best = best.max(cur);
+        if m > 1 {
+            if ins || key_ctr.varying() {
+                cur = g;
+            } else {
+                cur = cur.saturating_add(g.saturating_mul(m - 1));
+            }
+            best = best.max(cur);
+        }
+        prev = Some((obj, (key.0, key_ctr.at(m - 1), key.2), ins));
+        for c in [
+            &mut obj_actor,
+            &mut obj_ctr,
+            &mut key_actor,
+            &mut key_ctr,
+            &mut key_str,
+            &mut insert,
+            &mut succ,
+        ] {
+            c.advance(m);
+        }
+        row += m;
+    }
+    best
+}
+
+/// Scan external input (any sequence of chunks) for what loading it would
+/// cost. `limit` bounds the inflation (to a tenth of it, see the module
+/// docs); `None` inflates everything. Gmax is taken at its upper bound,
+/// the number of successor entries ([`InputCounts::gmax_bounded`]); the
+/// checks rescan exactly ([`scan_input_exact`]) when that bound is what
+/// puts an estimate over the limit. Never fails and never panics.
+pub fn scan_input(bytes: &[u8], limit: Option<u64>) -> InputCounts {
+    scan(bytes, limit, false)
+}
+
+/// [`scan_input`] with Gmax computed exactly (merging the object, key,
+/// insert and successor columns run by run).
+pub fn scan_input_exact(bytes: &[u8], limit: Option<u64>) -> InputCounts {
+    scan(bytes, limit, true)
+}
+
+fn scan(bytes: &[u8], limit: Option<u64>, exact_gmax: bool) -> InputCounts {
+    let mut scanner = Scanner::new(limit.map(|l| l / PER_BYTE), exact_gmax);
+    let mut counts = InputCounts::default();
+    let mut r = Reader::new(bytes);
+    let mut chunks = 0usize;
+    let mut single_doc_parses = false;
+    while !r.done() {
+        let header = (|| {
+            if r.take(4)? != MAGIC {
+                return None;
+            }
+            r.take(4)?; // checksum (Automerge checks it)
+            let chunk_type = r.take(1)?[0];
+            let len = r.usize_c()?;
+            Some((chunk_type, r.take(len)?))
+        })();
+        let Some((chunk_type, data)) = header else {
+            counts.malformed = true;
+            break;
+        };
+        chunks += 1;
+        // Header bytes, and the chunk's data as it is (deflated columns
+        // are counted inflated instead when they are inflated).
+        scanner.count(data.len() as u64 + 20);
+        let result = match chunk_type {
+            DOCUMENT_CHUNK => {
+                let mut doc = DocCounts::default();
+                let inflated_before = scanner.inflated;
+                let result = scanner.doc_chunk(data, &mut doc);
+                doc.inflated =
+                    scanner.inflated.saturating_sub(inflated_before) + data.len() as u64 + 20;
+                if chunks == 1 {
+                    counts.first_doc = doc;
+                    if let Ok(parses) = result {
+                        single_doc_parses = parses && r.canonical;
+                    }
+                } else {
+                    counts.later_docs.add(&doc);
+                    let mut as_changes = doc.as_changes();
+                    // Their actors are counted by name with the changes'.
+                    as_changes.actors = 0;
+                    counts.changes.add(&as_changes);
+                    let mut ar = Reader::new(data);
+                    if let Some(n) = ar.uleb() {
+                        for _ in 0..n.min(data.len() as u64) {
+                            let Some(len) = ar.uleb().and_then(|l| usize::try_from(l).ok()) else {
+                                break;
+                            };
+                            let Some(id) = ar.take(len) else { break };
+                            scanner.actors.insert(id.to_vec());
+                        }
+                    }
+                }
+                result.map(|_| ())
+            }
+            CHANGE_CHUNK => scanner.change_chunk(data, &mut counts.changes),
+            COMPRESSED_CHUNK => scanner
+                .inflate(data)
+                .and_then(|inflated| scanner.change_chunk(&inflated, &mut counts.changes)),
+            BUNDLE_CHUNK => {
+                counts.bundle = true;
+                Err(Stop::Malformed)
+            }
+            _ => Err(Stop::Malformed),
+        };
+        match result {
+            Ok(()) => {}
+            Err(Stop::Malformed) => {
+                counts.malformed = !counts.bundle;
+                break;
+            }
+            Err(Stop::Truncated) => {
+                counts.truncated = true;
+                break;
+            }
+        }
+    }
+    counts.changes.actors = scanner.actors.len() as u64;
+    counts.deflated_out = scanner.deflated_out;
+    counts.gmax_bounded = scanner.gmax_bounded;
+    // Change chunks' bytes: everything inflated that is not a document's.
+    counts.changes.inflated = scanner
+        .inflated
+        .saturating_sub(counts.first_doc.inflated)
+        .saturating_sub(counts.later_docs.inflated);
+    counts.single_doc_parses = chunks == 1
+        && single_doc_parses
+        && !counts.malformed
+        && !counts.truncated
+        && counts.later_docs == DocCounts::default();
+    counts
+}
+
+/// Whether `bytes` holds a bundle chunk, from the chunk headers alone
+/// (nothing else is checked; for the paths that skip the scan without a
+/// limit).
+pub fn has_bundle(bytes: &[u8]) -> bool {
+    let mut r = Reader::new(bytes);
+    while !r.done() {
+        let header = (|| {
+            if r.take(4)? != MAGIC {
+                return None;
+            }
+            r.take(4)?;
+            let chunk_type = r.take(1)?[0];
+            let len = usize::try_from(r.uleb()?).ok()?;
+            r.take(len)?;
+            Some(chunk_type)
+        })();
+        match header {
+            Some(BUNDLE_CHUNK) => return true,
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The counts of changes about to be applied, from their chunks
+/// (`Change::raw_bytes()`, uncompressed change chunks), with their
+/// distinct actors. Never fails; what does not parse is not counted
+/// (these are changes Automerge built).
+pub fn scan_changes<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> ChangeCounts {
+    let mut scanner = Scanner::new(None, true);
+    let mut counts = ChangeCounts::default();
+    for chunk in chunks {
+        let mut r = Reader::new(chunk);
+        let data = (|| {
+            r.take(8)?;
+            let chunk_type = r.take(1)?[0];
+            let len = usize::try_from(r.uleb()?).ok()?;
+            Some((chunk_type, r.take(len)?))
+        })();
+        match data {
+            Some((CHANGE_CHUNK, data)) => {
+                scanner.count(data.len() as u64 + 20);
+                let _ = scanner.change_chunk(data, &mut counts);
+            }
+            Some((COMPRESSED_CHUNK, data)) => {
+                scanner.count(20);
+                if let Ok(inflated) = scanner.inflate(data) {
+                    let _ = scanner.change_chunk(&inflated, &mut counts);
+                }
+            }
+            _ => {}
+        }
+    }
+    counts.actors = scanner.actors.len() as u64;
+    counts.inflated = scanner.inflated;
+    counts
+}
+
+/// The counts of a stored value (one document chunk, uncompressed): what
+/// loading it costs, [`doc_estimate`]. For anything else, the counts of
+/// the document a load of it would build ([`InputCounts::as_document`]).
+/// Never fails.
+/// Gmax is taken at its bound, as in [`scan_input`].
+pub fn scan_doc(bytes: &[u8]) -> DocCounts {
+    scan_input(bytes, None).as_document()
+}
+
+/// [`scan_doc`] with Gmax computed exactly.
+pub fn scan_doc_exact(bytes: &[u8]) -> DocCounts {
+    scan_input_exact(bytes, None).as_document()
+}
+
+/// The largest number of successor entries in one (object, key) group of
+/// a document chunk, row by row, by the definition in [`gmax`]: the
+/// reference for the tests (slow; `None` if `bytes` is not one document
+/// chunk).
+#[cfg(feature = "test-hooks")]
+pub fn gmax_by_rows(bytes: &[u8]) -> Option<u64> {
+    let mut r = Reader::new(bytes);
+    if r.take(4)? != MAGIC {
+        return None;
+    }
+    r.take(5)?;
+    let len = usize::try_from(r.uleb()?).ok()?;
+    let data = r.take(len)?;
+    let mut r = Reader::new(data);
+    let actors = r.uleb()?;
+    for _ in 0..actors {
+        let len = usize::try_from(r.uleb()?).ok()?;
+        r.take(len)?;
+    }
+    let heads = usize::try_from(r.uleb()?).ok()?;
+    r.take(heads * 32)?;
+    let change_meta = Scanner::metadata(&mut r)?;
+    let op_meta = Scanner::metadata(&mut r)?;
+    let mut scanner = Scanner::new(None, true);
+    scanner.columns(&mut r, &change_meta, true).ok()?;
+    let cols = scanner.columns(&mut r, &op_meta, true).ok()?;
+    let (rows, _) = scanner.rows_and_group(&cols, &DOC_OP_SPECS, SUCC_GROUP, &SUCC_MEMBERS);
+    let rows_usize = usize::try_from(rows).ok()?;
+    let expand = |spec: u64| -> Vec<Val<'_>> {
+        let mut out = Vec::new();
+        if let Some(col) = cols.iter().find(|c| c.spec == spec) {
+            let mut runs = Runs::new(spec & 7, &col.data);
+            while let Some(seg) = runs.next_seg() {
+                for k in 0..seg.len {
+                    if out.len() >= rows_usize {
+                        break;
+                    }
+                    out.push(seg.at(k));
+                }
+            }
+        }
+        out.resize(rows_usize, Val::Null);
+        out
+    };
+    let (oa, oc, ka, kc, ks, ins, succ) = (
+        expand(OBJ_ACTOR),
+        expand(OBJ_CTR),
+        expand(KEY_ACTOR),
+        expand(KEY_CTR),
+        expand(KEY_STR),
+        expand(INSERT),
+        expand(SUCC_GROUP),
+    );
+    let (mut best, mut cur) = (0u64, 0u64);
+    for i in 0..rows_usize {
+        let is_ins = ins[i] == Val::B(true);
+        let boundary = i == 0
+            || is_ins
+            || (oa[i], oc[i]) != (oa[i - 1], oc[i - 1])
+            || ((ka[i], kc[i], ks[i]) != (ka[i - 1], kc[i - 1], ks[i - 1])
+                && ins[i - 1] != Val::B(true));
+        if boundary {
+            cur = 0;
+        }
+        cur = cur.saturating_add(match succ[i] {
+            Val::U(g) => g,
+            _ => 0,
+        });
+        best = best.max(cur);
+    }
+    Some(best)
+}

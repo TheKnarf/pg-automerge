@@ -19,7 +19,12 @@
 //! - whatever `normalize` returns is a stored value: it loads, with the
 //!   heads the header says, and normalizes to itself;
 //! - whatever `merge_changes` returns, once its stored bytes are computed,
-//!   loads back with the document's heads.
+//!   loads back with the document's heads;
+//! - the load memory scan (`budget::scan_input`) never marks input that
+//!   Automerge loads as malformed, and the peak memory of `normalize`
+//!   (measured by a counting allocator) stays below its estimate;
+//!   `normalize` rejects input over the limit (`Error::LoadLimit`) only
+//!   when the estimate says so.
 //!
 //! `tests/corpus/*.bin` are inputs worth keeping, found by this harness:
 //! `panic-*` one per distinct decoder panic, `reload-*` inputs that load
@@ -35,11 +40,14 @@ use std::path::PathBuf;
 
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, Automerge, ROOT};
+use pg_automerge_core::budget::{self, doc_estimate, scan_doc, scan_input};
 use pg_automerge_core::header::heads_from_bytes;
 use pg_automerge_core::loaded::{self, Input};
 use pg_automerge_core::{Error, normalize};
 
 mod common;
+#[path = "common/counting.rs"]
+mod counting;
 
 use common::{Rng, chunk, edit, random_replicas, reference_normalize};
 
@@ -208,7 +216,29 @@ enum Notable {
 /// Check every property on one input.
 fn check(input: &[u8], base: &[u8]) -> Notable {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let normalized = normalize(input);
+        let scanned = scan_input(input, budget::limit());
+        let loads =
+            catch_unwind(AssertUnwindSafe(|| Automerge::load(input).is_ok())).unwrap_or(false);
+        if loads {
+            assert!(
+                !scanned.malformed,
+                "Automerge loads what the scan calls malformed"
+            );
+        }
+        let (normalized, peak) = counting::peak_of(|| normalize(input));
+        if let Err(Error::LoadLimit(err)) = &normalized {
+            // Over the limit by the estimate; the reference load of such
+            // input could take gigabytes, so it is not run.
+            assert!(err.estimate > err.limit);
+            return Notable::Nothing;
+        }
+        if let Ok(stored) = &normalized {
+            let estimate = scanned.load_estimate().max(doc_estimate(&scan_doc(stored)));
+            assert!(
+                peak <= estimate,
+                "normalize peak {peak} above the estimate {estimate}"
+            );
+        }
         let notable = match &normalized {
             Err(Error::InvalidInput(m)) if m.contains("malformed data") => Notable::DecoderPanic,
             Err(Error::InvalidInput(m))

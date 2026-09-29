@@ -20,6 +20,9 @@
 # custom-format restore runs with pg_automerge.verify_writes = off (set on
 # its database) and must give the same bytes; the dump does not mention
 # the setting.
+# A restore into a database with a lower pg_automerge.max_load_memory
+# fails with 53400, and succeeds with the limit raised for the restore
+# session (PGOPTIONS='-c pg_automerge.max_load_memory=-1').
 #
 # Env: see tests/lib.sh.
 
@@ -29,7 +32,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 DB=pg_automerge_dump
 DB_PLAIN=pg_automerge_dump_plain
 DB_CUSTOM=pg_automerge_dump_custom
-DROP_DBS=("$DB" "$DB_PLAIN" "$DB_CUSTOM")
+DB_LOW=pg_automerge_dump_low
+DROP_DBS=("$DB" "$DB_PLAIN" "$DB_CUSTOM" "$DB_LOW")
 
 on_exit() {
     if [[ $1 == 0 ]]; then log "all dump/restore checks passed"; else echo "dump test FAILED" >&2; fi
@@ -143,6 +147,30 @@ check_restored "$DB_CUSTOM" "custom dump"
 [[ "$(sql_on "$DB_CUSTOM" -c "SELECT current_setting('pg_automerge.verify_writes')")" == off ]] \
     || fail "custom dump: restore database should run with pg_automerge.verify_writes off"
 ! grep -q verify_writes "$WORK/dump.sql" || fail "the dump mentions pg_automerge.verify_writes"
+
+log "restore into a database with a lower pg_automerge.max_load_memory"
+# Every value restored is new input to the restoring server: under a
+# limit below what the documents take to load, the restore fails with
+# 53400; raising the limit for the restore session, as DESIGN.md
+# documents, restores them unchanged. The dump does not mention it.
+sql_on postgres -c "DROP DATABASE IF EXISTS $DB_LOW WITH (FORCE)" -c "CREATE DATABASE $DB_LOW" \
+    -c "ALTER DATABASE $DB_LOW SET pg_automerge.max_load_memory = '64kB'"
+if out="$("$BINDIR/pg_restore" -h localhost -p "$PORT" -d "$DB_LOW" --exit-on-error "$WORK/dump.custom" 2>&1)"; then
+    fail "restore under a 64kB limit succeeded"
+fi
+grep -q 'estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (64 kB)' <<<"$out" \
+    || fail "unexpected restore error: $out"
+sql_on postgres -c "DROP DATABASE $DB_LOW WITH (FORCE)" -c "CREATE DATABASE $DB_LOW" \
+    -c "ALTER DATABASE $DB_LOW SET pg_automerge.max_load_memory = '64kB'"
+PGOPTIONS='-c pg_automerge.max_load_memory=-1' "$BINDIR/pg_restore" -h localhost -p "$PORT" -d "$DB_LOW" \
+    --exit-on-error "$WORK/dump.custom" || fail "restore with the limit raised failed"
+[[ "$(sql_on "$DB_LOW" -c "LOAD 'pg_automerge'" \
+        -c "SELECT current_setting('pg_automerge.max_load_memory')")" == 64kB ]] \
+    || fail "the database's own limit changed"
+# (check_restored merges: with the database's limit back to the default.)
+sql_on postgres -c "ALTER DATABASE $DB_LOW RESET pg_automerge.max_load_memory"
+check_restored "$DB_LOW" "restore with the limit raised"
+! grep -q max_load_memory "$WORK/dump.sql" || fail "the dump mentions pg_automerge.max_load_memory"
 
 log "binary COPY round trip"
 sql -c "\\copy app.docs (id, doc) TO '$WORK/docs.bin' (FORMAT binary)"

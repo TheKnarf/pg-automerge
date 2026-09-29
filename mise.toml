@@ -18,7 +18,7 @@ description = "Download and build the Postgres version pgrx develops against (~/
 run = "cargo pgrx init --pg{{env.PG_VERSION}} download"
 
 [tasks.test]
-description = "Run core unit tests, #[pg_test] tests in a pgrx-managed Postgres, then the multi-session scripts (concurrency, LISTEN/NOTIFY, dump/restore, upgrade, extension flags)"
+description = "Run core unit tests, #[pg_test] tests in a pgrx-managed Postgres, then the multi-session scripts (concurrency, LISTEN/NOTIFY, dump/restore, upgrade, extension flags, the load memory limit against a memory-capped scratch cluster)"
 # The extension is installed once (a dev build without the pg_test
 # instrumentation) for all multi-session scripts.
 run = [
@@ -30,6 +30,7 @@ run = [
   "PG_AUTOMERGE_INSTALLED=1 bash tests/dump.sh",
   "PG_AUTOMERGE_INSTALLED=1 bash tests/upgrade.sh",
   "PG_AUTOMERGE_INSTALLED=1 bash tests/extension.sh",
+  "PG_AUTOMERGE_INSTALLED=1 bash tests/limits.sh",
 ]
 
 [tasks.regress]
@@ -62,8 +63,12 @@ description = "Install every released version's snapshot, ALTER EXTENSION UPDATE
 run = "bash tests/upgrade.sh"
 
 [tasks.extension]
-description = "Control-file flags: CREATE EXTENSION .. SCHEMA, ALTER EXTENSION SET SCHEMA with dependent objects, dump/restore of a moved extension, no install by non-superusers, verify_writes stays superuser-only (installs + starts the pgrx Postgres)"
+description = "Control-file flags: CREATE EXTENSION .. SCHEMA, ALTER EXTENSION SET SCHEMA with dependent objects, dump/restore of a moved extension, no install by non-superusers, verify_writes and max_load_memory stay superuser-only (installs + starts the pgrx Postgres)"
 run = "bash tests/extension.sh"
+
+[tasks.limits]
+description = "The load memory limit against real crashes: a scratch cluster with its address space capped aborts on crafted and compressed input without the limit, and gets clean 53400 errors with it (installs the extension; part of test)"
+run = "bash tests/limits.sh"
 
 [tasks.replication]
 description = "Logical replication (text and binary) between two databases of a scratch cluster; not part of test"

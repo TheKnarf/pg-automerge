@@ -18,8 +18,10 @@
 #     can be moved again.
 # trusted = false, superuser = true:
 #   - a non-superuser that owns the database cannot CREATE EXTENSION;
-#   - pg_automerge.verify_writes stays superuser-only for that role: SET
-#     (before and after the library is loaded), ALTER ROLE/DATABASE .. SET.
+#   - pg_automerge.verify_writes and pg_automerge.max_load_memory stay
+#     superuser-only for that role: SET (before and after the library is
+#     loaded), ALTER ROLE/DATABASE .. SET; a superuser can still set them
+#     per role or GRANT SET ON PARAMETER.
 #
 # Env: see tests/lib.sh.
 
@@ -238,3 +240,34 @@ sql_on "$DB_OWNED" -c "GRANT SET ON PARAMETER pg_automerge.verify_writes TO $ROL
         -c "SHOW pg_automerge.verify_writes" | tail -1)" == off ]] \
     || fail "GRANT SET ON PARAMETER did not let $ROLE turn it off"
 sql_on "$DB_OWNED" -c "REVOKE SET ON PARAMETER pg_automerge.verify_writes FROM $ROLE"
+
+log "pg_automerge.max_load_memory stays superuser-only"
+# The same checks: a placeholder SET is refused when the library loads,
+# SET afterwards and ALTER ROLE/DATABASE .. SET fail, and it stays 2GB.
+out="$(as_role -c "SET pg_automerge.max_load_memory = -1" \
+    -c "SELECT '\\x'::bytea::automerge IS NOT NULL" -c "SHOW pg_automerge.max_load_memory" 2>&1)"
+grep -q 'permission denied to set parameter "pg_automerge.max_load_memory"' <<<"$out" \
+    || fail "placeholder SET of max_load_memory not refused: $out"
+grep -qx 2GB <<<"$out" || fail "placeholder SET of max_load_memory took effect: $out"
+for stmt in "SET pg_automerge.max_load_memory = -1" \
+            "SET pg_automerge.max_load_memory = '64GB'" \
+            "ALTER ROLE $ROLE SET pg_automerge.max_load_memory = -1" \
+            "ALTER DATABASE $DB_OWNED SET pg_automerge.max_load_memory = -1"; do
+    if out="$(as_role -c "SELECT '\\x'::bytea::automerge IS NOT NULL" -c "$stmt" 2>&1)"; then
+        fail "a non-superuser ran: $stmt"
+    fi
+    grep -q 'permission denied to set parameter "pg_automerge.max_load_memory"' <<<"$out" \
+        || fail "$stmt: unexpected error: $out"
+done
+[[ "$(as_role -c "SELECT '\\x'::bytea::automerge IS NOT NULL" -c "SHOW pg_automerge.max_load_memory" | tail -1)" \
+   == 2GB ]] || fail "max_load_memory is not 2GB for $ROLE"
+# A superuser can set it for a role, and delegate it.
+sql_on "$DB_OWNED" -c "ALTER ROLE $ROLE SET pg_automerge.max_load_memory = '64MB'"
+[[ "$(as_role -c "SELECT '\\x'::bytea::automerge IS NOT NULL" -c "SHOW pg_automerge.max_load_memory" | tail -1)" \
+   == 64MB ]] || fail "ALTER ROLE .. SET by a superuser did not apply"
+sql_on "$DB_OWNED" -c "ALTER ROLE $ROLE RESET pg_automerge.max_load_memory" \
+    -c "GRANT SET ON PARAMETER pg_automerge.max_load_memory TO $ROLE"
+[[ "$(as_role -c "SELECT '\\x'::bytea::automerge IS NOT NULL" -c "SET pg_automerge.max_load_memory = -1" \
+        -c "SHOW pg_automerge.max_load_memory" | tail -1)" == -1 ]] \
+    || fail "GRANT SET ON PARAMETER did not let $ROLE change max_load_memory"
+sql_on "$DB_OWNED" -c "REVOKE SET ON PARAMETER pg_automerge.max_load_memory FROM $ROLE"

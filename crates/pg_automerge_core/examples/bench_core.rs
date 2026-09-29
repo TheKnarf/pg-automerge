@@ -1,6 +1,6 @@
 //! Rust-level timings of the core primitives on the benchmark documents
 //! (`mise run bench-core`, release build): loading, normalizing canonical
-//! and compressed input, saving, and the JSON walk.
+//! and compressed input, the load memory scan, saving, and the JSON walk.
 //!
 //! Env: BENCH_DOCS (space-separated subset of "text3mb items20k items2k
 //! typed5k", default all), BENCH_REPS (default 5). Prints the median in
@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use automerge::{AutoCommit, Automerge};
 use pg_automerge_core::json::{self, JsonSink};
-use pg_automerge_core::normalize;
+use pg_automerge_core::{budget, normalize};
 
 #[path = "shared/bench_docs.rs"]
 mod bench_docs;
@@ -109,6 +109,18 @@ fn main() {
             (
                 "normalize(save(): compressed)",
                 Box::new(|| drop(black_box(normalize(&compressed).unwrap()))),
+            ),
+            (
+                "load memory scan (stored)",
+                Box::new(|| {
+                    black_box(budget::scan_input(&stored, budget::limit()));
+                }),
+            ),
+            (
+                "load memory scan (compressed)",
+                Box::new(|| {
+                    black_box(budget::scan_input(&compressed, budget::limit()));
+                }),
             ),
             (
                 "save_nocompress",

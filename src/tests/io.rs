@@ -480,6 +480,10 @@ fn text_output_round_trips_exactly() {
         )
         .unwrap();
     }
+    // Merging the 3,000,000-character document into the unrelated ones
+    // applies all of its ops as changes, estimated at 2.9 GB: over the
+    // default pg_automerge.max_load_memory (see limits.rs).
+    Spi::run("SET LOCAL pg_automerge.max_load_memory = '8GB'").unwrap();
     Spi::run("INSERT INTO dump_src SELECT 10, merge_agg(doc) FROM dump_src").unwrap();
     let all_same: bool = one(
         "SELECT bool_and(doc::text::automerge::bytea = doc::bytea \

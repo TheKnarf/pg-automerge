@@ -20,6 +20,7 @@ include!("notify.rs");
 include!("expanded.rs");
 include!("hardening.rs");
 include!("loads.rs");
+include!("limits.rs");
 
 fn actor(n: u8) -> ActorId {
     ActorId::from([n; 16])

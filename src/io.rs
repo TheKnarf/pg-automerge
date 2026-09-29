@@ -23,6 +23,9 @@ fn automerge_in(input: &CStr) -> AutomergeDatum {
             "invalid input syntax for type automerge: not valid UTF-8".into(),
         ))
     });
+    // A literal too long to fit the load memory limit whatever it holds
+    // is refused before its hex is decoded.
+    am::budget::check_input_len(text.len().saturating_sub(2) / 2).or_raise();
     AutomergeDatum::from_external(&am::encoding::from_hex_literal(text).or_raise())
 }
 
@@ -83,7 +86,7 @@ CREATE TYPE automerge (
 );
 
 COMMENT ON TYPE automerge IS
-    'An Automerge CRDT document (uncompressed save format). Implicitly castable to jsonb.';
+    'An Automerge CRDT document (uncompressed save format). Implicitly castable to jsonb. New values must fit pg_automerge.max_load_memory.';
 COMMENT ON FUNCTION automerge_in(cstring) IS
     'Input function of type automerge: \x followed by the hex of an Automerge save.';
 COMMENT ON FUNCTION automerge_out(automerge) IS
@@ -140,11 +143,11 @@ CREATE CAST (automerge AS bytea) WITHOUT FUNCTION;
 CREATE CAST (automerge AS jsonb) WITH FUNCTION automerge_to_jsonb(automerge) AS IMPLICIT;
 
 COMMENT ON FUNCTION automerge_from_bytea(bytea) IS
-    'An Automerge save (or change chunks) as an automerge value, validated and normalized; the bytea to automerge cast.';
+    'An Automerge save (or change chunks) as an automerge value, validated (within pg_automerge.max_load_memory) and normalized; the bytea to automerge cast.';
 COMMENT ON FUNCTION automerge_to_jsonb(automerge) IS
     'The current state of the document as jsonb; the implicit automerge to jsonb cast.';
 COMMENT ON CAST (bytea AS automerge) IS
-    'Assignment cast: validates and normalizes an Automerge save.';
+    'Assignment cast: validates (within pg_automerge.max_load_memory) and normalizes an Automerge save.';
 COMMENT ON CAST (automerge AS bytea) IS
     'Explicit cast: the stored Automerge bytes (an uncompressed save).';
 COMMENT ON CAST (automerge AS jsonb) IS

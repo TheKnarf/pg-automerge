@@ -98,21 +98,6 @@ impl Reader<'_> {
         Err(Stop::NotSingleDoc)
     }
 
-    /// [`Self::uleb`], also rejecting overlong encodings (a last byte of
-    /// zero after the first), as Automerge's parser does.
-    fn canonical_uleb(&mut self) -> Result<u64, Stop> {
-        let start = self.pos;
-        let value = self.uleb()?;
-        if self.pos - start > 1 && self.prefix[self.pos - 1] == 0 {
-            return Err(Stop::NotSingleDoc);
-        }
-        Ok(value)
-    }
-
-    fn canonical_uleb_usize(&mut self) -> Result<usize, Stop> {
-        usize::try_from(self.canonical_uleb()?).map_err(|_| Stop::NotSingleDoc)
-    }
-
     fn uleb_usize(&mut self) -> Result<usize, Stop> {
         usize::try_from(self.uleb()?).map_err(|_| Stop::NotSingleDoc)
     }
@@ -528,20 +513,6 @@ pub fn document_chunk(bytes: &[u8]) -> Option<DocumentChunk> {
     })
 }
 
-/// Change column specs of a document chunk in the order Automerge 0.12
-/// writes them (`change_graph.rs` `ids`), deflate bit clear: actor, seq,
-/// max op, time, message, deps (group, then values), extra (metadata, then
-/// values).
-const DOC_CHANGE_SPECS: [u64; 9] = [0x01, 0x03, 0x13, 0x23, 0x35, 0x40, 0x43, 0x56, 0x57];
-/// Op column specs of a document chunk in the order Automerge 0.12 writes
-/// them (`op_set2/columns.rs` `ids::ALL_COLUMN_SPECS` sorted): obj (actor,
-/// counter), key (actor, counter, string), id (actor, counter), insert,
-/// action, value (metadata, values), succ (group, actor, counter), expand,
-/// mark name.
-const DOC_OP_SPECS: [u64; 16] = [
-    0x01, 0x02, 0x11, 0x13, 0x15, 0x21, 0x23, 0x34, 0x42, 0x56, 0x57, 0x80, 0x81, 0x83, 0x94, 0xa5,
-];
-
 /// Whether `bytes`, exactly one document chunk, passes everything Automerge
 /// 0.12's `storage::Chunk::parse` checks of a document chunk (the checksum
 /// is [`document_chunk`]'s), conservatively: `true` only if that
@@ -570,95 +541,12 @@ const DOC_OP_SPECS: [u64; 16] = [
 ///   range is contiguous with the previous one. Anything else (unknown or
 ///   out-of-order specs, a value column without its metadata) is `false`.
 ///
-/// The column contents are not decoded: Automerge does not decode them
-/// either for a chunk it skips. Costs a pass over the metadata and an
-/// inflation of the deflated columns (into nothing). Never panics.
+/// This is [`crate::budget::scan_input`]'s
+/// [`single_doc_parses`](crate::budget::InputCounts::single_doc_parses),
+/// without a limit; the merge and containment paths use the scan they
+/// make anyway. Never panics.
 pub fn document_parses(bytes: &[u8]) -> bool {
-    let mut r = Reader {
-        prefix: bytes,
-        total_len: bytes.len(),
-        pos: 0,
-    };
-    let parsed = (|| -> Result<(), Stop> {
-        if r.take(4)? != MAGIC {
-            return Err(Stop::NotSingleDoc);
-        }
-        r.take(4)?; // checksum
-        if r.take(1)?[0] != DOCUMENT_CHUNK {
-            return Err(Stop::NotSingleDoc);
-        }
-        let data_len = r.canonical_uleb_usize()?;
-        if r.pos.checked_add(data_len) != Some(r.total_len) {
-            return Err(Stop::NotSingleDoc);
-        }
-        let actors = r.canonical_uleb_usize()?;
-        for _ in 0..actors {
-            let len = r.canonical_uleb_usize()?;
-            r.take(len)?;
-        }
-        let heads = r.canonical_uleb_usize()?;
-        r.take(heads.checked_mul(32).ok_or(Stop::NotSingleDoc)?)?;
-        let change_cols = canonical_column_specs(&mut r)?;
-        let op_cols = canonical_column_specs(&mut r)?;
-        if !layout_ok(&change_cols, &DOC_CHANGE_SPECS) || !layout_ok(&op_cols, &DOC_OP_SPECS) {
-            return Err(Stop::NotSingleDoc);
-        }
-        for &(spec, len) in change_cols.iter().chain(&op_cols) {
-            let raw = r.take(len)?;
-            if spec & DEFLATE_BIT != 0 {
-                let mut decoder = flate2::bufread::DeflateDecoder::new(raw);
-                std::io::copy(&mut decoder, &mut std::io::sink())
-                    .map_err(|_| Stop::NotSingleDoc)?;
-            }
-        }
-        // The head indices: absent (older JS saves), or one per head and
-        // nothing after them.
-        if r.pos < r.total_len {
-            for _ in 0..heads {
-                r.canonical_uleb()?;
-            }
-            if r.pos != r.total_len {
-                return Err(Stop::NotSingleDoc);
-            }
-        }
-        Ok(())
-    })();
-    parsed.is_ok()
-}
-
-/// A column metadata block with canonical LEB128 throughout.
-fn canonical_column_specs(r: &mut Reader<'_>) -> Result<Vec<(u64, usize)>, Stop> {
-    let count = r.canonical_uleb_usize()?;
-    // Each entry takes at least two bytes.
-    if count > r.total_len / 2 {
-        return Err(Stop::NotSingleDoc);
-    }
-    let mut cols = Vec::with_capacity(count);
-    for _ in 0..count {
-        let spec = r.canonical_uleb()?;
-        if spec > u64::from(u32::MAX) {
-            return Err(Stop::NotSingleDoc);
-        }
-        cols.push((spec, r.canonical_uleb_usize()?));
-    }
-    Ok(cols)
-}
-
-/// The layout rule of [`document_parses`] for one metadata block.
-fn layout_ok(cols: &[(u64, usize)], known: &[u64]) -> bool {
-    const VALUE: u64 = 7;
-    let specs: Vec<u64> = cols.iter().map(|&(spec, _)| spec & !DEFLATE_BIT).collect();
-    let mut rest = known.iter();
-    if !specs.iter().all(|s| rest.any(|k| k == s)) {
-        return false;
-    }
-    // A value column only right after its metadata column; a metadata
-    // column alone is fine (Automerge writes one for an empty extra-bytes
-    // column).
-    specs
-        .iter()
-        .enumerate()
-        .all(|(i, &s)| s & 0x07 != VALUE || (i > 0 && specs[i - 1] == s - 1))
+    crate::budget::scan_input(bytes, None).single_doc_parses
 }
 
 /// Chunk type of an uncompressed change chunk.

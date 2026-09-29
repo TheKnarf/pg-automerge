@@ -2,7 +2,8 @@
 //! extension's pg_tests and the core's own tests enable): observe and force
 //! the save-and-load check that keeps unloadable values out of storage
 //! (see [`crate::normalize`] and [`crate::loaded::LoadedDoc::stored`]),
-//! switch it off, and count document loads.
+//! switch it off, count document loads, and override the load memory
+//! limit ([`crate::budget::limit`]).
 //!
 //! Per thread: core tests run in parallel threads, a backend has one.
 
@@ -13,6 +14,17 @@ thread_local! {
     static FAIL_RELOAD_CHECK: Cell<bool> = const { Cell::new(false) };
     static VERIFICATION: Cell<Option<bool>> = const { Cell::new(None) };
     static LOADS: Cell<usize> = const { Cell::new(0) };
+    static LIMIT: Cell<Option<Option<u64>>> = const { Cell::new(None) };
+}
+
+/// Override [`crate::budget::limit`] on this thread: `Some(Some(bytes))`
+/// a limit, `Some(None)` no limit, `None` the registered source again.
+pub fn set_limit(limit: Option<Option<u64>>) {
+    LIMIT.with(|l| l.set(limit));
+}
+
+pub(crate) fn limit_override() -> Option<Option<u64>> {
+    LIMIT.with(Cell::get)
 }
 
 /// How many times this thread has run `Automerge::load` (every load the
@@ -51,4 +63,13 @@ pub fn set_fail_reload_check(fail: bool) {
 pub(crate) fn reload_check_hook() -> bool {
     RELOAD_CHECKS.with(|n| n.set(n.get() + 1));
     FAIL_RELOAD_CHECK.with(Cell::get)
+}
+
+/// `raw` deflated as Automerge deflates columns and chunks (for tests
+/// that build compressed input, e.g. a deflate bomb).
+pub fn deflate(raw: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(raw).expect("writing to a Vec");
+    encoder.finish().expect("writing to a Vec")
 }

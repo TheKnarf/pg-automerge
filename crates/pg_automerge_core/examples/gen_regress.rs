@@ -6,6 +6,9 @@ use automerge::transaction::{CommitOptions, Transactable};
 use automerge::{ActorId, AutoCommit, ObjType, ROOT, ScalarValue};
 use pg_automerge_core::encoding::to_hex_literal;
 
+#[path = "../tests/common/craft.rs"]
+mod craft;
+
 fn hex(doc: &mut AutoCommit) -> String {
     to_hex_literal(&doc.document().save_nocompress())
 }
@@ -84,4 +87,10 @@ fn main() {
     let mut reused = base.fork().with_actor(ActorId::from([0xbbu8; 16]));
     reused.put(ROOT, "status", "cancelled").unwrap();
     println!("\\set bob_reused '\\{}'", hex(&mut reused));
+    // A change chunk whose run-length encoded columns describe 10,000,000
+    // list inserts: over 10 GB to load.
+    println!(
+        "\\set bomb '\\{}'",
+        to_hex_literal(&craft::change_ops(10_000_000))
+    );
 }

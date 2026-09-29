@@ -47,8 +47,10 @@ impl PgError {
 impl From<Error> for PgError {
     /// 22P02 for invalid input, 22000 for conflicting histories (a reused
     /// actor id), 22023 for an argument that does not fit the document,
-    /// 54000 for a document an output cannot represent, XX000 for
-    /// internal errors. See docs/DESIGN.md, "Error codes".
+    /// 54000 for a document an output cannot represent, 53400 for input
+    /// over `pg_automerge.max_load_memory`, 0A000 for input in a form the
+    /// extension does not take, XX000 for internal errors. See
+    /// docs/DESIGN.md, "Error codes".
     fn from(err: Error) -> Self {
         let code = match err {
             Error::InvalidInput(_) | Error::MissingDependencies(_) => {
@@ -57,6 +59,8 @@ impl From<Error> for PgError {
             Error::ConflictingChanges(_) => PgSqlErrorCode::ERRCODE_DATA_EXCEPTION,
             Error::InvalidParameter(_) => PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
             Error::LimitExceeded(_) => PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+            Error::LoadLimit(_) => PgSqlErrorCode::ERRCODE_CONFIGURATION_LIMIT_EXCEEDED,
+            Error::Unsupported(_) => PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
             Error::Internal(_) => PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
         };
         let mut pg = PgError::new(code, err.message());

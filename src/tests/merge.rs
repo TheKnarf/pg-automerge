@@ -558,6 +558,10 @@ fn heads_fast_path_matches_rust_for_every_storage_form() {
         &[],
     );
     assert_eq!(bad, 0);
+    // The pairwise merges below merge the 3,000,000-character document
+    // into unrelated ones, applying all of its ops as changes (estimated
+    // at 2.9 GB): over the default pg_automerge.max_load_memory.
+    Spi::run("SET LOCAL pg_automerge.max_load_memory = '8GB'").unwrap();
     // The storage forms above really occur.
     let forms: String = one(
         "SELECT string_agg(DISTINCT CASE \

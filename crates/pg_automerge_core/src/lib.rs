@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use automerge::{Automerge, AutomergeError, ChangeHash, ReadDoc};
 
+pub mod budget;
 pub mod encoding;
 pub mod header;
 pub mod history;
@@ -33,7 +34,9 @@ pub use serde_json;
 /// (invalid_text_representation), [`Error::ConflictingChanges`] to 22000
 /// (data_exception), [`Error::InvalidParameter`] to 22023
 /// (invalid_parameter_value), [`Error::LimitExceeded`] to 54000
-/// (program_limit_exceeded) and [`Error::Internal`] to XX000, with
+/// (program_limit_exceeded), [`Error::LoadLimit`] to 53400
+/// (configuration_limit_exceeded), [`Error::Unsupported`] to 0A000
+/// (feature_not_supported) and [`Error::Internal`] to XX000, with
 /// [`Error::message`] as the message, [`Error::detail`] as the DETAIL and
 /// [`Error::hint`] as the HINT.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +59,12 @@ pub enum Error {
     /// A valid document that an output format cannot represent (nesting
     /// deeper than [`json::MAX_DEPTH`] for jsonb).
     LimitExceeded(String),
+    /// Client input (or a merge result) whose estimated load exceeds
+    /// `pg_automerge.max_load_memory` (see [`budget`]).
+    LoadLimit(Box<budget::LimitError>),
+    /// Client input in a form the extension does not accept (Automerge's
+    /// experimental bundle chunks).
+    Unsupported(String),
     /// A broken invariant: a stored value that does not load, or a bug.
     Internal(String),
 }
@@ -71,7 +80,9 @@ impl Error {
             | Error::InvalidParameter(msg)
             | Error::ConflictingChanges(msg)
             | Error::LimitExceeded(msg)
+            | Error::Unsupported(msg)
             | Error::Internal(msg) => msg.clone(),
+            Error::LoadLimit(err) => err.message(),
             Error::MissingDependencies(missing) => {
                 let what = if missing.len() == 1 {
                     "dependency"
@@ -88,7 +99,8 @@ impl Error {
 
     /// Supporting detail, if any: for [`Error::MissingDependencies`] the
     /// missing hashes (at most five, then a count of the others), for
-    /// [`Error::ConflictingChanges`] why they cannot be merged.
+    /// [`Error::ConflictingChanges`] why they cannot be merged, for
+    /// [`Error::LoadLimit`] the estimate and what it counts.
     pub fn detail(&self) -> Option<String> {
         match self {
             Error::MissingDependencies(missing) => {
@@ -99,18 +111,21 @@ impl Error {
                  which cannot be merged."
                     .into(),
             ),
+            Error::LoadLimit(err) => Some(err.detail()),
             _ => None,
         }
     }
 
     /// Advice for the user, if any: for [`Error::ConflictingChanges`] that
-    /// every writer needs its own actor id.
+    /// every writer needs its own actor id, for [`Error::LoadLimit`] who
+    /// can raise the limit.
     pub fn hint(&self) -> Option<&'static str> {
         match self {
             Error::ConflictingChanges(_) => Some(
                 "Each writer must use its own actor id. Automerge picks a random one \
                  for every document instance unless the application sets it.",
             ),
+            Error::LoadLimit(_) => Some(budget::LimitError::hint()),
             _ => None,
         }
     }
@@ -337,20 +352,54 @@ fn load_external(bytes: &[u8]) -> Result<Automerge, Error> {
 /// missing dependencies, and for input that does not survive a save and
 /// load.
 pub fn normalize(bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    guard_input(|| normalize_unguarded(bytes).map(|(_, saved)| saved))
+    guard_input(|| normalize_unguarded(bytes).map(|n| n.saved))
+}
+
+/// A document [`normalize`] built: the document, its stored bytes, and
+/// their counts (see [`budget`]) when a limit was checked.
+pub(crate) struct Normalized {
+    pub(crate) doc: Automerge,
+    pub(crate) saved: Vec<u8>,
+    pub(crate) counts: Option<budget::DocCounts>,
 }
 
 /// [`normalize`], keeping the loaded document: the document and its
 /// stored bytes (checked as `normalize` checks them). Unguarded.
-pub(crate) fn normalize_unguarded(bytes: &[u8]) -> Result<(Automerge, Vec<u8>), Error> {
+///
+/// Before anything is loaded, the input is scanned and its estimated load
+/// checked against [`budget::limit`] ([`Error::LoadLimit`]); bundle chunks
+/// are rejected ([`Error::Unsupported`]). The normalized document must fit
+/// the limit too, so that every stored value fit it when it was written.
+pub(crate) fn normalize_unguarded(bytes: &[u8]) -> Result<Normalized, Error> {
+    let limit = budget::limit();
+    let scanned = match limit {
+        Some(_) => {
+            let counts = budget::scan_input(bytes, limit);
+            budget::check_load(&counts, bytes, limit)?;
+            Some(counts)
+        }
+        None if budget::has_bundle(bytes) => return Err(budget::bundle_error()),
+        None => None,
+    };
     let doc = load_external(bytes)?;
     let saved = doc.save_nocompress();
-    if !loads_as_saved(bytes, &saved) && verification_enabled() {
+    let as_saved = loads_as_saved(bytes, &saved);
+    let counts = match scanned {
+        // The input is the save itself (or inflates to it): its counts.
+        Some(scanned) if as_saved => Some(scanned.first_doc),
+        Some(_) => Some(budget::check_saved(
+            &saved,
+            budget::LimitKind::Normalized,
+            limit,
+        )?),
+        None => None,
+    };
+    if !as_saved && verification_enabled() {
         let mut heads = doc.get_heads();
         heads.sort_unstable();
         reload_check(&saved, &heads, "invalid automerge document")?;
     }
-    Ok((doc, saved))
+    Ok(Normalized { doc, saved, counts })
 }
 
 /// Whether loading `saved` (the `save_nocompress()` of a document loaded
@@ -610,7 +659,7 @@ pub fn contains_changes_by_heads(heads_a: &[ChangeHash], changes: &[u8]) -> Opti
 /// [`contains_changes_by_heads`], extended to a save: input that is
 /// exactly one document chunk with a valid checksum whose header heads are
 /// all heads of `a`, and that passes Automerge's chunk parse
-/// ([`header::document_parses`]), is contained (`Some(true)`; what a load
+/// ([`header::document_parses`], within [`budget::limit`]), is contained (`Some(true)`; what a load
 /// of `a ++ changes` decides, see [`loaded::merge_changes`]). One that
 /// does not parse is left to the loading path, which rejects it. Needs only `a`'s heads, so callers can
 /// answer before they fetch or load `a`.
@@ -644,8 +693,12 @@ pub fn contains_input_by_header(
     }
     let chunk = header::document_chunk(changes)?;
     if is_subset(&chunk.heads, heads_a) {
-        // Only if the chunk parses; otherwise the loading path rejects it.
-        return header::document_parses(changes).then_some(true);
+        // Only if the chunk parses, within the limit; otherwise the
+        // loading path rejects it.
+        let limit = budget::limit();
+        let counts = budget::scan_input(changes, limit);
+        return (counts.single_doc_parses && budget::check_parse(&counts, limit).is_ok())
+            .then_some(true);
     }
     match (chunk.change_count, count_a()) {
         (Some(count), Some(count_a)) if count >= count_a => Some(false),
@@ -698,53 +751,89 @@ enum AccState {
         bytes: Vec<u8>,
         heads: Vec<ChangeHash>,
     },
-    /// A loaded document (boxed: an `Automerge` is large).
-    Loaded {
-        doc: Box<Automerge>,
-        /// The stored bytes of the input the document was loaded from,
-        /// while nothing has been added to it.
-        stored: Option<Vec<u8>>,
-        /// Whether it holds unverified external changes (see
-        /// [`loaded::LoadedDoc`]); the result then does too.
-        unverified: bool,
-    },
+    /// A loaded document.
+    Loaded(AccDoc),
 }
 
-impl AccState {
-    /// A copy of a loaded input as the whole state.
+/// The loaded document of a [`MergeAccumulator`].
+struct AccDoc {
+    /// The document (boxed: an `Automerge` is large).
+    doc: Box<Automerge>,
+    /// The stored bytes of the input the document was loaded from, while
+    /// nothing has been added to it.
+    stored: Option<Vec<u8>>,
+    /// Whether it holds unverified external changes (see
+    /// [`loaded::LoadedDoc`]); the result then does too.
+    unverified: bool,
+    /// What its save describes (see [`budget`]), when known.
+    counts: Option<budget::DocCounts>,
+    /// A save of it made to count it, while nothing has been added.
+    save: Option<Vec<u8>>,
+}
+
+impl AccDoc {
+    /// A copy of a loaded input.
     fn adopt(input: &loaded::LoadedDoc) -> Self {
-        AccState::Loaded {
+        AccDoc {
             doc: Box::new(input.doc().clone()),
             stored: input.cached_stored().map(<[u8]>::to_vec),
             unverified: input.is_unverified(),
+            counts: input.known_counts(),
+            save: None,
         }
     }
 
     /// A document loaded from the stored input `bytes`.
     fn from_stored(doc: Automerge, bytes: Vec<u8>) -> Self {
-        AccState::Loaded {
+        AccDoc {
             doc: Box::new(doc),
             stored: Some(bytes),
             unverified: false,
+            counts: None,
+            save: None,
         }
     }
 
-    /// A document built by merging.
-    fn merged(doc: Automerge, unverified: bool) -> Self {
-        AccState::Loaded {
-            doc: Box::new(doc),
-            stored: None,
-            unverified,
+    /// What its save describes: known, or a scan of its stored bytes (or
+    /// of a save, which is kept).
+    fn counts(&mut self) -> budget::DocCounts {
+        if let Some(counts) = self.counts {
+            return counts;
         }
+        let counts = match &self.stored {
+            Some(bytes) => budget::scan_doc(bytes),
+            None => budget::scan_doc(self.save.get_or_insert_with(|| self.doc.save_nocompress())),
+        };
+        self.counts = Some(counts);
+        counts
     }
 
+    /// Merge `other` into the document, within the limit (the changes to
+    /// apply, then the result, see [`loaded::merge_from`] and
+    /// [`loaded::result_counts`]).
+    fn merge(&mut self, other: &Automerge, other_unverified: bool) -> Result<(), Error> {
+        let limit = budget::limit();
+        let base = limit.map(|_| self.counts());
+        let approx = loaded::merge_from(&mut self.doc, base, other, limit)?;
+        self.stored = None;
+        self.save = None;
+        self.counts = None;
+        self.unverified |= other_unverified;
+        let (counts, save) = loaded::result_counts(&self.doc, approx, limit)?;
+        self.counts = counts;
+        self.save = save;
+        Ok(())
+    }
+}
+
+impl AccState {
     fn unverified(&self) -> bool {
         matches!(
             self,
-            AccState::Loaded {
+            AccState::Loaded(AccDoc {
                 unverified: true,
                 ..
-            }
+            })
         )
     }
 }
@@ -783,9 +872,7 @@ impl MergeAccumulator {
         match &self.state {
             AccState::Empty => Ok(false),
             AccState::Pending { heads: have, .. } => Ok(is_subset(heads, have)),
-            AccState::Loaded {
-                doc, unverified, ..
-            } => guard_for(*unverified, || Ok(has_all(doc, heads))),
+            AccState::Loaded(acc) => guard_for(acc.unverified, || Ok(has_all(&acc.doc, heads))),
         }
     }
 
@@ -810,7 +897,7 @@ impl MergeAccumulator {
                     heads: sorted_stored_heads(bytes)?,
                 };
             }
-            (AccState::Empty, Loaded(input)) => self.state = AccState::adopt(input),
+            (AccState::Empty, Loaded(input)) => self.state = AccState::Loaded(AccDoc::adopt(input)),
             (
                 AccState::Pending {
                     bytes: first,
@@ -837,20 +924,22 @@ impl MergeAccumulator {
                 if bytes.len() > first.len() {
                     let doc = load_stored_unguarded(bytes)?;
                     if has_all(&doc, first_heads) {
-                        self.state = AccState::from_stored(doc, bytes.to_vec());
+                        self.state = AccState::Loaded(AccDoc::from_stored(doc, bytes.to_vec()));
                         return Ok(());
                     }
-                    let mut target = load_stored_unguarded(first)?;
-                    loaded::merge_from(&mut target, &doc)?;
-                    self.state = AccState::merged(target, false);
+                    let mut target =
+                        AccDoc::from_stored(load_stored_unguarded(first)?, std::mem::take(first));
+                    target.merge(&doc, false)?;
+                    self.state = AccState::Loaded(target);
                 } else {
-                    let mut target = load_stored_unguarded(first)?;
-                    if has_all(&target, &heads) {
-                        self.state = AccState::from_stored(target, std::mem::take(first));
+                    let mut target =
+                        AccDoc::from_stored(load_stored_unguarded(first)?, std::mem::take(first));
+                    if has_all(&target.doc, &heads) {
+                        self.state = AccState::Loaded(target);
                         return Ok(());
                     }
-                    loaded::merge_from(&mut target, &load_stored_unguarded(bytes)?)?;
-                    self.state = AccState::merged(target, false);
+                    target.merge(&load_stored_unguarded(bytes)?, false)?;
+                    self.state = AccState::Loaded(target);
                 }
             }
             (
@@ -864,52 +953,43 @@ impl MergeAccumulator {
                     return Ok(());
                 }
                 if has_all(input.doc(), first_heads) {
-                    self.state = AccState::adopt(input);
+                    self.state = AccState::Loaded(AccDoc::adopt(input));
                     return Ok(());
                 }
-                let mut target = load_stored_unguarded(first)?;
-                if has_all(&target, input.heads()) {
-                    self.state = AccState::from_stored(target, std::mem::take(first));
+                let mut target =
+                    AccDoc::from_stored(load_stored_unguarded(first)?, std::mem::take(first));
+                if has_all(&target.doc, input.heads()) {
+                    self.state = AccState::Loaded(target);
                     return Ok(());
                 }
-                loaded::merge_from(&mut target, input.doc())?;
-                self.state = AccState::merged(target, input.is_unverified());
+                target.merge(input.doc(), input.is_unverified())?;
+                self.state = AccState::Loaded(target);
             }
-            (AccState::Loaded { doc, stored, .. }, Stored(bytes)) => {
-                if stored.as_deref() == Some(bytes) {
+            (AccState::Loaded(acc), Stored(bytes)) => {
+                if acc.stored.as_deref() == Some(bytes) {
                     return Ok(());
                 }
                 // Read the heads from the header first: an input that adds
                 // nothing is then never loaded.
-                if has_all(doc, &stored_heads_unguarded(bytes)?) {
+                if has_all(&acc.doc, &stored_heads_unguarded(bytes)?) {
                     return Ok(());
                 }
                 let other = load_stored_unguarded(bytes)?;
-                if has_all(&other, &doc.get_heads()) {
-                    self.state = AccState::from_stored(other, bytes.to_vec());
+                if has_all(&other, &acc.doc.get_heads()) {
+                    self.state = AccState::Loaded(AccDoc::from_stored(other, bytes.to_vec()));
                     return Ok(());
                 }
-                loaded::merge_from(doc, &other)?;
-                *stored = None;
+                acc.merge(&other, false)?;
             }
-            (
-                AccState::Loaded {
-                    doc,
-                    stored,
-                    unverified,
-                },
-                Loaded(input),
-            ) => {
-                if has_all(doc, input.heads()) {
+            (AccState::Loaded(acc), Loaded(input)) => {
+                if has_all(&acc.doc, input.heads()) {
                     return Ok(());
                 }
-                if has_all(input.doc(), &doc.get_heads()) {
-                    self.state = AccState::adopt(input);
+                if has_all(input.doc(), &acc.doc.get_heads()) {
+                    self.state = AccState::Loaded(AccDoc::adopt(input));
                     return Ok(());
                 }
-                loaded::merge_from(doc, input.doc())?;
-                *stored = None;
-                *unverified |= input.is_unverified();
+                acc.merge(input.doc(), input.is_unverified())?;
             }
         }
         Ok(())
@@ -927,18 +1007,19 @@ impl MergeAccumulator {
         Ok(Some(match &self.state {
             AccState::Empty => return Ok(None),
             AccState::Pending { bytes, .. }
-            | AccState::Loaded {
+            | AccState::Loaded(AccDoc {
                 stored: Some(bytes),
                 ..
-            } => Accumulated::Stored(bytes),
-            AccState::Loaded {
-                doc,
-                stored: None,
-                unverified,
-            } => Accumulated::Loaded(Box::new(loaded::LoadedDoc::from_doc(
-                Automerge::clone(doc),
-                *unverified,
-            )?)),
+            }) => Accumulated::Stored(bytes),
+            AccState::Loaded(acc) => {
+                let doc = guard_stored(|| Ok(Automerge::clone(&acc.doc)))?;
+                Accumulated::Loaded(Box::new(loaded::LoadedDoc::from_parts(
+                    doc,
+                    acc.unverified,
+                    acc.counts,
+                    acc.save.clone(),
+                )))
+            }
         }))
     }
 }

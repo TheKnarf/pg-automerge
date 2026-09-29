@@ -34,9 +34,19 @@ mod notify;
 /// docs/DESIGN.md, "Invariants" and "The deferred verification").
 static VERIFY_WRITES: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 
+/// The default of `pg_automerge.max_load_memory`, in kB: 2 GB.
+const MAX_LOAD_MEMORY_DEFAULT_KB: i32 = 2 * 1024 * 1024;
+
+/// `pg_automerge.max_load_memory`: the largest estimated memory, in kB, a
+/// load of client input (or a merge result) may take; -1 for no limit
+/// (see docs/DESIGN.md, "Resource limits").
+static MAX_LOAD_MEMORY: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(MAX_LOAD_MEMORY_DEFAULT_KB);
+
 /// Library initialization: let the core's long loops (the jsonb walk,
-/// history rows) honour query cancel and `statement_timeout`, and define
-/// the `pg_automerge.verify_writes` setting.
+/// history rows, the input scan) honour query cancel and
+/// `statement_timeout`, and define the `pg_automerge.verify_writes` and
+/// `pg_automerge.max_load_memory` settings.
 #[pgrx::pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     pg_automerge_core::set_interrupt_check(check_for_interrupts);
@@ -53,11 +63,35 @@ pub extern "C-unwind" fn _PG_init() {
         pgrx::GucFlags::default(),
     );
     pg_automerge_core::set_verification_check(verify_writes);
+    pgrx::GucRegistry::define_int_guc(
+        c"pg_automerge.max_load_memory",
+        c"Largest estimated memory a load of client input or a merge result may take.",
+        c"Automerge input is compressed and run-length encoded, so a few bytes can describe a \
+          document that takes gigabytes to load, and a failed allocation restarts the server. \
+          Every value built from client bytes (input, the bytea cast, merge with a bytea) and \
+          every merge result is priced from its headers before Automerge allocates, and \
+          rejected (53400) when the estimate exceeds this. Loading stored values is never \
+          limited. -1 means no limit. Superuser-only.",
+        &MAX_LOAD_MEMORY,
+        -1,
+        i32::MAX,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::UNIT_KB,
+    );
+    pg_automerge_core::budget::set_limit_source(max_load_memory);
 }
 
 /// The current value of `pg_automerge.verify_writes`.
 fn verify_writes() -> bool {
     VERIFY_WRITES.get()
+}
+
+/// The current value of `pg_automerge.max_load_memory`, in bytes (`None`:
+/// no limit).
+fn max_load_memory() -> Option<u64> {
+    u64::try_from(MAX_LOAD_MEMORY.get())
+        .ok()
+        .map(|kb| kb.saturating_mul(1024))
 }
 
 /// `CHECK_FOR_INTERRUPTS()`. An interrupt raises an ERROR, which unwinds
