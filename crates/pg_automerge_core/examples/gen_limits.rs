@@ -27,6 +27,12 @@
 //! - `columns.bin`: a compressed change chunk of about 24 kB whose column
 //!   metadata lists 12,000,000 empty columns: Automerge's parse keeps
 //!   every entry in doubling vectors (about 2 GB).
+//! - `deep_block.bin`: `Automerge.save()` of {status: "deep", body: a
+//!   text "x" after a block whose map holds maps and lists nested 5,000
+//!   levels deep} (under 30 kB): Automerge's recursive rendering of that
+//!   block needs about 65 MB of stack (docs/DESIGN.md, "Deep blocks").
+//!   `deep_changes.bin`: the same document as change chunks
+//!   (`save_after([])`), for merges into an existing value.
 //! - `small.bin`: an ordinary small document.
 
 use std::path::PathBuf;
@@ -81,6 +87,23 @@ fn main() {
         craft::compressed_change_columns(12_000_000),
     )
     .unwrap();
+
+    let mut deep = AutoCommit::new().with_actor(ActorId::from([3u8; 16]));
+    deep.put(ROOT, "status", "deep").unwrap();
+    let body = deep.put_object(ROOT, "body", ObjType::Text).unwrap();
+    deep.splice_text(&body, 0, 0, "x").unwrap();
+    let mut obj = deep.split_block(&body, 0).unwrap();
+    for i in 1..5_000 {
+        obj = if i % 2 == 0 {
+            deep.put_object(&obj, "m", ObjType::Map).unwrap()
+        } else {
+            let list = deep.put_object(&obj, "l", ObjType::List).unwrap();
+            deep.insert_object(&list, 0, ObjType::Map).unwrap()
+        };
+    }
+    deep.commit();
+    std::fs::write(dir.join("deep_block.bin"), deep.save()).unwrap();
+    std::fs::write(dir.join("deep_changes.bin"), deep.save_after(&[])).unwrap();
 
     let mut small = AutoCommit::new().with_actor(ActorId::from([2u8; 16]));
     small.put(ROOT, "status", "small").unwrap();

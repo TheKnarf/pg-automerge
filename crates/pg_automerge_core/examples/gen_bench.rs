@@ -1,14 +1,16 @@
 //! Prints SQL that loads the fixtures of tests/bench_expanded.sh and
-//! tests/bench_sql.sh: three documents of different shapes and sizes
-//! (`bench_doc`), and for each a chain of small incremental change sets
-//! (`bench_changes`, change `i` builds on change `i - 1`, as a backend
-//! persisting edit by edit sends them) plus concurrent forks
-//! (`bench_forks`, full saves of the base with one extra change each, for
-//! `merge_agg`), each document's compressed save as `bytea`
-//! (`bench_saves`, for timing writes), and a newer version as a backend
-//! sends it (`bench_newer`: the base loaded from its save plus one change
-//! by another actor, ROOT "status" = "edited", as a compressed full save
-//! `save` and as the changes since the base, `save_after(base heads)`).
+//! tests/bench_sql.sh: four documents of different shapes and sizes
+//! (`bench_doc`; `rich20k`, a rich text of 20,000 paragraphs after
+//! blocks, is timed only when BENCH_DOCS names it), and for each a chain
+//! of small incremental change sets (`bench_changes`, change `i` builds on
+//! change `i - 1`, as a backend persisting edit by edit sends them) plus
+//! concurrent forks (`bench_forks`, full saves of the base with one extra
+//! change each, for `merge_agg`), each document's compressed save as
+//! `bytea` (`bench_saves`, for timing writes), and a newer version as a
+//! backend sends it (`bench_newer`: the base loaded from its save plus one
+//! change by another actor, ROOT "status" = "edited", as a compressed full
+//! save `save` and as the changes since the base, `save_after(base
+//! heads)`).
 
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, ROOT};
@@ -17,7 +19,7 @@ use pg_automerge_core::encoding::to_hex_literal;
 #[path = "shared/bench_docs.rs"]
 mod bench_docs;
 
-use bench_docs::{big_text, structured};
+use bench_docs::{big_text, rich_text, structured};
 
 const CHANGES: usize = 20;
 const FORKS: usize = 8;
@@ -34,6 +36,7 @@ fn main() {
         ("text3mb", big_text()),
         ("items20k", structured(20_000)),
         ("items2k", structured(2_000)),
+        ("rich20k", rich_text(20_000)),
     ] {
         // The compressed save a backend sends (`Automerge.save()`), stored
         // as bytea so the benchmark can time its validation.

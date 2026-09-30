@@ -276,3 +276,20 @@ pub fn chunk(chunk_type: u8, data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(data);
     out
 }
+
+/// The stack of [`on_small_stack`]'s thread: far below what any recursion
+/// once per level of the deep documents of the tests needs, above what
+/// every entry point needs on shallow ones (in a debug build).
+pub const SMALL_STACK: usize = 1 << 20;
+
+/// Run `f` on a thread with a [`SMALL_STACK`] stack. A recursion as deep
+/// as a test document overflows it: the test process aborts ("has
+/// overflowed its stack"), a failure.
+pub fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(SMALL_STACK)
+        .spawn(f)
+        .expect("spawn a thread")
+        .join()
+        .expect("the thread finished")
+}

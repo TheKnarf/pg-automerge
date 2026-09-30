@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use automerge::{Automerge, AutomergeError, ChangeHash, ReadDoc};
 
+pub mod blocks;
 pub mod budget;
 pub mod encoding;
 pub mod header;

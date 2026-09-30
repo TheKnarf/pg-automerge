@@ -28,8 +28,8 @@
 # image (tests/docker_bench.sh).
 #
 # Env: see tests/lib.sh; also BENCH_DOCS (default "items20k text3mb"; also
-# items2k), BENCH_REPS, BENCH_CASES (a grep -E pattern on the case ids,
-# default all), BENCH_REUSE=1 (keep the database of a previous run),
+# items2k, rich20k), BENCH_REPS, BENCH_CASES (a grep -E pattern on the case
+# ids, default all), BENCH_REUSE=1 (keep the database of a previous run),
 # BENCH_NO_INSTALL=1 (use the installed build as is), BENCH_SETTINGS (SQL
 # run first in every session, e.g. "SET pg_automerge.verify_writes = off").
 

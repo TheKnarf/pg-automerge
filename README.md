@@ -512,8 +512,11 @@ where JavaScript gives `Date`, `Uint8Array`, a `number` or a `BigInt`
 (beyond ±(2^53−1), and always for unsigned integers), and a `Counter` for
 a counter in a block. There are no positions in the result;
 a block counts as one character in the text's indices. Blocks nested more
-than 32 levels deep are refused (54000). Details in
-[DESIGN.md](docs/DESIGN.md#rich-text-spans).
+than 32 levels deep are refused (54000) by `automerge_spans`, whose
+rendering of them would overflow the stack; the jsonb view and every
+other function read such documents as usual (the jsonb view never renders
+blocks). Details in [DESIGN.md](docs/DESIGN.md#rich-text-spans) and
+[Deep blocks](docs/DESIGN.md#deep-blocks).
 
 ## Configuration
 

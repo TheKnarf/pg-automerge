@@ -122,10 +122,8 @@ fn automerge_from_bytea(bytes: &[u8]) -> AutomergeValue {
 #[pg_extern(immutable, strict, parallel_safe)]
 fn automerge_to_jsonb(doc: AutomergeArg) -> JsonbDatum {
     let mut jsonb = JsonbBuilder::default();
-    doc.with_input(|input| {
-        loaded::with_doc(input, |doc| am::json::write_json_at(doc, None, &mut jsonb))
-    })
-    .or_raise();
+    doc.with_input(|input| loaded::write_json(input, &mut jsonb))
+        .or_raise();
     jsonb.finish().unwrap_or_else(|| {
         raise(Error::Internal(
             "automerge to jsonb: incomplete result".into(),

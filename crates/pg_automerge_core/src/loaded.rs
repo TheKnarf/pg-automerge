@@ -61,6 +61,9 @@ pub struct LoadedDoc {
     /// uses instead of saving again (still with the check of an
     /// unverified document).
     save: RefCell<Option<Vec<u8>>>,
+    /// Whether `doc` has blocks ([`crate::blocks::has_blocks`]), once
+    /// known.
+    blocks: OnceCell<bool>,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -87,6 +90,7 @@ impl LoadedDoc {
             unverified,
             counts: OnceCell::new(),
             save: RefCell::new(None),
+            blocks: OnceCell::new(),
         }
     }
 
@@ -122,6 +126,21 @@ impl LoadedDoc {
             let mut save = self.save.borrow_mut();
             let saved = save.get_or_insert_with(|| self.doc.save_nocompress());
             budget::scan_doc(saved)
+        })
+    }
+
+    /// Whether the document has blocks ([`crate::blocks::has_blocks`]),
+    /// read from its stored bytes, or from a save of it when they are not
+    /// computed yet (that save is kept, as in [`LoadedDoc::counts`]).
+    /// Unguarded.
+    pub(crate) fn has_blocks(&self) -> bool {
+        *self.blocks.get_or_init(|| {
+            if let Some(bytes) = self.stored.get() {
+                return crate::blocks::has_blocks(&self.doc, Some(bytes));
+            }
+            let mut save = self.save.borrow_mut();
+            let saved = save.get_or_insert_with(|| self.doc.save_nocompress());
+            crate::blocks::has_blocks(&self.doc, Some(saved))
         })
     }
 
@@ -294,6 +313,16 @@ impl<'a> Input<'a> {
     /// load.
     pub fn heads(&self) -> Result<Cow<'a, [ChangeHash]>, Error> {
         guard_stored(|| self.heads_unguarded())
+    }
+
+    /// Whether the document (`doc`, loaded from this input) has blocks
+    /// ([`crate::blocks::has_blocks`]): from the stored bytes, or the
+    /// loaded document's cached answer. Unguarded.
+    pub(crate) fn has_blocks(&self, doc: &Automerge) -> bool {
+        match self {
+            Input::Stored(bytes) => crate::blocks::has_blocks(doc, Some(bytes)),
+            Input::Loaded(loaded) => loaded.has_blocks(),
+        }
     }
 
     /// The number of changes: read from the change actor column of a
@@ -890,6 +919,24 @@ pub fn contains(a: Input<'_>, b: Input<'_>) -> Result<bool, Error> {
 /// [`Error::Internal`] if a stored `a` does not load.
 pub fn contains_heads(a: Input<'_>, heads: &[ChangeHash]) -> Result<bool, Error> {
     with_doc(a, |doc| Ok(has_all(doc, heads)))
+}
+
+/// Write the current state of `input` into `sink` as JSON
+/// ([`crate::json::write_json_at`]), with blocks looked for in the stored
+/// bytes at hand (a loaded document without them is saved once, and the
+/// save kept) rather than in a new save.
+///
+/// # Errors
+///
+/// As [`crate::json::write_json_at`]; [`Error::Internal`] if a stored
+/// value does not load.
+pub fn write_json<S: crate::json::JsonSink + ?Sized>(
+    input: Input<'_>,
+    sink: &mut S,
+) -> Result<(), Error> {
+    with_doc(input, |doc| {
+        crate::json::write_json_checked(doc, None, input.has_blocks(doc), sink)
+    })
 }
 
 /// Run `f` on the document of `input`: in place when loaded, otherwise

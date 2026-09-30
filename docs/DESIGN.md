@@ -1159,7 +1159,8 @@ Postgres errors inside those calls unwind through the walk untouched (see
 [Errors and panics](#errors-and-panics)).
 
 The walk makes one sweep over the document with Automerge's document
-iterator (`ReadDoc::iter_at`), buffering each object's visible entries
+iterator (`ReadDoc::iter_at`), unless the document has blocks (maps
+inside a text; see [Deep blocks](#deep-blocks)), buffering each object's visible entries
 (borrowed from the document), then emits them depth first from the root.
 The entries of all maps and lists go to one vector (the iterator yields an
 object's items together, so each object's entries are one range of it),
@@ -1171,12 +1172,15 @@ sorts only if it ever does not hold. One sweep avoids setting up a `map_range`/`
 (about 5 µs each). Text comes from the sweep's spans: string runs, and
 U+FFFC for each block marker, which is exactly what `text()` returns (both
 emit U+FFFC for anything in a text that is not a string and nothing for
-marks). The previous per-object walk (`json::write_json_per_object`) is
-kept for documents with legacy `Table` objects, which the sweep would read
-as lists, and as the reference: a core test checks that both emit exactly
-the same events for current and historical states of generated documents,
-text with blocks, marks and non-string elements, unreachable objects,
-conflicts and deep nesting.
+marks). The per-object walk (`json::write_json_per_object`: a
+`map_range` / `list_range` per object, `text()` per text) is taken for
+documents with blocks, which the document iterator renders recursively
+(see [Deep blocks](#deep-blocks)), and for documents with legacy `Table`
+objects, which the sweep would read as lists; it is also the reference:
+a core test checks that both walks, and the choice between them, emit
+exactly the same events for current and historical states of generated
+documents, text with blocks, marks and non-string elements, unreachable
+objects, conflicts and deep nesting.
 
 Nesting is capped at 1000 levels (error `54000` program_limit_exceeded,
 like jsonb's own size limits): the walk itself uses an explicit stack, but
@@ -1306,7 +1310,7 @@ level of nesting inside the block and needs about 13 kB of stack per
 level in a release build: a block holding maps nested a few hundred
 levels deep (a document of about 2 kB) overflows the backend's 8 MB stack
 inside `spans()`, a crash (a segfault restarts the cluster) that no guard
-can catch. So before `spans()` is called, every block of the text is
+can catch (see [Deep blocks](#deep-blocks) for the other paths). So before `spans()` is called, every block of the text is
 found without hydrating (one `list_range` over the text, as of the heads;
 the map objects among its elements are the blocks) and its depth is
 measured with an iterative walk: a block nested more than 32 levels deep
@@ -1351,6 +1355,136 @@ order); `src/tests/spans.rs` covers the SQL side
 (paths against `#>`, `22023` messages, heads errors, NULLs, expanded
 values, the labels and the depth error); the regress example shows the
 output.
+
+### Deep blocks
+
+A block is a map inside a text object (`splitBlock` in JavaScript). Its
+value can hold further maps and lists, nested as deep as the writer
+likes: the regress fixture `deep_block` holds a block nested 2,000
+levels deep in 4 kB, and nothing in Automerge or in the input checks
+refuses it. Automerge renders a block's value with `hydrate`, which
+recurses once per level and takes about 13 kB of stack per level in a
+release build, so such a block overflows the backend's 8 MB stack
+wherever Automerge renders it: a segfault, which no guard catches and
+after which the postmaster restarts every session. Automerge renders blocks in two places:
+
+- its span iterator (`ReadDoc::spans` / `spans_at`), for every block of
+  the text: `automerge_spans` checks the depth of every block first
+  (54000, see [Rich text spans](#rich-text-spans));
+- its document iterator (`ReadDoc::iter_at`), whose items for a text are
+  that text's spans. Until 2026-09-30 the jsonb walk used it for every
+  document, so `doc::jsonb` / `automerge_to_jsonb` (both overloads) and
+  everything built on them (`->`, `->>`, a stored generated `doc::jsonb`
+  column, an expression index, which crashed the INSERT that stored such
+  a value) crashed the backend. A text maps to a string in which a block
+  is U+FFFC, so the walk never needed the rendered blocks at all.
+
+**The audit.** Every path that could recurse in proportion to a
+document's structure, for every SQL function:
+
+| Path | Automerge calls | Recursion per level |
+|---|---|---|
+| input (`automerge_in`, `automerge_recv`, the `bytea` cast), `automerge_out` / `automerge_send` | `load`, `load_incremental`, `save_nocompress`, the save-and-load check | none |
+| `doc::jsonb`, `automerge_to_jsonb(doc[, heads])`, `->`, `->>` | the walk: `iter_at` (sweep), or `map_range` / `list_range` / `text()` (per object); `get_missing_deps`, clocks for heads | `iter_at` renders blocks (fixed below); the rest none. The walks keep their own stack; nesting deeper than 1000 levels is 54000 before `convertToJsonb` (which recurses, with Postgres' `check_stack_depth`) |
+| `automerge_spans` | `get`, `list_range`, `map_range`, then `spans()` | `spans()` renders blocks: only after the depth check (32 levels); the conversion of the rendered blocks recurses at most as deep |
+| `automerge_changes`, `_meta`, `_bytes`, `automerge_get_change`, `automerge_change_count` | `get_changes`, `get_changes_meta`, `save_after`, `get_change_by_hash` | none |
+| `merge`, `\|\|`, `merge(automerge, bytea)`, `merge_agg`, `automerge_contains` (both) | `get_changes_added`, `apply_changes`, `load_incremental`, `Automerge::merge`, `get_heads`, `get_missing_deps` | none |
+| `automerge_heads`, `automerge_notify` | the chunk header, or `get_heads` | none |
+
+Found by reading Automerge 0.12.0 (`hydrate_map` / `hydrate_list` are its
+only recursions over document structure; they are called by the span
+export of both iterators, which the extension reaches only as described
+above, and by `ReadDoc::hydrate`, `Automerge::rescue` and `text_diff`
+(`update_text`, `update_spans`), which it does not call) and checked by
+measurement: `crates/pg_automerge_core/tests/deep_structures.rs` runs
+every core entry point behind these functions
+(normalize of a save, a compressed save and change chunks, loads, the
+jsonb walks current and as of heads, spans, the history functions,
+merges both ways stored and loaded, `merge(automerge, bytea)`,
+containment, the `merge_agg` accumulator, saves of the results) on
+documents nested 20,000 levels deep (maps; lists; a block holding maps;
+a block holding lists of maps; texts in blocks in texts) and on a
+history of 20,000 changes, on a thread with a 1 MB stack, which any
+recursion of more than about 50 bytes per level overflows. Before the
+fix the jsonb walks overflowed it on both block shapes; everything else
+passes it (in a release build, everything else also passes on a 128 kB
+stack at that depth, while the jsonb walks overflowed 1 MB).
+
+**The fix.** The walk takes the per-object walk for any document that
+has, or ever had, a block: Automerge's `text()`, `map_range` and
+`list_range` do not render blocks, and the per-object walk already gave
+exactly the sweep's output. Whether a document has blocks is read from
+its stored bytes (`blocks::has_blocks`): the objects in which an op makes
+a map, found run by run in the object and action columns of the
+document chunk (`budget::any_map_parent`; ops are sorted by object, so
+it costs about one step per run), each looked up in the loaded document
+for its type (a text: blocks) until the first text. Deleted and
+overwritten ops count too, so the answer holds for every historical
+state. Bytes that are not one readable document chunk (never a stored
+value) answer "has blocks", the safe side: the per-object walk gives the
+same result. An expanded value without stored bytes yet (a merge result)
+is saved once for this, and the save is kept as its stored bytes, which
+it needs when it is written anyway; its answer is cached with it.
+
+Cost (`mise run bench-core`, release build, medians): the check takes
+1.1 ms on `items20k` (877 kB, 20,000 small maps in a list, so a single
+object holds map-making ops), 0.1 ms on `items2k`, nothing measurable on
+`text3mb` and `typed5k`, and stops at the first text on `rich20k`; a
+read of `items20k` loads for 158 ms and walks for 65 ms. Documents with
+blocks gain: the walk of `rich20k` (20,000 paragraphs, each after a
+block) takes 15 ms instead of 917 ms, because the document iterator
+rendered every block, and visited every block's contents, for nothing.
+See [the benchmarks](#deep-blocks-2026-09-30).
+
+**Not rejected on input.** Deep blocks are still accepted by the input
+functions and merges:
+
+- With the fix, every function reads such a document: the jsonb view,
+  generated columns and indexes, history, merges, containment, output.
+  Only `automerge_spans` of the very text that holds the deep block is
+  refused (54000), and the rest of the document's spans are readable.
+- They are valid Automerge documents that any client can write, and
+  that the other clients of the document merge. Refusing them at input
+  would make a row unwritable as soon as one client's document holds
+  one (every later full save or change set of that document would fail),
+  would break the restore of dumps whose values were stored before
+  (restore goes through the input function), and would cost every write
+  a walk of every block.
+
+**No `check_stack_depth` calls.** What recursion is left in the
+extension's own code is bounded: the conversion of rendered blocks in
+`automerge_spans` (at most 32 levels, checked before Automerge renders
+them), and dropping those rendered values (as deep). The jsonb walks and
+the depth check use explicit stacks, and jsonb's own recursion
+(`convertToJsonb`) checks the stack itself. A check before calling into
+Automerge would not help: how deep Automerge recurses is decided inside
+it, which is why the fix keeps such calls away from deep structures.
+
+**Upgrading.** No SQL object changed, so the fix needs only the new
+library (no version bump, no `ALTER EXTENSION`), and the jsonb result of
+every document is unchanged (expression indexes and generated columns
+stay valid). Values stored by earlier builds read normally with it,
+including documents whose jsonb view crashed those builds (a table
+without a jsonb generated column or expression index could store them).
+
+Tests: `crates/pg_automerge_core/tests/blocks.rs` (the block check against
+a scan of every change's ops over generated documents with and without
+blocks, blocks that were deleted, blocks in nested texts, compressed
+saves and saves made on the spot, bytes that are not one document chunk,
+and the reads of stored, loaded and merged values against the per-object
+walk on a small stack), `tests/deep_structures.rs` (above),
+`tests/json_walk.rs` (the sweep and the choice against the per-object
+walk); pg_tests in `src/tests/blocks.rs` (a 5,000-level block: a stored
+generated `doc::jsonb` column, a GIN and a B-tree expression index,
+`doc::jsonb` of stored, expanded and merged values, `merge_agg`,
+`automerge_to_jsonb` as of heads, `->>`, updates, and every other
+function; `automerge_spans` still 54000); the regress example (the cast,
+a generated column and `automerge_to_jsonb` of the 2,000-level
+`deep_block` fixture); `tests/limits.sh` step 3 (a 5,000-level block
+stored, merged and read through every path on a scratch cluster with an
+8 MB stack, and no backend terminated by a signal; the build before the
+fix segfaults there on the INSERT) and the same checks in the Docker
+image (`tests/docker.sh`).
 
 ## Resource limits
 
@@ -2133,11 +2267,14 @@ What costs a load, per call:
   change count against the loaded change graph), `loaded.rs` (loaded
   documents are byte-identical to the flat path), `memory_bounds.rs` (the
   load memory limit: measured peaks against the estimate, see
-  [Resource limits](#resource-limits)). `common/` holds the
+  [Resource limits](#resource-limits)), `blocks.rs` and
+  `deep_structures.rs` (the block check, and every entry point on
+  documents nested 20,000 levels deep on a 1 MB stack, see
+  [Deep blocks](#deep-blocks)). `common/` holds the
   random-history generator and stored-bytes wrappers around the
   `Input`-based API.
 - `#[pg_test]`s (`cargo pgrx test pg18`) for SQL behaviour, in
-  `src/tests/{io,merge,history,notify,expanded,hardening,loads,spans}.rs`
+  `src/tests/{io,merge,history,notify,expanded,hardening,loads,spans,blocks}.rs`
   (`loads.rs` counts the `Automerge::load` calls of each write path and of
   `automerge_contains`, and
   covers the release of the cast's expanded values and the
@@ -2191,7 +2328,9 @@ What costs a load, per call:
   superuser-only.
 - `tests/limits.sh` (`mise run limits`, part of `mise run test`): the load
   memory limit against a real crash, in a scratch cluster whose address
-  space is capped (see [Resource limits](#resource-limits)). In its
+  space is capped (see [Resource limits](#resource-limits)), and a
+  document with a block nested 5,000 levels deep read through every path
+  there without a crash (see [Deep blocks](#deep-blocks)). In its
   container mode (`LIMITS_CONTAINER`, used by `tests/docker.sh`) the
   capped server is a container of the Docker image started with
   `--memory` (see [Docker image](#docker-image)).
@@ -2208,7 +2347,9 @@ What costs a load, per call:
   idempotent), `merge(automerge, bytea)` results load back with their
   heads, the load memory scan never takes input Automerge loads for
   unparseable, and `normalize`'s peak (a counting allocator) stays below
-  the estimate, also when Automerge refuses the input. The seeds include
+  the estimate, also when Automerge refuses the input; the block check
+  (see [Deep blocks](#deep-blocks)) never panics on any of the bytes, and
+  answers for a stored value as for a save of its loaded document. The seeds include
   change chunks whose header lists repeat entries. 1,500 inputs per `cargo test`; `mise run fuzz` runs 200,000 (or
   `FUZZ_ITERS`) and can save findings (`FUZZ_SAVE_DIR`) for
   `tests/corpus/`, which runs first. In 300,000 inputs it caught 4,903
@@ -2221,15 +2362,16 @@ What costs a load, per call:
   [The deferred verification](#the-deferred-verification)).
 - `tests/spans.rs`: `automerge_spans` against Automerge's own spans (see
   [Rich text spans](#rich-text-spans)).
-- `tests/json_walk.rs`: the one-sweep jsonb walk against the per-object
-  walk; `tests/normalize.rs`: the compressed-input shortcut against the
+- `tests/json_walk.rs`: the one-sweep jsonb walk, and the choice between
+  the walks, against the per-object walk; `tests/normalize.rs`: the compressed-input shortcut against the
   full check; `tests/interrupts.rs`: the interrupt hook runs in the loops
   and its errors pass the guard; `tests/format_fixtures.rs`: values saved
   by every shipped automerge version (see
   [Versioning and upgrades](#versioning-and-upgrades)).
 - `tests/bench_expanded.sh` (`mise run bench-expanded`, not part of
   `mise run test`) installs a release build and times the SQL workloads
-  of [Performance](#performance) on three generated documents;
+  of [Performance](#performance) on three generated documents (and a
+  rich text, `rich20k`, when `BENCH_DOCS` names it);
   `tests/bench_sql.sh` (`mise run bench-sql`) times the everyday paths
   (reads, inserts, the merge and upsert forms of a write, `merge_agg`,
   `automerge_contains`) one statement at
@@ -3451,3 +3593,58 @@ own work (detoasting, `palloc`, the executor), which the assertions and
 the memory randomization slow down. The earlier sections' conclusions
 hold on a production build; their millisecond-scale absolute numbers
 are about twice what a production server shows.
+
+### Deep blocks (2026-09-30)
+
+The jsonb walk before and after it skips Automerge's document iterator
+for documents with blocks (see [Deep blocks](#deep-blocks)); release
+builds of the previous commit (555110e) and this one, interleaved.
+
+The crash: the Docker image of 0.1.0 built before `automerge_spans`
+(the one the reported crash came from) segfaults on
+`INSERT INTO t (doc) VALUES (:'deep_block')` into a table with a stored
+generated `doc::jsonb` column (the regress fixture: 2,000 levels, 4 kB);
+so did `tests/limits.sh` step 3 with the previous commit's library, on
+its 5,000-level input. With this commit both pass.
+
+`mise run bench-core` (five rounds, each binary's median of 5; the
+median of the rounds, ms; "walk" is the sweep before and the checked
+walk, block check included, after):
+
+| doc | load (untouched) | block check | walk before | walk after | per-object walk |
+|---|---|---|---|---|---|
+| text3mb | 2498 / 2670 | 0.0 | 252.8 | 249.9 | 193.0 |
+| items20k | 157.6 / 159.6 | 1.1 | 64.4 | 66.4 | 146.7 |
+| items2k | 15.4 / 15.6 | 0.1 | 5.6 | 5.8 | 13.5 |
+| typed5k | 21.6 / 22.7 | 0.0 | 0.4 | 0.4 | 0.3 |
+| rich20k | 368.4 / 381.1 | 0.0 | 917.2 | 15.1 | 15.1 |
+
+The load, which this commit does not touch, differs by up to 7% between
+the two binaries: code layout. The walk after costs the sweep plus the
+check (items20k: 65.5 ms for the new binary's own sweep, 66.4 ms checked).
+
+`mise run bench-sql` read paths (R1: `doc->>'status'`, R2: three
+accessors, R3: `automerge_heads`; five interleaved rounds of 5, the
+median of the rounds, ms), and R1 again (six rounds of 9):
+
+| case | doc | before | after |
+|---|---|---|---|
+| R1 | items20k (877 kB) | 263 | 262 (-0.4%); again 266 → 264.5 (-0.6%) |
+| R1 | text3mb (3 MB) | 2839 | 2902 (+2.2%); again 2878.5 → 2887 (+0.3%) |
+| R1 | items2k (83 kB) | 28 | 28 |
+| R1 | rich20k (1.7 MB) | 1332 | 424 (-68%) |
+| R2 | items20k | 796 | 776 (-2.5%) |
+| R2 | text3mb | 8567 | 8625 (+0.7%) |
+| R2 | items2k | 78 | 77 |
+| R2 | rich20k | 4004 | 1235 (-69%) |
+| R3 | all | 0.4-0.5 | 0.4-0.6 (no load, no walk) |
+
+Merge results read as jsonb (expanded values without stored bytes, which
+are saved once for the check; five interleaved rounds, each the median of
+7, ms): `merge(doc, c1)::jsonb->>'status'` items20k 263.5 → 260.9, items2k
+26.1 → 26.3, text3mb 2846 → 2896 (+1.8%); two merges into a PL/pgSQL
+variable and ten reads of it items20k 1074 → 1046, items2k 100.9 → 98.1,
+text3mb 5196 → 5256 (+1.2%). The added work there is one
+`save_nocompress` (7.3 ms on text3mb, kept for when the value is stored)
+and the check; the rest of the difference on text3mb is of the size and
+sign of the untouched load's above.

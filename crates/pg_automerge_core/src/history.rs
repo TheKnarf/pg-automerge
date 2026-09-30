@@ -334,7 +334,9 @@ pub fn write_json_at<S: JsonSink + ?Sized>(
 ) -> Result<(), Error> {
     with_doc(input, |doc| {
         let wanted = read_heads(doc, heads)?;
-        crate::json::write_json_at(doc, wanted.as_deref(), sink)
+        // Blocks from the stored bytes at hand, as `loaded::write_json`.
+        let blocks = input.has_blocks(doc);
+        crate::json::write_json_checked(doc, wanted.as_deref(), blocks, sink)
     })
 }
 

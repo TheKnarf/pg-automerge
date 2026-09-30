@@ -2077,6 +2077,112 @@ pub fn scan_changes<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> ChangeCou
     counts
 }
 
+/// The action column of a document chunk's ops.
+const ACTION: u64 = 0x42;
+/// The action of an op that makes a map (`Action::MakeMap` in Automerge's
+/// encoding).
+const MAKE_MAP: u64 = 0;
+
+/// Whether `is_text` holds for an object of the document chunk `bytes` in
+/// which an op makes a map (the root, a map, is never asked about): what
+/// [`crate::blocks`] looks for, text objects whose map elements are
+/// blocks. `is_text` gets the object's actor id, its index in the chunk's
+/// actor table and its counter, once per object, in chunk order, until it
+/// returns `true`. Every op of the chunk counts, deleted and overwritten
+/// ones too, so the answer covers every historical state. Run by run: the
+/// object and action columns are run-length encoded, so this costs about
+/// one step per run, not per op.
+///
+/// `None` unless `bytes` is exactly one document chunk (columns deflated
+/// or not) that scans cleanly; callers then assume the worst.
+pub(crate) fn any_map_parent(
+    bytes: &[u8],
+    mut is_text: impl FnMut(&[u8], usize, u64) -> bool,
+) -> Option<bool> {
+    let mut r = Reader::new(bytes);
+    if r.take(4)? != MAGIC {
+        return None;
+    }
+    r.take(4)?; // checksum
+    if r.take(1)?[0] != DOCUMENT_CHUNK {
+        return None;
+    }
+    let len = usize::try_from(r.uleb()?).ok()?;
+    let data = r.take(len)?;
+    if !r.done() {
+        return None;
+    }
+    let mut r = Reader::new(data);
+    let count = usize::try_from(r.uleb()?).ok()?;
+    if count > data.len() {
+        return None;
+    }
+    let mut actors = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = usize::try_from(r.uleb()?).ok()?;
+        actors.push(r.take(len)?);
+    }
+    let heads = usize::try_from(r.uleb()?).ok()?;
+    r.take(heads.checked_mul(32)?)?;
+    let mut scanner = Scanner::new(None, false);
+    let change_meta = scanner.metadata(&mut r, &DOC_CHANGE_SPECS).ok()?;
+    let op_meta = scanner.metadata(&mut r, &DOC_OP_SPECS).ok()?;
+    scanner
+        .columns(&mut r, &change_meta, true, &[], |_, _, _| {})
+        .ok()?;
+    let (cols, repeated) = scanner
+        .columns(
+            &mut r,
+            &op_meta,
+            true,
+            &[OBJ_ACTOR, OBJ_CTR, ACTION],
+            |_, _, _| {},
+        )
+        .ok()?;
+    if repeated {
+        // Which of two columns with one spec Automerge reads is not
+        // modelled.
+        return None;
+    }
+    let mut obj_actor = Cursor::new(&cols, OBJ_ACTOR);
+    let mut obj_ctr = Cursor::new(&cols, OBJ_CTR);
+    let mut action = Cursor::new(&cols, ACTION);
+    // The last object asked about (an object's ops are contiguous).
+    let mut asked = None;
+    let mut ticker = Ticker::default();
+    // The action column has a row for every op: past its end there are no
+    // more ops (the other two read as null there).
+    while action.seg.is_some() {
+        ticker.tick();
+        let m = [&obj_actor, &obj_ctr, &action]
+            .iter()
+            .map(|c| c.left())
+            .min()
+            .unwrap_or(u64::MAX);
+        if action.at(0) == Val::U(MAKE_MAP)
+            && let (Val::U(actor), Val::U(ctr)) = (obj_actor.at(0), obj_ctr.at(0))
+            && asked != Some((actor, ctr))
+        {
+            asked = Some((actor, ctr));
+            // An actor index outside the table: not what Automerge
+            // loaded; assume the worst.
+            let Some((index, id)) = usize::try_from(actor)
+                .ok()
+                .and_then(|i| Some((i, *actors.get(i)?)))
+            else {
+                return Some(true);
+            };
+            if is_text(id, index, ctr) {
+                return Some(true);
+            }
+        }
+        for c in [&mut obj_actor, &mut obj_ctr, &mut action] {
+            c.advance(m);
+        }
+    }
+    Some(false)
+}
+
 /// The counts of a stored value (one document chunk, uncompressed): what
 /// loading it costs, [`doc_estimate`]. For anything else, the counts of
 /// the document a load of it would build ([`InputCounts::as_document`]).

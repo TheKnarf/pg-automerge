@@ -11,9 +11,9 @@
 # pg_automerge_bench. Not part of `mise run test` (it takes minutes).
 #
 # Env: see tests/lib.sh; also BENCH_DOCS (default "text3mb items20k
-# items2k"), BENCH_REPS (default 3), BENCH_CASES (a grep -E pattern
-# selecting cases, default all), BENCH_REUSE=1 (keep the database and
-# fixtures of a previous run).
+# items2k"; also rich20k), BENCH_REPS (default 3), BENCH_CASES (a grep -E
+# pattern selecting cases, default all), BENCH_REUSE=1 (keep the database
+# and fixtures of a previous run).
 
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

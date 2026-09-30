@@ -29,6 +29,15 @@
 #      restarts: no new "terminated by signal" in the log, a session opened
 #      before is still connected, pg_postmaster_start_time() unchanged, and
 #      ordinary writes still work.
+#   3. A 14 kB document whose text holds a block nested 5,000 levels deep
+#      (Automerge's recursive rendering of it needs about 65 MB of stack;
+#      the server runs with an 8 MB stack, `ulimit -s`, as in Docker) and
+#      the same document as change chunks: inserted into a table with a
+#      stored generated doc::jsonb column and two expression indexes,
+#      merged into a stored row, read with ::jsonb, ->>, the heads
+#      overload of automerge_to_jsonb and merge_agg, all succeed with the
+#      expected values; automerge_spans on that text is a clean 54000; and
+#      nothing crashed (the checks of step 2, which run after this).
 #
 # Container mode (LIMITS_CONTAINER=<name>, with PG_AUTOMERGE_TEST_HOST and
 # friends pointing at it, see tests/lib.sh; tests/docker.sh does this):
@@ -123,6 +132,8 @@ else
     (
         ulimit -c 0
         ulimit -v "$AS_KB"
+        # Deep structures must not need more than the usual 8 MB (step 3).
+        ulimit -s 8192
         scratch_ctl -w -o "-p $SPORT -c listen_addresses=localhost -k $WORK -c shared_buffers=16MB \
             -c max_connections=20 -c restart_after_crash=on" start >/dev/null
     ) || fail "the capped server did not start"
@@ -138,6 +149,8 @@ MESSAGES="pg_read_binary_file('$SIN/messages.bin')"
 KEYS="pg_read_binary_file('$SIN/keys.bin')"
 ACTORS="pg_read_binary_file('$SIN/actors.bin')"
 COLUMNS="pg_read_binary_file('$SIN/columns.bin')"
+DEEP="pg_read_binary_file('$SIN/deep_block.bin')"
+DEEP_CHANGES="pg_read_binary_file('$SIN/deep_changes.bin')"
 
 wait_ready() {
     for _ in $(seq 1 300); do
@@ -228,6 +241,34 @@ for stmt in \
     grep -q 'HINT:  A superuser can raise "pg_automerge.max_load_memory".' <<<"$out" \
         || fail "${stmt:0:80}: no HINT: $out"
 done
+
+log "deep blocks: every read works, spans refuse cleanly, no stack overflow"
+ssql -c "CREATE TABLE deep (id int PRIMARY KEY, doc automerge NOT NULL,
+             data jsonb GENERATED ALWAYS AS (doc::jsonb) STORED)" \
+    -c "CREATE INDEX deep_gin ON deep USING gin ((doc::jsonb))" \
+    -c "CREATE INDEX deep_status ON deep ((doc->>'status'))" \
+    -c "INSERT INTO deep VALUES (1, $DEEP)" \
+    -c "INSERT INTO docs VALUES (10, pg_read_binary_file('$SIN/small.bin'))" \
+    -c "UPDATE docs SET doc = merge(doc, $DEEP_CHANGES) WHERE id = 10" \
+    || fail "storing the deep-block document"
+expected='{"body": "\uFFFCx", "status": "deep"}'
+for q in \
+    "SELECT data FROM deep" \
+    "SELECT doc::jsonb FROM deep" \
+    "SELECT $DEEP::automerge::jsonb" \
+    "SELECT automerge_to_jsonb(doc, automerge_heads(doc)) FROM deep" \
+    "SELECT merge_agg(doc)::jsonb FROM deep" \
+    "SELECT doc::jsonb FROM docs WHERE id = 10"; do
+    out="$(ssql -c "SELECT ($q) = '$expected'::jsonb" 2>&1)" || fail "${q:0:80}: $out"
+    [[ "$out" == t ]] || fail "${q:0:80}: not the expected jsonb"
+done
+# Its status and the small one's conflict; the deep one's actor wins.
+[[ "$(ssql -c "SELECT doc->>'status' FROM docs WHERE id = 10")" == deep ]] \
+    || fail "the merged row's status"
+out="$(ssql -v VERBOSITY=verbose -c "SELECT automerge_spans(doc, '{body}') FROM deep" 2>&1)" \
+    && fail "automerge_spans of the deep block succeeded"
+grep -q "ERROR:  54000: automerge text block is nested more than 32 levels deep" <<<"$out" \
+    || fail "automerge_spans: $out"
 
 [[ "$(crashes)" == "$BEFORE" ]] || fail "a backend was terminated by a signal"
 [[ "$(ssql -c "SELECT pg_postmaster_start_time()")" == "$START" ]] || fail "the postmaster restarted"

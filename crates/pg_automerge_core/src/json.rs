@@ -89,6 +89,68 @@ pub fn doc_to_json_at(doc: &Automerge, heads: Option<&[ChangeHash]>) -> Result<V
 /// interrupts (see [`crate::set_interrupt_check`]) every
 /// [`crate::TICK_EVERY`] steps.
 ///
+/// Takes one of two walks with the same output:
+///
+/// - [`write_json_sweep`], one sweep over the document with Automerge's
+///   document iterator: the fastest on documents made of many small
+///   objects;
+/// - [`write_json_per_object`], a `map_range` / `list_range` iterator per
+///   object and `text()` per text: for documents with blocks (maps inside a
+///   text, see [`crate::blocks`]) and with legacy `Table` objects.
+///
+/// The document iterator renders every block it passes with Automerge's
+/// recursive `hydrate`, which a block nested a few hundred levels deep
+/// turns into a stack overflow, and which costs far more than the walk
+/// needs even for shallow blocks (a text shows each block as U+FFFC): a
+/// rich text of 20,000 paragraphs takes 0.9 s in the sweep and 15 ms per
+/// object. Whether `doc` has blocks is read from a save of it
+/// ([`crate::blocks::has_blocks`]), made here: callers that have the
+/// stored bytes use [`write_json_checked`] with the answer instead
+/// ([`crate::loaded::write_json`] does).
+///
+/// `heads` must all be changes of `doc` (callers check); Automerge ignores
+/// unknown ones. Heads equal to the document's current heads take the
+/// current-state path inside Automerge.
+///
+/// On an error the sink has received an incomplete walk.
+///
+/// # Errors
+///
+/// As [`doc_to_json`].
+pub fn write_json_at<S: JsonSink + ?Sized>(
+    doc: &Automerge,
+    heads: Option<&[ChangeHash]>,
+    sink: &mut S,
+) -> Result<(), Error> {
+    write_json_checked(doc, heads, crate::blocks::has_blocks(doc, None), sink)
+}
+
+/// [`write_json_at`] for a document whose blocks are known: `has_blocks`
+/// must be [`crate::blocks::has_blocks`] of `doc` (`true` is always safe;
+/// `false` for a document with a deeply nested block overflows the stack).
+///
+/// # Errors
+///
+/// As [`doc_to_json`].
+pub fn write_json_checked<S: JsonSink + ?Sized>(
+    doc: &Automerge,
+    heads: Option<&[ChangeHash]>,
+    has_blocks: bool,
+    sink: &mut S,
+) -> Result<(), Error> {
+    if has_blocks {
+        write_json_per_object(doc, heads, sink)
+    } else {
+        write_json_sweep(doc, heads, sink)
+    }
+}
+
+/// The one-sweep walk of [`write_json_at`], for documents without blocks
+/// (it lets Automerge hydrate every block, recursively: a deeply nested
+/// one overflows the stack; [`write_json_at`] decides). The same output as
+/// [`write_json_per_object`]; a document with a `Table` object takes that
+/// walk.
+///
 /// Two passes: Automerge's document iterator (`ReadDoc::iter_at`) visits
 /// every reachable object once, in one sweep over the op set, and the
 /// entries are buffered per object (borrowing from `doc`); then they are
@@ -104,16 +166,10 @@ pub fn doc_to_json_at(doc: &Automerge, heads: Option<&[ChangeHash]>) -> Result<V
 /// creates them, but loads them from old saves; the sweep would read one
 /// as a list) takes the per-object walk.
 ///
-/// `heads` must all be changes of `doc` (callers check); Automerge ignores
-/// unknown ones. Heads equal to the document's current heads take the
-/// current-state path inside Automerge.
-///
-/// On an error the sink has received an incomplete walk.
-///
 /// # Errors
 ///
 /// As [`doc_to_json`].
-pub fn write_json_at<S: JsonSink + ?Sized>(
+pub fn write_json_sweep<S: JsonSink + ?Sized>(
     doc: &Automerge,
     heads: Option<&[ChangeHash]>,
     sink: &mut S,
@@ -319,9 +375,10 @@ impl<'a> Sweep<'a> {
 }
 
 /// [`write_json_at`] one object at a time: a `map_range` / `list_range`
-/// iterator per object, `text()` per text. The same output; slower on many
-/// small objects, faster on one huge text. Used for documents with `Table`
-/// objects (and by tests, as the reference).
+/// iterator per object, `text()` per text (neither hydrates blocks). The
+/// same output as [`write_json_sweep`]; slower on many small objects,
+/// faster on one huge text and far faster with blocks. Used for documents
+/// with blocks or `Table` objects (and by tests, as the reference).
 ///
 /// # Errors
 ///

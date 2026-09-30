@@ -1,5 +1,6 @@
-//! The one-sweep JSON walk (`json::write_json_at`) emits exactly the events
-//! of the per-object walk (`json::write_json_per_object`, the reference),
+//! The one-sweep JSON walk (`json::write_json_sweep`) emits exactly the
+//! events of the per-object walk (`json::write_json_per_object`, the
+//! reference), and so does `json::write_json_at`, which picks one of them,
 //! for current and historical states, over generated documents and the
 //! shapes where the two read Automerge differently (text with blocks,
 //! marks and non-string elements; objects under deleted or overwritten
@@ -79,14 +80,23 @@ fn assert_same(doc: &Automerge, what: &str) {
             .map(|e| if e.starts_with('[') { "[".into() } else { e })
             .collect()
     };
-    let sweep = events(doc, None, json::write_json_at);
+    let sweep = events(doc, None, json::write_json_sweep);
     let reference = events(doc, None, json::write_json_per_object);
     assert_eq!(sweep, reference, "{what}: current state");
+    let chosen = events(doc, None, json::write_json_at);
+    assert_eq!(chosen, reference, "{what}: current state, write_json_at");
     for change in doc.get_changes(&[]) {
         let heads = [change.hash()];
-        let sweep = events(doc, Some(&heads), json::write_json_at).map(strip);
+        let sweep = events(doc, Some(&heads), json::write_json_sweep).map(strip);
         let reference = events(doc, Some(&heads), json::write_json_per_object).map(strip);
         assert_eq!(sweep, reference, "{what}: as of {}", change.hash());
+        let chosen = events(doc, Some(&heads), json::write_json_at).map(strip);
+        assert_eq!(
+            chosen,
+            reference,
+            "{what}: as of {}, write_json_at",
+            change.hash()
+        );
     }
 }
 
@@ -187,7 +197,7 @@ fn nesting_limit_is_the_same() {
         for _ in 0..depth {
             obj = doc.put_object(&obj, "k", ObjType::Map).unwrap();
         }
-        let sweep = events(doc.document(), None, json::write_json_at);
+        let sweep = events(doc.document(), None, json::write_json_sweep);
         let reference = events(doc.document(), None, json::write_json_per_object);
         assert_eq!(sweep.is_ok(), reference.is_ok(), "depth {depth}");
         assert_eq!(sweep.is_ok(), depth < json::MAX_DEPTH);
@@ -231,6 +241,6 @@ fn objects_sharing_counters_across_actors() {
     assert_same(merged.document(), "in memory");
     let loaded = Automerge::load(&merged.save()).unwrap();
     assert_same(&loaded, "loaded");
-    let events = events(&loaded, None, json::write_json_at).unwrap();
+    let events = events(&loaded, None, json::write_json_sweep).unwrap();
     assert_eq!(events.iter().filter(|e| *e == "key \"r\"").count(), 60);
 }

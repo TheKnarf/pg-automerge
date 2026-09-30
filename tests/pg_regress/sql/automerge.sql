@@ -171,6 +171,14 @@ SELECT automerge_spans(:'note'::automerge, '{}');
 -- stack on a block nested a few hundred levels deep; such blocks are
 -- refused (54000) before that.
 SELECT automerge_spans(:'deep_block'::automerge, '{body}');
+-- Everything else reads such a document as usual: the jsonb view shows a
+-- text as a string (each block as U+FFFC) without rendering its blocks,
+-- also in a stored generated column, and as of given heads.
+SELECT :'deep_block'::automerge::jsonb AS deep_block;
+CREATE TABLE deep_docs (doc automerge, body text GENERATED ALWAYS AS (doc->>'body') STORED);
+INSERT INTO deep_docs VALUES (:'deep_block');
+SELECT body, automerge_to_jsonb(doc, automerge_heads(doc)) AS as_of_heads FROM deep_docs;
+DROP TABLE deep_docs;
 
 -- merge_agg folds many versions (e.g. a history table) into one document.
 SELECT merge_agg(v)->>'title' AS title, jsonb_array_length(merge_agg(v)->'items') AS n_items

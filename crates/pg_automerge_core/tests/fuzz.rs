@@ -25,7 +25,10 @@
 //!   (measured by a counting allocator) stays below its estimate, whether
 //!   it accepts the input or Automerge refuses it;
 //!   `normalize` rejects input over the limit (`Error::LoadLimit`) only
-//!   when the estimate says so.
+//!   when the estimate says so;
+//! - the block check's column scan (`blocks::has_blocks`) never panics on
+//!   any bytes, and on a stored value answers as it does from a save of
+//!   the loaded document.
 //!
 //! `tests/corpus/*.bin` are inputs worth keeping, found by this harness:
 //! `panic-*` one per distinct decoder panic, `reload-*` inputs that load
@@ -44,7 +47,7 @@ use automerge::{ActorId, AutoCommit, Automerge, ROOT};
 use pg_automerge_core::budget::{self, doc_estimate, scan_doc, scan_input};
 use pg_automerge_core::header::heads_from_bytes;
 use pg_automerge_core::loaded::{self, Input};
-use pg_automerge_core::{Error, normalize};
+use pg_automerge_core::{Error, blocks, normalize};
 
 mod common;
 #[path = "common/counting.rs"]
@@ -223,6 +226,8 @@ enum Notable {
 fn check(input: &[u8], base: &[u8]) -> Notable {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let scanned = scan_input(input, budget::limit());
+        // Any bytes, against a document that has none of their objects.
+        let _ = blocks::has_blocks(&Automerge::new(), Some(input));
         let loads =
             catch_unwind(AssertUnwindSafe(|| Automerge::load(input).is_ok())).unwrap_or(false);
         if loads {
@@ -269,6 +274,10 @@ fn check(input: &[u8], base: &[u8]) -> Notable {
                 sorted(doc.get_heads())
             );
             assert_eq!(normalize(stored).as_ref(), Ok(stored));
+            assert_eq!(
+                blocks::has_blocks(&doc, Some(stored)),
+                blocks::has_blocks(&doc, None)
+            );
         }
         if let Ok(Some(doc)) = loaded::merge_changes(Input::Stored(base), input)
             && let Ok(stored) = doc.stored()

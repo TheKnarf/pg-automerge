@@ -1,7 +1,8 @@
 //! Rust-level timings of the core primitives on the benchmark documents
 //! (`mise run bench-core`, release build): loading, normalizing canonical
-//! and compressed input, the load memory scan, saving, the JSON walk, and
-//! (on documents with a text at `text`) the rich-text spans.
+//! and compressed input, the load memory scan, saving, the block check
+//! and the JSON walks, and (on documents with a text at `text`) the
+//! rich-text spans.
 //!
 //! Env: BENCH_DOCS (space-separated subset of "text3mb items20k items2k
 //! typed5k rich20k", default all), BENCH_REPS (default 5). Prints the median in
@@ -13,7 +14,7 @@ use std::time::Instant;
 use automerge::{AutoCommit, Automerge, ObjType, ReadDoc};
 use pg_automerge_core::json::{self, JsonSink};
 use pg_automerge_core::loaded::{Input, LoadedDoc};
-use pg_automerge_core::{budget, normalize, spans};
+use pg_automerge_core::{blocks, budget, normalize, spans};
 
 #[path = "shared/bench_docs.rs"]
 mod bench_docs;
@@ -134,15 +135,30 @@ fn main() {
                 Box::new(|| drop(black_box(loaded.save_nocompress()))),
             ),
             (
+                "block check (stored bytes)",
+                Box::new(|| {
+                    black_box(blocks::has_blocks(&loaded, Some(&stored)));
+                }),
+            ),
+            (
+                "json walk, checked (stored bytes, no-op sink)",
+                Box::new(|| {
+                    let mut sink = Discard::default();
+                    let has = blocks::has_blocks(&loaded, Some(&stored));
+                    json::write_json_checked(&loaded, None, has, &mut sink).unwrap();
+                    black_box(sink.0);
+                }),
+            ),
+            (
                 "json walk, one sweep (no-op sink)",
-                Box::new(|| walk(&loaded, json::write_json_at)),
+                Box::new(|| walk(&loaded, json::write_json_sweep)),
             ),
             (
                 "json walk, per object (no-op sink)",
                 Box::new(|| walk(&loaded, json::write_json_per_object)),
             ),
             (
-                "doc_to_json (walk + serde Value)",
+                "doc_to_json (save, block check, walk, serde Value)",
                 Box::new(|| drop(black_box(json::doc_to_json(&loaded).unwrap()))),
             ),
         ];

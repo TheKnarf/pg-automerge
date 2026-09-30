@@ -29,7 +29,8 @@
 #     bytes since heads, get_change, jsonb at earlier heads),
 #     automerge_spans of the regress rich-text fixture (current and at
 #     earlier heads, 22023 for a non-text path, 54000 and no crash for the
-#     2,000-level deep block in this release build), lz4 TOAST
+#     2,000-level deep block in this release build, whose jsonb view and
+#     STORED generated doc::jsonb column read fine), lz4 TOAST
 #     compression of automerge columns, settings passed with -c;
 #   - automerge_notify(): a separate LISTEN session receives the trigger's
 #     payload, whose heads match the row;
@@ -288,6 +289,17 @@ for bad in "note|{title}|22023: automerge value at path {title} is a string scal
     fi
     grep -qF "ERROR:  $want" <<<"$out" || fail "automerge_spans($fx, $path): $out"
 done
+# Everything else reads the deep block's document: its jsonb view shows the
+# text as a string without rendering the block (Automerge's rendering of
+# it would overflow the stack), also in a STORED generated column.
+out="$(psql_in default app -v doc="\\x$DEEP_BLOCK" <<'SQL'
+CREATE TABLE deep (doc automerge NOT NULL, data jsonb GENERATED ALWAYS AS (doc::jsonb) STORED);
+INSERT INTO deep VALUES (:'doc');
+SELECT data = doc::jsonb, doc->>'body' = E'\uFFFCx',
+       automerge_to_jsonb(doc, automerge_heads(doc)) = data FROM deep;
+SQL
+)"
+expect "deep block jsonb" 't|t|t' "$out"
 
 log "automerge_notify: a separate LISTEN session receives the payload"
 psql_in default app -c "CREATE TABLE notify_done (x int)" \
