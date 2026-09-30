@@ -11,7 +11,8 @@ cd "$(dirname "$0")/.."
 
 image="${PG_AUTOMERGE_IMAGE:-pg-automerge}"
 version="$(sh scripts/versions.sh | sed -n 's/^CRATE_VERSION=//p')"
-source_url="$(git remote get-url origin 2>/dev/null || true)"
+# Normalised: no credentials of an https remote in the public label.
+source_url="$(bash scripts/oci-source-url.sh)"
 revision="$(git rev-parse HEAD 2>/dev/null || true)"
 if [[ -n "$revision" ]] && ! git diff --quiet HEAD 2>/dev/null; then revision="$revision-dirty"; fi
 

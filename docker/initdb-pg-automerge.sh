@@ -4,6 +4,10 @@
 # the postgres OS user against the temporary socket-only server; it never
 # runs again on an existing volume.
 #
+# Also installed as /usr/local/bin/pg-automerge-initdb, for an image whose
+# /docker-entrypoint-initdb.d is replaced (a bind-mounted directory hides
+# 10-pg-automerge.sh): an executable init script of your own can run it.
+#
 # PG_AUTOMERGE_CREATE_EXTENSION
 #   1 (default)  CREATE EXTENSION IF NOT EXISTS pg_automerge in $POSTGRES_DB
 #   0            skip: install it yourself (e.g. into a schema of its own,
@@ -23,8 +27,11 @@ esac
 
 db="${POSTGRES_DB:-${POSTGRES_USER:-postgres}}"
 echo "pg_automerge: CREATE EXTENSION pg_automerge in database $db"
-# The same connection the entrypoint's own docker_process_sql uses.
-psql -v ON_ERROR_STOP=1 --no-psqlrc --no-password \
+# The same connection the entrypoint's own docker_process_sql uses: the
+# local socket, with PGHOST and PGHOSTADDR cleared (set in the container's
+# environment for other tools, they would send psql over TCP to a
+# temporary server that does not listen there).
+PGHOST='' PGHOSTADDR='' psql -v ON_ERROR_STOP=1 --no-psqlrc --no-password \
   --username "${POSTGRES_USER:-postgres}" --dbname "$db" \
   -c 'CREATE EXTENSION IF NOT EXISTS pg_automerge' \
   -Atc "SELECT 'pg_automerge ' || extversion || ' installed' FROM pg_extension WHERE extname = 'pg_automerge'"

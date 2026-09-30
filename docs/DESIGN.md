@@ -2330,7 +2330,11 @@ README's Docker section. Packaging decisions:
   cannot read from a file); the build fails if it disagrees with
   `Cargo.toml`. `mise run docker-build` passes it, plus the git remote
   (empty while there is none) and commit for the `source` and `revision`
-  labels.
+  labels. The remote goes through `scripts/oci-source-url.sh` first: the
+  label is public (every archive and pushed image carries it), so an
+  https remote's credentials are stripped, an ssh or scp-style remote
+  becomes its https URL, and anything else (a local path) gives an empty
+  label; `check_ci.sh` tests those cases.
 - **Toolchain from Debian's rustup.** `rustup` comes from the signed
   Debian archive (no `curl | sh`) and installs the pinned toolchain
   (minimal profile); `cargo install --locked cargo-pgrx`. The package is
@@ -2359,7 +2363,16 @@ README's Docker section. Packaging decisions:
   EXISTS pg_automerge` in `POSTGRES_DB` on first initialization, unless
   `PG_AUTOMERGE_CREATE_EXTENSION=0`; any other value than `0`/`1` fails
   initialization rather than guessing. It is executable, so the entrypoint
-  runs it in its own process instead of sourcing it into its shell. It
+  runs it in its own process instead of sourcing it into its shell. Its
+  `psql` connects like the entrypoint's own `docker_process_sql`, over the
+  socket with `PGHOST` and `PGHOSTADDR` cleared: set in the container's
+  environment for other tools, they would send it over TCP to the
+  temporary server, which listens only on the socket. A bind mount over
+  `/docker-entrypoint-initdb.d` (the usual way to add init files) hides
+  it, and the extension would silently be missing; the README says to
+  mount single files instead, and the same script is installed as
+  `/usr/local/bin/pg-automerge-initdb` for a mounted directory's own
+  script to run. It
   does not touch `template1`: the extension is not trusted (see [Why the
   extension is not trusted](#why-the-extension-is-not-trusted)), and a copy
   in the template would install it into every database a `CREATEDB` role
@@ -2383,7 +2396,10 @@ README's Docker section. Packaging decisions:
   `docker-build`; not part of `mise run test` because it needs Docker and
   a release build; CI's `docker` job runs it) checks the labels, the
   version file and license, that no toolchain is in the image, lz4
-  support and the exact set of extension files. Then, against fresh
+  support, the exact set of extension files (the install script, the
+  control file, the library, and every `sql/pg_automerge--*--*.sql`
+  upgrade script the repository has) and a `source` label without
+  credentials. Then, against fresh
   containers and volumes (labelled `pg-automerge-test`, port 5432
   published on a free port of 127.0.0.1, all removed on exit; helpers in
   `tests/docker_lib.sh`):
@@ -2413,6 +2429,19 @@ README's Docker section. Packaging decisions:
   - a restart on the same volume (data kept, init not re-run, `ALTER
     EXTENSION .. UPDATE` a no-op), `PG_AUTOMERGE_CREATE_EXTENSION=0` (then
     a manual `CREATE EXTENSION .. SCHEMA`), an invalid value failing init;
+  - the upgrade path with the image's own scripts and library, as
+    `tests/upgrade.sh` does against pgrx's Postgres: each
+    `sql/snapshots` version is copied into the container under a scratch
+    version name, with the first hop of each upgrade path the image ships
+    (so an image missing an upgrade script fails), documents are stored,
+    `ALTER EXTENSION .. UPDATE` reaches the current version and the
+    documents read the same (the catalog comparison stays in
+    `upgrade.sh`);
+  - `PGHOST=localhost` and `PGHOSTADDR` in the container's environment
+    with an init file mounted as a single file next to ours (the
+    extension is created, the file runs after it), and a whole directory
+    mounted over `/docker-entrypoint-initdb.d` whose own script runs
+    `pg-automerge-initdb`;
   - the regress examples through `pg_regress --use-existing` (the same
     expected output as `mise run regress`), and `concurrency.sh`,
     `notify.sh`, `dump.sh` and `extension.sh` in `tests/lib.sh`'s external
@@ -2440,7 +2469,10 @@ README's Docker section. Packaging decisions:
     127.0.0.1, `down -v` leaves no volume);
   - the release scripts: `scripts/docker-archive.sh` names the archive by
     version and architecture, `scripts/docker-push.sh --dry-run` loads it
-    back as the same image and prints the pushes it would make, and
+    back as the same image (the ID it prints) and prints the pushes it
+    would make; loading an archive whose tag (e.g. `pg-automerge:<version>`)
+    points to another image locally, or to none, leaves that tag as it
+    was; and it
     refuses a repository without a registry host (Docker would send it to
     Docker Hub), another version's archive and a duplicate architecture.
 
@@ -2524,8 +2556,10 @@ suites' fixture generators. The nightly run also benchmarks the image.
     build per tag, in parallel.
 - **Publishing is prepared, not enabled.** The `publish` job runs on tags
   after both `ci` and `docker` passed, downloads the tested archives and
-  pushes them with `scripts/docker-push.sh`: each archive is loaded,
-  checked (version label equals the crate version, architecture equals
+  pushes them with `scripts/docker-push.sh`: each archive is loaded (the
+  local tags it carries are put back afterwards, so a by-hand run with
+  the arm64 archive on an amd64 host does not repoint
+  `pg-automerge:<version>`), checked (version label equals the crate version, architecture equals
   the file name's), tagged `<image>:<version>-<arch>` and pushed, then
   `docker buildx imagetools create` makes `<image>:<version>` and
   `<image>:latest` an index of them. Pushing the tested bytes rather than

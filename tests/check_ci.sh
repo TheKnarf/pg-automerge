@@ -76,19 +76,44 @@ if grep -E '^FROM ' "$df" | grep -vqE '^FROM \$\{PG_IMAGE\} AS [a-z]+$'; then
   fail "$df: every stage must be FROM \${PG_IMAGE}"
 fi
 grep -qE '^COPY .*docker/initdb-pg-automerge.sh /docker-entrypoint-initdb.d/' "$df" || fail "$df: initdb script not installed"
+grep -qE '^COPY .*docker/initdb-pg-automerge.sh /usr/local/bin/pg-automerge-initdb$' "$df" \
+  || fail "$df: initdb script not installed as /usr/local/bin/pg-automerge-initdb (for directory mounts)"
+grep -qE "^PGHOST='' PGHOSTADDR='' psql " docker/initdb-pg-automerge.sh \
+  || fail "docker/initdb-pg-automerge.sh: clear PGHOST/PGHOSTADDR for psql, like the entrypoint's docker_process_sql"
 if grep -qE '^(ENTRYPOINT|CMD|USER|VOLUME) ' "$df"; then fail "$df: keep the official image's entrypoint, cmd, user and volume"; fi
 # Everything COPY'd from the build context is let through .dockerignore.
 for src in $(grep -E '^COPY ' "$df" | grep -v -- '--from=' | sed -E 's/^COPY( --[a-z]+=[^ ]+)* //; s/ [^ ]+$//'); do
   [ "$src" = . ] && continue
   grep -qxF "!$src" .dockerignore || fail ".dockerignore does not let $src through (COPY in $df)"
 done
-for f in docker/initdb-pg-automerge.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh; do
+for f in docker/initdb-pg-automerge.sh scripts/oci-source-url.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh; do
   bash -n "$f" || fail "$f: syntax"
 done
 [ -x docker/initdb-pg-automerge.sh ] || fail "docker/initdb-pg-automerge.sh must be executable (the entrypoint sources non-executable scripts)"
 grep -qE '^    image: pg-automerge:' compose.yaml || fail "compose.yaml: image must be the pg-automerge built by mise run docker-build"
 grep -qE '^      - pgdata:/var/lib/postgresql$' compose.yaml \
   || fail "compose.yaml: mount the volume at /var/lib/postgresql (postgres:18 keeps PGDATA in 18/docker below it)"
+
+# The image's source label comes from the git remote through
+# scripts/oci-source-url.sh: never credentials, only an https URL or nothing.
+grep -qF 'source_url="$(bash scripts/oci-source-url.sh)"' scripts/docker-build.sh \
+  || fail "scripts/docker-build.sh: take the source label from scripts/oci-source-url.sh"
+while IFS='|' read -r remote want; do
+  got=$(bash scripts/oci-source-url.sh "$remote")
+  [ "$got" = "$want" ] || fail "oci-source-url.sh '$remote': expected '$want', got '$got'"
+done <<'CASES'
+https://x-access-token:ghp_secret@github.com/you/pg-automerge.git|https://github.com/you/pg-automerge
+https://user:pa:ss@word@gitlab.example.com:8443/g/sub/repo.git/|https://gitlab.example.com:8443/g/sub/repo
+https://github.com/you/repo?token=secret#x|https://github.com/you/repo
+http://github.com/you/repo|https://github.com/you/repo
+git@github.com:you/repo.git|https://github.com/you/repo
+ssh://git@github.com:22/you/repo.git|https://github.com/you/repo
+https://github.com/you/repo|https://github.com/you/repo
+/home/you/pg-automerge|
+file:///home/you/pg-automerge|
+git@github.com:you/re po.git|
+|
+CASES
 
 echo "check_ci: docker ok"
 

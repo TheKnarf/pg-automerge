@@ -6,7 +6,7 @@
 # PROJECT (a per-run name prefix) and DWORK (a scratch directory), and an
 # EXIT trap that calls the script's on_exit function (if any) with the exit
 # status, then removes every container and volume start() created (and
-# the compose project PROJECT), and DWORK.
+# the compose project PROJECT), every image tag in IMAGES, and DWORK.
 #
 # Containers are named "$PROJECT-<name>" and labelled pg-automerge-test;
 # every container gets the password $PG_PASSWORD, POSTGRES_DB=app, a named
@@ -30,12 +30,14 @@ PG_PASSWORD="test"
 DWORK="$(mktemp -d)"
 CONTAINERS=()
 VOLUMES=()
+IMAGES=()   # tags the tests made, removed on exit
 
 docker_cleanup() {
     local status=$?
     if declare -F on_exit >/dev/null; then on_exit "$status" || true; fi
     for c in "${CONTAINERS[@]}"; do docker rm -f -v "$c" >/dev/null 2>&1 || true; done
     for v in "${VOLUMES[@]}"; do docker volume rm -f "$v" >/dev/null 2>&1 || true; done
+    for i in "${IMAGES[@]}"; do docker rmi "$i" >/dev/null 2>&1 || true; done
     PG_AUTOMERGE_IMAGE_TAG="${IMAGE#*:}" PG_AUTOMERGE_PORT=0 \
         docker compose -p "$PROJECT" down -v >/dev/null 2>&1 || true
     rm -rf "$DWORK"

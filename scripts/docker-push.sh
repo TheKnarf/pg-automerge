@@ -7,13 +7,17 @@
 #
 # For each archive: `docker load`, check that the image's version label is
 # Cargo.toml's version and its architecture the one in the file name, tag
-# it REPOSITORY:<version>-<arch> and push that. Then
+# it REPOSITORY:<version>-<arch> and push that. Prints `loaded ARCHIVE
+# IMAGE-ID` for each. The local tags the archive carries (e.g.
+# pg-automerge:<version>) are put back as they were before the load, so
+# loading the arm64 archive does not repoint your amd64 pg-automerge tag. Then
 # `docker buildx imagetools create` makes REPOSITORY:<version> (and
 # REPOSITORY:latest, unless PG_AUTOMERGE_PUSH_LATEST=0) an index of the
 # per-architecture images. The caller must be logged in to the registry.
 #
 # --dry-run: load and check everything, print the push and imagetools
-# commands instead of running them, and remove the tags it made.
+# commands instead of running them, and remove the tags it made (and an
+# image the load added that no tag refers to any more).
 #
 # Usage: docker-push.sh [--dry-run] REPOSITORY ARCHIVE...
 #   REPOSITORY: fully qualified, registry host first, lower case, e.g.
@@ -37,7 +41,28 @@ run() {
 }
 
 tags=()
-cleanup() { if ((dry_run)) && ((${#tags[@]})); then docker rmi "${tags[@]}" >/dev/null 2>&1 || true; fi; }
+declare -A restore=()   # local tag -> its image ID before the loads ("" = none)
+new_images=()           # image IDs the loads added
+cleanup() {
+    local status=$? tag id
+    if ((dry_run)) && ((${#tags[@]})); then docker rmi "${tags[@]}" >/dev/null 2>&1 || true; fi
+    for tag in "${!restore[@]}"; do
+        id="$(docker image inspect -f '{{.Id}}' "$tag" 2>/dev/null || true)"
+        [[ "$id" == "${restore[$tag]}" ]] && continue
+        if [[ -n "${restore[$tag]}" ]]; then
+            docker tag "${restore[$tag]}" "$tag" || { echo "docker-push.sh: could not restore $tag to ${restore[$tag]}" >&2; status=1; }
+        else
+            docker rmi "$tag" >/dev/null || { echo "docker-push.sh: could not remove the tag $tag the load made" >&2; status=1; }
+        fi
+    done
+    if ((dry_run)); then
+        for id in "${new_images[@]}"; do
+            [[ -z "$(docker image inspect -f '{{join .RepoTags " "}}' "$id" 2>/dev/null)" ]] \
+                && docker rmi "$id" >/dev/null 2>&1 || true
+        done
+    fi
+    exit "$status"
+}
 trap cleanup EXIT
 
 seen=" "
@@ -50,8 +75,20 @@ for archive in "$@"; do
     [[ "$seen" != *" $arch "* ]] || fail "two archives for $arch"
     seen+="$arch "
 
-    loaded="$(docker load -i "$archive" | sed -n 's/^Loaded image: //p' | tail -1)"
+    # The tags in the archive, and what they point to now, to put back.
+    archive_tags="$(tar -xzOf "$archive" manifest.json | jq -r '.[].RepoTags[]?')" \
+        || fail "$archive: no manifest.json (not a docker save archive)"
+    [[ -n "$archive_tags" ]] || fail "$archive: the image in it has no tag"
+    for t in $archive_tags; do
+        [[ -v "restore[$t]" ]] || restore[$t]="$(docker image inspect -f '{{.Id}}' "$t" 2>/dev/null || true)"
+    done
+    before="$(docker image ls -aq --no-trunc)"
+    out="$(docker load -i "$archive")"
+    loaded="$(sed -n 's/^Loaded image: //p' <<<"$out" | tail -1)"
     [[ -n "$loaded" ]] || fail "$archive: docker load reported no image"
+    loaded="$(docker image inspect -f '{{.Id}}' "$loaded")"
+    grep -qxF "$loaded" <<<"$before" || new_images+=("$loaded")
+    echo "loaded $archive $loaded"
     label="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$loaded")"
     [[ "$label" == "$version" ]] || fail "$archive: image version label '$label', expected $version"
     image_arch="$(docker image inspect -f '{{.Architecture}}' "$loaded")"

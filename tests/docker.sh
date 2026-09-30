@@ -7,14 +7,17 @@
 # PGDG Postgres 18) on a fresh named volume, with its port published on a
 # free port of 127.0.0.1; all are labelled pg-automerge-test and removed on
 # exit, with their volumes (tests/docker_lib.sh). Checks:
-#   - the image: OCI labels, the version file, no toolchain, lz4 support,
-#     only the expected extension files;
+#   - the image: OCI labels (a source label without credentials), the
+#     version file, no toolchain, lz4 support, only the expected extension
+#     files (install script, control file, library, and every
+#     sql/pg_automerge--*--*.sql upgrade script);
 #   - the release scripts: scripts/docker-archive.sh saves the image as
 #     pg-automerge-<version>-linux-<arch>.tar.gz, scripts/docker-push.sh
-#     --dry-run loads it back (the same image), prints the per-arch push
-#     and the multi-arch index it would make, and refuses a repository
-#     without a registry host, an archive of another version and two of
-#     one architecture, leaving no tags behind;
+#     --dry-run loads it back (the same image ID), prints the per-arch push
+#     and the multi-arch index it would make, puts back a local tag the
+#     archive carries (pointing elsewhere, or absent) and refuses a
+#     repository without a registry host, an archive of another version and
+#     two of one architecture, leaving no tags behind;
 #   - default init: the container turns healthy, the init script installed
 #     pg_automerge in POSTGRES_DB (at the Cargo.toml version) and nowhere
 #     else, the server is a release build (debug_assertions off);
@@ -35,8 +38,14 @@
 #     trigger restored;
 #   - a restart on the same volume keeps the data and does not re-run init;
 #     ALTER EXTENSION pg_automerge UPDATE is a no-op at the current version;
+#   - the upgrade path in the image: every sql/snapshots version installed
+#     under a scratch name with the image's upgrade scripts, documents
+#     stored, ALTER EXTENSION UPDATE to the current version, same data;
 #   - PG_AUTOMERGE_CREATE_EXTENSION=0 skips the extension (and it can then
 #     be created by hand into a schema); an invalid value fails init;
+#   - PGHOST/PGHOSTADDR in the container's environment do not break init,
+#     and an init file mounted singly runs after ours; a directory mounted
+#     over /docker-entrypoint-initdb.d can run /usr/local/bin/pg-automerge-initdb;
 #   - the suites (unless DOCKER_TEST_SUITES=0; they need Postgres 18 client
 #     tools, PG_CONFIG's or by default pgrx's, and cargo): the regress
 #     examples (pg_regress --use-existing, the same expected output as
@@ -108,19 +117,47 @@ contents="$(docker run --rm --label "$LABEL" --entrypoint bash "$IMAGE" -euc "
     cd /usr/lib/postgresql/18/lib && ls pg_automerge*
 " 2>&1)" || { echo "$contents" >&2; fail "image contents"; }
 files="$(sort <<<"$contents" | tr '\n' ' ')"
-expect "extension files" "pg_automerge--$VERSION.sql pg_automerge.control pg_automerge.so " "$files"
+# The install script, the control file, the library, and every upgrade
+# script in sql/ (cargo pgrx package ships them; see "Versioning and
+# upgrades" in docs/DESIGN.md).
+expected_files="$( { printf '%s\n' "pg_automerge--$VERSION.sql" pg_automerge.control pg_automerge.so
+    for f in sql/pg_automerge--*--*.sql; do if [[ -e "$f" ]]; then basename "$f"; fi; done; } | sort | tr '\n' ' ')"
+expect "extension files" "$expected_files" "$files"
+# The source label is the normalised remote (scripts/oci-source-url.sh):
+# empty, or an https URL without credentials.
+source_label="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.source"}}' "$IMAGE")"
+[[ -z "$source_label" || "$source_label" =~ ^https://[^@/]+/[^@]+$ ]] || fail "source label '$source_label'"
 
 log "release archive (scripts/docker-archive.sh) and a push dry run (scripts/docker-push.sh)"
 ARCH="$(docker image inspect -f '{{.Architecture}}' "$IMAGE")"
 archive="$(bash scripts/docker-archive.sh "$IMAGE" "$DWORK/release")"
 expect "archive name" "$DWORK/release/pg-automerge-$VERSION-linux-$ARCH.tar.gz" "$archive"
 PUSH_REPO=registry.invalid/pg-automerge-test
+IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
 out="$(bash scripts/docker-push.sh --dry-run "$PUSH_REPO" "$archive")"
-expect "push dry run" "$(printf '%s\n' "+ docker push $PUSH_REPO:$VERSION-$ARCH" \
+expect "push dry run" "$(printf '%s\n' "loaded $archive $IMAGE_ID" "+ docker push $PUSH_REPO:$VERSION-$ARCH" \
     "+ docker buildx imagetools create -t $PUSH_REPO:$VERSION -t $PUSH_REPO:latest $PUSH_REPO:$VERSION-$ARCH")" "$out"
 expect "dry run leaves no tags" "" "$(docker image ls -q "$PUSH_REPO")"
-expect "the loaded archive is the image" "$(docker image inspect -f '{{.Id}}' "$IMAGE")" \
-    "$(docker image inspect -f '{{.Id}}' "pg-automerge:$VERSION")"
+expect "the image is still $IMAGE" "$IMAGE_ID" "$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+# Loading an archive puts back the local tag it carries: an archive of
+# SCRATCH:<version>, loaded while that tag points to another image (as
+# pg-automerge:<version> does when an archive of another architecture is
+# loaded), and while it does not exist.
+SCRATCH="$PROJECT-img:$VERSION"
+docker tag "$IMAGE" "$SCRATCH"; IMAGES+=("$SCRATCH")
+archive2="$(bash scripts/docker-archive.sh "$SCRATCH" "$DWORK/release2")"
+decoy="$(printf 'FROM %s\nLABEL pg-automerge-test.decoy=1\n' "$IMAGE" \
+    | DOCKER_BUILDKIT=1 docker build -q --label "$LABEL" -t "$SCRATCH" -)"
+[[ "$decoy" != "$IMAGE_ID" ]] || fail "decoy image is the image"
+out="$(bash scripts/docker-push.sh --dry-run "$PUSH_REPO" "$archive2")"
+expect "dry run loads the archive's image" "loaded $archive2 $IMAGE_ID" "$(head -1 <<<"$out")"
+expect "dry run puts back the tag it replaced" "$decoy" "$(docker image inspect -f '{{.Id}}' "$SCRATCH")"
+docker rmi "$SCRATCH" >/dev/null
+bash scripts/docker-push.sh --dry-run "$PUSH_REPO" "$archive2" >/dev/null
+if docker image inspect "$SCRATCH" >/dev/null 2>&1; then fail "dry run left the tag $SCRATCH it loaded"; fi
+expect "the image is still $IMAGE after the loads" "$IMAGE_ID" "$(docker image inspect -f '{{.Id}}' "$IMAGE")"
+expect "dry runs leave no tags" "" "$(docker image ls -q "$PUSH_REPO")"
+rm -rf "$DWORK/release2"
 # Refused: a repository without a registry host (Docker would pick Docker
 # Hub), an archive of another version, the same architecture twice.
 for bad in "pg-automerge|REPOSITORY must be registry-host/path" \
@@ -283,6 +320,42 @@ grep -q 'Skipping initialization' <<<"$(docker logs "$C2" 2>&1)" || { docker log
 expect "data after restart" "Groceries for Sunday|eggs" "$(psql_in restart app -c "SELECT (SELECT doc->>'title' FROM docs WHERE id = 1), (SELECT data #>> '{items,1,name}' FROM notes WHERE id = 7)")"
 psql_in restart app -c 'SET client_min_messages = warning' -c 'ALTER EXTENSION pg_automerge UPDATE'
 expect "version after UPDATE" "$VERSION" "$(psql_in restart app -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")"
+
+log "upgrade path in the image: each sql/snapshots version, ALTER EXTENSION UPDATE with the image's scripts"
+# As tests/upgrade.sh does against pgrx's Postgres: install the snapshot
+# under the version name "V-snapshot", plus the first hop of each upgrade
+# path from V that the image ships (renamed to start at V-snapshot), or an
+# empty V-snapshot--<current> for the current version. So a release whose
+# image lacks an upgrade script from an older version fails here.
+EXTDIR=/usr/share/postgresql/18/extension
+DOCS_FINGERPRINT="$(head -1 <<<"$FINGERPRINT")"
+n=0
+for snapshot in sql/snapshots/pg_automerge--*.sql; do
+    v="${snapshot#sql/snapshots/pg_automerge--}"; v="${v%.sql}"; old="$v-snapshot"; n=$((n + 1))
+    docker cp -q "$snapshot" "$C2:$EXTDIR/pg_automerge--$old.sql"
+    if [[ "$v" == "$VERSION" ]]; then
+        docker exec "$C2" sh -c ": >'$EXTDIR/pg_automerge--$old--$VERSION.sql'"
+    else
+        docker exec "$C2" bash -euc 'cd "$1"; set -- pg_automerge--"$2"--*.sql; [ -e "$1" ] || exit 3
+            for f; do cp "$f" "pg_automerge--$3--${f#pg_automerge--"$2"--}"; done' _ "$EXTDIR" "$v" "$old" \
+            || fail "the image ships no upgrade script from $v (sql/pg_automerge--$v--*.sql)"
+    fi
+    psql_in restart postgres -c "CREATE DATABASE upgrade_$n"
+    psql_in restart "upgrade_$n" "${FIXTURES[@]}" -v old="$old" <<'SQL'
+CREATE EXTENSION pg_automerge VERSION :'old';
+CREATE TABLE docs (id int PRIMARY KEY, doc automerge NOT NULL);
+CREATE INDEX ON docs USING gin ((doc::jsonb));
+INSERT INTO docs VALUES (1, :'base'), (2, :'alice'), (3, merge(:'base'::automerge, :'bob_changes'::bytea));
+SQL
+    before="$(psql_in restart "upgrade_$n" -c "$DOCS_FINGERPRINT")"
+    psql_in restart "upgrade_$n" -c 'ALTER EXTENSION pg_automerge UPDATE'
+    expect "$v: version after UPDATE" "$VERSION" "$(psql_in restart "upgrade_$n" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")"
+    expect "$v: documents after UPDATE" "$before" "$(psql_in restart "upgrade_$n" -c "$DOCS_FINGERPRINT")"
+    expect "$v: merge after UPDATE" "Groceries for Sunday|2" "$(psql_in restart "upgrade_$n" \
+        -c "SELECT (d.doc || a.doc)->>'title', cardinality(automerge_heads(d.doc || a.doc)) FROM docs d, docs a WHERE d.id = 3 AND a.id = 2")"
+    docker exec "$C2" sh -c "rm -f '$EXTDIR'/pg_automerge--'$old'*.sql"
+done
+((n)) || fail "no snapshots in sql/snapshots"
 check_log restart
 docker rm -f "$C2" >/dev/null
 
@@ -315,6 +388,30 @@ if wait_ready bad; then fail "$(cname bad) started with an invalid PG_AUTOMERGE_
 grep -qF "PG_AUTOMERGE_CREATE_EXTENSION must be 0 or 1, got 'yes'" <<<"$(docker logs "$(cname bad)" 2>&1)" \
     || { docker logs "$(cname bad)" >&2; fail "no error message for the invalid value"; }
 docker rm -f -v "$(cname bad)" >/dev/null
+
+log "PGHOST in the environment, and an init file mounted next to ours"
+# The init script connects over the socket like the entrypoint's own psql,
+# whatever PGHOST says; a single file mounted into
+# /docker-entrypoint-initdb.d runs after it (README.md, Docker).
+INIT="$DWORK/init"; mkdir -p "$INIT"; chmod 755 "$INIT"
+printf '%s\n' 'CREATE TABLE app_t (id int PRIMARY KEY, doc automerge NOT NULL);' \
+    "INSERT INTO app_t VALUES (1, '\\x$BASE');" >"$INIT/20-app.sql"
+chmod 644 "$INIT/20-app.sql"
+start_ready initfile initfile -e PGHOST=localhost -e PGHOSTADDR=127.0.0.1 \
+    -v "$INIT/20-app.sql:/docker-entrypoint-initdb.d/20-app.sql:ro"
+expect "PGHOST set: extension and the app's init file" "$VERSION|Groceries" \
+    "$(docker exec -e PGHOST= -e PGHOSTADDR= "$(cname initfile)" psql -X -At -U postgres -d app -c "SELECT (SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'), (SELECT doc->>'title' FROM app_t)")"
+check_log initfile
+docker rm -f -v "$(cname initfile)" >/dev/null
+
+log "a directory mounted over /docker-entrypoint-initdb.d runs pg-automerge-initdb itself"
+printf '#!/bin/sh\nexec pg-automerge-initdb\n' >"$INIT/10-pg-automerge.sh"
+chmod 755 "$INIT/10-pg-automerge.sh"
+start_ready initdir initdir -v "$INIT:/docker-entrypoint-initdb.d:ro"
+expect "directory mount: extension and the app's init file" "$VERSION|Groceries" \
+    "$(psql_in initdir app -c "SELECT (SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'), (SELECT doc->>'title' FROM app_t)")"
+check_log initdir
+docker rm -f -v "$(cname initdir)" >/dev/null
 
 # ---------------------------------------------------------------------------
 if [[ "${DOCKER_TEST_SUITES:-1}" == 1 ]]; then

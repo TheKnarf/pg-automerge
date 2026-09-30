@@ -145,4 +145,7 @@ COPY --from=builder --chmod=0644 /out/extension/ /usr/share/postgresql/18/extens
 # The MIT license asks for its notice in every copy (Debian's place for it).
 COPY --from=versions --chmod=0644 /version /usr/share/doc/pg_automerge/VERSION
 COPY --chmod=0644 LICENSE /usr/share/doc/pg_automerge/copyright
+# The init script, and a copy outside /docker-entrypoint-initdb.d that
+# survives a bind mount over that directory (README.md, Docker).
 COPY --chmod=0755 docker/initdb-pg-automerge.sh /docker-entrypoint-initdb.d/10-pg-automerge.sh
+COPY --chmod=0755 docker/initdb-pg-automerge.sh /usr/local/bin/pg-automerge-initdb

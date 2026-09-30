@@ -153,6 +153,25 @@ ours (`10-pg-automerge.sh`) when their names sort after it. Like all init
 scripts, it runs only on an empty data directory, never on an existing
 volume.
 
+Add init files one by one, as single-file mounts or `COPY` in an image
+of your own; do not mount a whole directory over
+`/docker-entrypoint-initdb.d`:
+
+```sh
+docker run ... -v ./init/20-app.sql:/docker-entrypoint-initdb.d/20-app.sql:ro pg-automerge:0.1.0
+```
+
+A directory mounted there replaces `10-pg-automerge.sh`, and the database
+then silently comes up without the extension. If you do mount a
+directory, put an executable script in it that runs the image's copy of
+ours, `/usr/local/bin/pg-automerge-initdb` (it reads
+`PG_AUTOMERGE_CREATE_EXTENSION` too):
+
+```sh
+printf '#!/bin/sh\nexec pg-automerge-initdb\n' > init/10-pg-automerge.sh
+chmod 755 init/10-pg-automerge.sh
+```
+
 The extension goes into `POSTGRES_DB` only, not `template1`: it is not
 trusted (see [Install](#install)), and a copy in `template1` would put it
 into every database a `CREATEDB` role creates later. Other databases get
@@ -259,6 +278,12 @@ Artifacts). To use one:
 docker load -i pg-automerge-0.1.0-linux-arm64.tar.gz   # loads pg-automerge:0.1.0
 ```
 
+`docker load` moves your local `pg-automerge:0.1.0` tag to the loaded
+image, so loading the other architecture's archive leaves that tag on an
+image your host cannot run (`exec format error`) until you
+`mise run docker-build` again. `scripts/docker-push.sh` (below) loads
+archives too, but puts the tags back as they were.
+
 The arm64 image is built and tested natively, without QEMU or
 cross-compilation ([why](docs/DESIGN.md#docker-image-in-ci)). Where the
 arm64 runner is not available (it depends on the repository's plan and
@@ -293,7 +318,7 @@ you built yourself:
 ```sh
 bash scripts/docker-archive.sh                     # pg-automerge-0.1.0-linux-amd64.tar.gz
 docker login ghcr.io
-bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz  # prints the pushes
+bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz  # prints the image IDs and the pushes
 bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz
 ```
 
