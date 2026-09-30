@@ -30,12 +30,19 @@
 //!   summed (successors, dependencies), and [`DocCounts::gmax`] is found
 //!   by merging the object, key, insert and successor columns run by run.
 //!   What rebuilding its changes copies beyond the chunk's own bytes
-//!   ([`DocCounts::rebuilt`]: a string repeated by a run, copied into
-//!   every rebuilt change) is computed from the run headers.
+//!   ([`DocCounts::rebuilt`]: strings repeated by a run and actor ids
+//!   longer than 16 bytes, copied into every rebuilt change that holds
+//!   them) is computed from the run headers.
 //! - A change chunk (compressed or not): its dependencies, actors and op
 //!   columns. Its list of other actors is priced per entry, duplicates
 //!   included (Automerge keeps every entry); a list longer than the limit
-//!   pays for stops the scan ([`InputCounts::truncated`]).
+//!   pays for stops the scan ([`InputCounts::truncated`]). What applying
+//!   it copies per op ([`ChangeCounts::repeated`]: keys and mark names
+//!   repeated by a run) is computed from the run headers.
+//! - Column metadata, in both: validated in place, nothing allocated per
+//!   entry; entries beyond one per column Automerge writes are priced
+//!   ([`DocCounts::extra_columns`]), and a block with more than the limit
+//!   pays for stops the scan.
 //! - Bundle chunks are not read: [`InputCounts::bundle`], which callers
 //!   reject (an experimental Automerge format).
 //!
@@ -1287,8 +1294,8 @@ struct Column<'a> {
 enum Stop {
     /// It does not parse.
     Malformed,
-    /// The inflated bytes exceed the cap, or a list of other actors is
-    /// longer than the limit pays for.
+    /// The inflated bytes exceed the cap, or a list of other actors or a
+    /// column metadata block is longer than the limit pays for.
     Truncated,
 }
 

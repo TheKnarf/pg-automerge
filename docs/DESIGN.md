@@ -1373,7 +1373,8 @@ key).
 
 The constants are the worst measured cost of each unit (the appendix);
 every generated and crafted input tried stays below the estimate, at
-most 0.80 of it (ops prepended to a list of maps). Known over-estimates:
+most 0.80 of it (ops prepended to a list of maps; a document whose 2,000
+changes share one 100 kB message or actor id). Known over-estimates:
 plain text about 5 times (appended characters cost about 90 bytes, the 450
 per op is forced by out-of-order ops at about 335; a tighter bound would
 mean simulating Automerge's per-change reorder queue), and a key
@@ -1382,6 +1383,34 @@ deletes from successors that are rows). The estimate is only as good as
 its measurements: upgrading Automerge means re-running
 `crates/pg_automerge_core/tests/memory_bounds.rs` and the fuzz harness
 (below), which check it.
+
+### What the estimate covers
+
+Where a load or apply allocates in proportion to something the input
+describes, the term that prices it, and the worst peak / estimate of the
+inputs of `tests/memory_bounds.rs` (release build):
+
+| Allocation (Automerge 0.12) | Priced by | Worst peak / estimate |
+|---|---|---|
+| The op set and the rebuilt changes' ops (document chunk) | 450 per op, 30 per successor, 600 × Gmax, 130 per row (at most 1,600 per change) | 0.80 (maps prepended to a list) |
+| Rebuilt changes (document chunk) | 1,600 per change | 0.71 (20,000 empty changes) |
+| Dependencies | 200 per entry | 0.68 (1,000 × 1,000) |
+| Actors, the clock cache | 200 per actor, 0.3 per change × actor, 3 per large change × actor | 0.39 (1,000 conflicting forks) |
+| Parsing and applying change chunks | 1,000 per op, 80 per pred, 2,500 per change | 0.67 (marks, as change chunks) |
+| A change header's list of other actors | 100 per entry, duplicates included | 0.64 (2,200,000 empty actors) |
+| Bytes, inflated (values, strings, the chunk buffers) | 10 per byte | 0.71 (1 MB of bytes, compressed save) |
+| Change messages repeated by a run, copied into every rebuilt change (document chunk) | 5 per rebuilt byte | 0.80 (2,000 changes, one 100 kB message) |
+| Keys and mark names repeated by a run, copied into every rebuilt change (document chunk) | 5 per rebuilt byte | 0.40 (2,000 changes, one 100 kB key) |
+| Actor ids over 16 bytes, copied into every rebuilt change that refers to them (document chunk) | 5 per rebuilt byte | 0.80 (2,000 changes by, or referring to, a 100 kB actor) |
+| Keys and mark names repeated by a run, one owned copy per op when applied, and held literally by the document where other keys come between (change chunks) | 8 per repeated byte | 0.59 (500 maps, one 50 kB key interleaved) |
+| Column metadata entries beyond one per column Automerge writes | 200 per entry | 0.79 (4,200,000 empty columns, compressed change chunk) |
+| Merging inserts scattered over a large list (column slabs split as they are inserted into) | not priced beyond the per-op costs | open: under review |
+
+The rebuilt, repeated and extra-column terms were added after the load
+limit shipped (see [Rebuilt copies and column
+metadata](#rebuilt-copies-and-column-metadata-2026-09-30)): before them, the same
+inputs peaked at 63 to 167 times their estimate (5 to 9 times for the
+metadata entries).
 
 ### The scan
 
@@ -1530,14 +1559,24 @@ again as new input, which is what a restore does:
   op, change, dependency, successor and pred bombs, many actors, change
   headers listing millions of empty or duplicate other actors and
   duplicate dependencies, plain and compressed, a save with 2,000
-  trailing change chunks): at the limit set to the estimate
+  trailing change chunks, strings repeated by a run (change messages,
+  keys, mark names; interleaved keys the document then holds literally),
+  long actor ids, millions of empty column metadata entries; and the
+  same strings and actor ids in saves written by Automerge, on their own
+  and after another save, where a load rebuilds and applies them): at
+  the limit set to the estimate
   the input is accepted (or refused by Automerge, for crafted input that
   does not load) with a peak below it; one byte lower it is refused before
-  loading with a peak that is a small fraction of it. Also deflate bombs
+  loading with a peak that is a small fraction of it; when the document
+  an input normalizes to is priced higher than the input, `normalize` at
+  the input's own estimate stays below it and refuses the result as the
+  normalized document; `merge_changes` of the crafted inputs into a
+  stored document stays below the two estimates. Also deflate bombs
   (256 MB of zeros, as a deflated column and as a compressed change chunk)
   refused quickly with a small peak, a 19 kB change listing 20,000,000
-  empty actors refused at the default limit without its entries being
-  read, the scan's counts against Automerge's
+  empty actors and a 24 kB one listing 12,000,000 empty columns refused
+  at the default limit without their entries being read, the scan's
+  counts against Automerge's
   `stats()` and its own change parser, Gmax against the row-by-row
   definition on random histories, merge results outgrowing the limit, the
   guarantees under a lowered limit, bundles, and the messages.
@@ -1561,7 +1600,11 @@ again as new input, which is what a restore does:
   a 113-byte crafted change chunk and a 19 kB compressed change chunk
   listing 20,000,000 empty other actors each abort the backend ("memory
   allocation of 1543503872 bytes failed", signal 6) and the cluster
-  restarts, which shows the inputs and the cap reproduce the crash. With
+  restarts, which shows the inputs and the cap reproduce the crash; so do
+  a 1 kB compressed save of 6,000 changes sharing one 100 kB message, a
+  100 kB document chunk of 6,000 changes by a 100 kB actor id, a 100 kB
+  change chunk of 16,000 puts of one 100 kB key, and a 24 kB compressed
+  change chunk listing 12,000,000 empty columns. With
   the default limit, the same inputs through text input, the `bytea` cast,
   `merge`, `||`, `automerge_contains`, `INSERT` and `COPY` get `53400`
   with DETAIL and HINT, no backend is terminated by a signal, a session
@@ -2713,3 +2756,113 @@ instructions as before the limit, ±0.004%, so its +1% is drift too). In
 compared net of the load in the same binary: on the 877 kB list a
 compressed save costs 8.2 ms beyond its load before the limit, 13.7 with
 the limit, 7.3 now; a canonical one 2.6, 5.4 and 3.8 (three runs each).
+
+### Rebuilt copies and column metadata (2026-09-30)
+
+A defensive test round against the load limit (release build, counting
+allocator) found four kinds of input whose peak the estimate did not
+bound, because Automerge copies something the input holds once, per
+change or per op, or keeps per-entry structures the estimate did not
+price. Peak and estimate in MB (2^20 bytes), before and after the terms
+of [The estimate](#the-estimate) that price them:
+
+| Input (bytes) | Peak | Estimate before | after |
+|---|---|---|---|
+| Document chunk, 2,000 empty changes sharing one 100 kB message (a repeat run; 100 kB, or 209 bytes deflated) | 766 | 4.6 (167x) | 958 (0.80) |
+| Document chunk, 3 changes sharing one 30 MB message (30 MB) | 372 | 286 (1.30x) | 572 (0.65) |
+| Document chunk, 2,000 empty changes by a 100 kB actor (100 kB) | 766 | 4.6 (167x) | 958 (0.80) |
+| Document chunk, 2,000 changes of a 16-byte actor, each putting a key in a map a 100 kB actor made (100 kB) | 766 | 5.7 (135x) | 960 (0.80) |
+| Document chunk, 2,000 changes sharing one 100 kB key (100 kB) | 384 | 5.7 (68x) | 959 (0.40) |
+| Change chunk, 2,000 puts of one 100 kB key (100 kB) | 192 | 3.1 (63x) | 1,528 (0.13) |
+| Change chunk, 2,000 marks with one 100 kB name (100 kB) | 383 | 3.1 (125x) | 1,528 (0.25) |
+| Change chunk, 500 maps each given one 50 kB key between two others (52 kB; `normalize`, with its save) | 141 | 2.1 (67x) | 239 (0.59) |
+| Document chunk, 2,100,000 / 4,200,000 empty columns (4.2 / 8.4 MB) | 240 / 480 | 40 / 80 (6.0x) | 441 / 881 (0.54) |
+| Change chunk, 2,100,000 / 4,200,000 empty columns (4.2 / 8.4 MB) | 336 / 672 | 40 / 80 (8.4x) | 441 / 881 (0.76) |
+| The same compressed (4 / 8 kB) | 348 / 696 | 40 / 80 (8.7x) | 441 / 881 (0.79) |
+
+Where Automerge 0.12 copies:
+
+- Messages: `ChangeCollector::collect` rebuilds every change of a
+  document as a `StoredChange` whose bytes hold the message and whose
+  `message` is a `String` copy of it (`op_set2/change/collector.rs`,
+  `finish`); `Document::verify_changes` clones every rebuilt change into
+  `MismatchedHeads` when the heads do not match. 4.0 bytes per byte of
+  the expanded run.
+- Actor ids: `ActorId` is a `TinyVec<[u8; 16]>`, so a longer id is a heap
+  copy wherever it is cloned; every rebuilt change holds its own actor
+  and the other actors its ops refer to in its bytes and as `ActorId`s
+  (`ChangeCols::actor`, `other_actors`), cloned again into the error.
+  4.0 bytes per byte.
+- Keys and mark names: a document's rebuilt changes hold their ops' keys
+  in their bytes (2.0 bytes per byte with the error's clone); applying a
+  change (`import_ops` in `op_set2/change/batch.rs`) makes an owned
+  `String` of every op's key (`Key::map`) and mark name, all held until
+  the batch is applied (1.0 and 2.0 bytes per byte), and the document's
+  key column holds a key literally where other keys come between its
+  rows (4.0 with the `String`s, 5.9 with `normalize`'s save).
+- Column metadata: `RawColumns::parse` collects the entries with
+  `parse::apply_n` into a vector that doubles as it grows, collects them
+  again into `RawColumn`s, and the change and document paths copy the
+  list once more (`uncompressed()`, `ChangeOpsColumns`,
+  `OpSet::validate`): up to 120 bytes per entry (document), 168 (change
+  chunk), 174 (compressed), at counts just past a power of two.
+
+The scan computes the expanded sizes from run headers (a repeat run of
+`n` strings of `len` bytes: `(n - 1) × len`; an actor column's run:
+its length, at most the changes, times the actor's length), so it stays
+proportional to the input. It no longer allocates per metadata entry:
+before, it kept two vectors per entry (48 bytes per two input bytes),
+so refusing such input cost about a third of its estimate; a block whose
+extra entries alone exceed the limit now stops the scan before they are
+read (12,000,000 entries in 24 kB: refused at the default limit with a
+peak under 72 MB, in under 2 s).
+
+Saves written by Automerge of the same shapes load (2,000 commits
+sharing one 100 kB message 0.40, one 100 kB key 0.20, by a 100 kB actor
+0.20), and so do they after another save, where they are rebuilt and
+applied as changes (0.15). The estimate of the long-actor save is loose:
+it assumes each of its 1,999 overwrites refers to another actor, three
+times, where they refer to the changes' own (a run-level bound cannot
+tell); ordinary documents, whose actor ids are 16 bytes, are unaffected.
+Every other input of the battery kept its estimate within 1% (map keys
+repeated by a run: one key overwritten 40,000 times +0.5%, 400 actors ×
+400 changes of 16 keys +1%), and its worst ratio stays 0.80. A 200,000-
+input release fuzz session found no violation. `tests/limits.sh` with
+the four inputs (a 1 kB compressed save of 6,000 changes sharing a
+100 kB message, a 100 kB document chunk of 6,000 changes by a 100 kB
+actor, a 100 kB change chunk of 16,000 puts of one 100 kB key, and a
+24 kB compressed change chunk listing 12,000,000 empty columns): each
+aborts the capped cluster without the limit, and gets `53400` with it
+through every path, with no restart.
+
+Cost, interleaved (the previous commit and this one alternating, five
+pairs; median of the per-run medians of five repetitions; release). The
+scan alone (`budget::scan_input`, median of seven batches of 2,000):
+83 kB list stored 66.4 → 64.2 µs, compressed 293 → 292 µs; 877 kB list
+stored 673 → 647 µs, compressed 2,476 → 2,470 µs (no per-entry vectors).
+`bench-core` normalize, ms:
+
+| document | stored before | after | compressed before | after |
+|---|---|---|---|---|
+| 83 kB list | 16.5 | 16.2 | 16.9 | 16.6 |
+| 877 kB list | 166.9 | 165.2 | 170.2 | 169.8 |
+| 3 MB text | 2488.8 | 2480.9 | 2525.9 | 2528.4 |
+| 5,000 typed characters | 22.4 | 22.6 | 22.4 | 22.6 |
+
+`bench-sql`, ms:
+
+| case | 83 kB before | after | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|---|---|
+| R1 read (unchanged code) | 25.7 | 25.6 | 261.6 | 256.0 | 2796 | 2807 |
+| I1 insert of a compressed save | 21.1 | 21.7 | 204.5 | 199.8 | 2762 | 2764 |
+| W1 merge(doc, changes) | 38.1 | 37.7 | 368.1 | 361.9 | 5275 | 5213 |
+| W2 merge(doc, newer save) | 22.5 | 23.0 | 208.2 | 207.1 | 2791 | 2781 |
+| W3 merge(doc, save::automerge) | 22.1 | 22.6 | 209.7 | 209.5 | 2776 | 2783 |
+| W4 upsert | 38.6 | 38.2 | 372.5 | 368.1 | 5337 | 5302 |
+| W6 W3 as a text parameter | 38.7 | 38.7 | 381.2 | 373.6 | 5362 | 5374 |
+| A2 merge_agg of two versions | 18.8 | 18.2 | 175.0 | 174.4 | 2566 | 2562 |
+
+All within ±3.1% (at 83 kB, ±0.6 ms either way), about the drift of R1,
+whose code did not change (−2.2% at 877 kB); the scan, the only code on
+these paths that changed, got faster, by 2 to 26 µs.
+

@@ -28,7 +28,7 @@
 //! the estimate's constants are measured costs of Automerge 0.12.
 
 use automerge::marks::{ExpandMark, Mark};
-use automerge::transaction::Transactable;
+use automerge::transaction::{CommitOptions, Transactable};
 use automerge::{ActorId, AutoCommit, Automerge, ObjType, ROOT, ReadDoc, ScalarValue};
 use pg_automerge_core::budget::{
     self, Base, InputCounts, LimitKind, doc_estimate, scan_doc, scan_doc_exact, scan_input,
@@ -415,6 +415,38 @@ fn check_apply(name: &str, input: &[u8]) -> f64 {
     ratio
 }
 
+/// `input` after another actor's save: a document chunk that is not the
+/// first of an input is rebuilt into changes and applied (unless the
+/// document has its heads: the crafted ones list none, so only the
+/// documents of [`written`] are rebuilt this way).
+fn after_save(input: &[u8]) -> Vec<u8> {
+    let (save, _) = concurrent("text", 100, 9);
+    [save.as_slice(), input].concat()
+}
+
+/// A compressed save written by Automerge of 2,000 one-op changes that
+/// share a 100 kB string: every change's message (`"message"`, one repeat
+/// run of the message column), their actor id (`"actor"`), or the key
+/// every change puts (`"key"`, one repeat run of the key column). Loads
+/// fine, and its heads are real.
+fn written(kind: &str) -> Vec<u8> {
+    let big = "x".repeat(100_000);
+    let mut doc = match kind {
+        "actor" => AutoCommit::new().with_actor(ActorId::from(vec![7u8; 100_000])),
+        _ => AutoCommit::new().with_actor(actor(3)),
+    };
+    for i in 0..2_000i64 {
+        let key = if kind == "key" { big.as_str() } else { "k" };
+        doc.put(ROOT, key, i).unwrap();
+        let mut options = CommitOptions::default();
+        if kind == "message" {
+            options.set_message(big.clone());
+        }
+        doc.commit_with(options);
+    }
+    doc.save()
+}
+
 /// A document's change messages, one repeat run of a string: Automerge
 /// rebuilds every change with its own copy of the message (in the
 /// change's bytes and as a `String`), and a load whose heads do not match
@@ -438,6 +470,14 @@ fn repeated_messages_are_priced() {
         check_normalize(name, &input, false);
         check_apply(name, &input);
     }
+    let input = written("message");
+    check_normalize("written: 2000 changes, one 100 kB message", &input, true);
+    let input = after_save(&input);
+    check_normalize(
+        "save + written: 2000 changes, one 100 kB message",
+        &input,
+        true,
+    );
 }
 
 /// Keys and mark names repeated by a run: applying a change makes an
@@ -473,6 +513,10 @@ fn repeated_keys_and_mark_names_are_priced() {
         check_normalize(name, &input, loads);
         check_apply(name, &input);
     }
+    let input = written("key");
+    check_normalize("written: 2000 changes, one 100 kB key", &input, true);
+    let input = after_save(&input);
+    check_normalize("save + written: 2000 changes, one 100 kB key", &input, true);
 }
 
 /// Actor ids longer than the 16 bytes an `ActorId` holds inline: every
@@ -498,6 +542,14 @@ fn long_actor_ids_are_priced() {
         check_normalize(name, &input, false);
         check_apply(name, &input);
     }
+    let input = written("actor");
+    check_normalize("written: 2000 changes by a 100 kB actor", &input, true);
+    let input = after_save(&input);
+    check_normalize(
+        "save + written: 2000 changes by a 100 kB actor",
+        &input,
+        true,
+    );
 }
 
 /// Column metadata entries: Automerge keeps every entry of a metadata
