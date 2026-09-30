@@ -107,6 +107,12 @@ const INSERT: u64 = 0x34;
 const MESSAGE: u64 = 0x35;
 /// The mark name column (document and change chunks).
 const MARK_NAME: u64 = 0xa5;
+/// The change actor column of a document chunk.
+const CHANGE_ACTOR: u64 = 0x01;
+/// The longest actor id Automerge's `ActorId` holds inline (a
+/// `TinyVec<[u8; 16]>`): a longer one is a heap copy wherever it is
+/// cloned.
+const INLINE_ACTOR: usize = 16;
 
 /// Bytes charged per inflated input byte (values and strings are copied
 /// into the document, 5-7 bytes each measured).
@@ -197,7 +203,9 @@ pub struct DocCounts {
     /// Bytes that rebuilding the document's changes copies beyond the
     /// chunk's own bytes: a repeat run of `n` change messages, op keys or
     /// mark names of `len` bytes is `(n - 1) * len` (every change holds
-    /// its own copy). Computed from the run headers, never expanded.
+    /// its own copy), and the actor ids longer than 16 bytes that each
+    /// change holds (its own, and the others its ops refer to). Computed
+    /// from the run headers, never expanded.
     pub rebuilt: u64,
 }
 
@@ -1429,10 +1437,15 @@ impl Scanner {
             return Err(Stop::Malformed);
         }
         counts.actors = actors as u64;
-        for _ in 0..actors {
+        // The actors longer than an `ActorId` holds inline: (index, length).
+        let mut long = Vec::new();
+        for i in 0..actors {
             self.ticker.tick();
             let len = r.usize_c().ok_or_else(malformed)?;
             r.take(len).ok_or_else(malformed)?;
+            if len > INLINE_ACTOR {
+                long.push((i as u64, len as u64));
+            }
         }
         let heads = r.usize_c().ok_or_else(malformed)?;
         r.take(heads.checked_mul(32).ok_or_else(malformed)?)
@@ -1469,7 +1482,14 @@ impl Scanner {
             &SUCC_MEMBERS,
             &[KEY_STR, MARK_NAME],
         );
-        counts.rebuilt = messages.saturating_add(strings);
+        let actor_copies = if long.is_empty() {
+            0
+        } else {
+            self.actor_copies(&long, &change_cols, &op_cols, changes, succ)
+        };
+        counts.rebuilt = messages
+            .saturating_add(strings)
+            .saturating_add(actor_copies);
         counts.changes = changes;
         counts.deps = deps;
         counts.ops = ops;
@@ -1498,6 +1518,56 @@ impl Scanner {
                 .collect();
         }
         Ok(layout && r.canonical)
+    }
+
+    /// The bytes of long actor ids (`long`: index and length of every
+    /// actor longer than [`INLINE_ACTOR`]) that a document's rebuilt
+    /// changes hold: each change holds its own actor and the other actors
+    /// its ops refer to, in its bytes and as `ActorId`s. Run by run: the
+    /// change actor column's runs times the actor's length (its own), and
+    /// for the other actors the object and key actor columns' runs, each
+    /// at most once per change (`changes`), plus for every successor entry
+    /// (`succ`) three references (a rebuilt op's pred, or a delete Automerge
+    /// rebuilds from it: its object, key and pred) of the longest actor;
+    /// at most every change referring to every long actor.
+    fn actor_copies(
+        &mut self,
+        long: &[(u64, u64)],
+        change_cols: &[Column<'_>],
+        op_cols: &[Column<'_>],
+        changes: u64,
+        succ: u64,
+    ) -> u64 {
+        let len_of = |idx: u64| {
+            long.binary_search_by_key(&idx, |&(i, _)| i)
+                .map_or(0, |at| long[at].1)
+        };
+        let mut sum_runs = |cols: &[Column<'_>], spec: u64, cap: u64| -> u64 {
+            let mut sum = 0u64;
+            for col in cols.iter().filter(|c| c.spec == spec) {
+                let mut runs = Runs::new(spec & 7, &col.data);
+                while let Some(seg) = runs.next_seg() {
+                    self.ticker.tick();
+                    if let Val::U(idx) = seg.first {
+                        let copies = seg.len.min(cap);
+                        sum = sum.saturating_add(copies.saturating_mul(len_of(idx)));
+                    }
+                }
+            }
+            sum
+        };
+        let own = sum_runs(change_cols, CHANGE_ACTOR, u64::MAX);
+        let referred = sum_runs(op_cols, OBJ_ACTOR, changes)
+            .saturating_add(sum_runs(op_cols, KEY_ACTOR, changes));
+        let longest = long.iter().map(|&(_, len)| len).max().unwrap_or(0);
+        let all: u64 = long
+            .iter()
+            .map(|&(_, len)| len)
+            .fold(0, u64::saturating_add);
+        let others = referred
+            .saturating_add(succ.saturating_mul(3).saturating_mul(longest))
+            .min(changes.saturating_mul(all));
+        own.saturating_add(others)
     }
 
     /// Scan a change chunk's data (inflated if it was compressed).

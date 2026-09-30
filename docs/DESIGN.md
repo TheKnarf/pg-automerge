@@ -1299,7 +1299,16 @@ are input bytes, already charged 10 each).
   its bytes and as a `String`, and its ops' keys and mark names in its
   bytes, and a load whose heads do not match clones every rebuilt change
   into its error: 4.0 bytes per byte measured for messages, 2.0 for keys,
-  charged 5).
+  charged 5), and the actor ids longer than the 16 bytes Automerge's
+  `ActorId` holds inline (every rebuilt change holds its own actor and
+  the other actors its ops refer to, in its bytes and as `ActorId`s:
+  4.0 bytes per byte measured). A change's own actor is counted from the
+  change actor column, run length × length; the others from the object
+  and key actor columns, each run at most once per change (min(run
+  length, changes) × length), plus three references of the longest actor
+  per successor entry (the pred of a rebuilt op, or the delete Automerge
+  rebuilds from it: its object, key and pred), and at most every change
+  referring to every long actor (changes × their total length).
 - Repeated bytes of changes: the keys and mark names of change chunks
   (importing a change's ops makes an owned `String` of every op's key and
   mark name, and the document holds a key literally wherever other keys
@@ -1318,7 +1327,13 @@ base.
 
 For a merge result, the rebuilt bytes of the bound (see [Merge
 results](#merge-results)) add the bytes and the repeated bytes of the
-changes applied: a rebuilt change is the change that was applied.
+changes applied: a rebuilt change is the change that was applied, so
+this bounds what loading the result copies. It does not always bound
+what a scan of the saved result counts: the actor term is not additive
+(a run of the object actor column that new rows split counts up to
+min(run, changes) twice), so, like the bytes term, a result can be
+stored with a scanned estimate somewhat over the limit when its bound is
+under it; its load copies no more than the bound says.
 
 The counts: ops are the largest row count of the known op columns (not
 the members of a group); Automerge sizes some allocations by one column's

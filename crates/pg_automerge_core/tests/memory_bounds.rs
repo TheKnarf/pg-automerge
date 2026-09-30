@@ -475,6 +475,31 @@ fn repeated_keys_and_mark_names_are_priced() {
     }
 }
 
+/// Actor ids longer than the 16 bytes an `ActorId` holds inline: every
+/// rebuilt change of a document holds its own actor and the other actors
+/// its ops refer to, in its bytes and as `ActorId`s (and a load whose
+/// heads do not match clones them all into its error).
+#[test]
+fn long_actor_ids_are_priced() {
+    for (name, input) in [
+        (
+            "doc 2000 changes by a 100 kB actor",
+            craft::long_actor_changes(2_000, 100_000),
+        ),
+        (
+            "doc 2000 changes referring to a 100 kB actor",
+            craft::long_actor_refs(2_000, 100_000),
+        ),
+        (
+            "doc 20000 changes by a 17-byte actor",
+            craft::long_actor_changes(20_000, 17),
+        ),
+    ] {
+        check_normalize(name, &input, false);
+        check_apply(name, &input);
+    }
+}
+
 #[test]
 fn rle_bombs_are_rejected_with_a_tiny_peak() {
     // Tiny inputs describing hundreds of millions of rows: with the

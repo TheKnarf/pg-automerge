@@ -21,6 +21,9 @@
 //! - `keys.bin`: a change chunk of 16,000 puts of one 100 kB key (a
 //!   repeat run, about 100 kB): applying it makes an owned copy of the key
 //!   per op (about 1.6 GB).
+//! - `actors.bin`: a document chunk of 6,000 empty changes by one actor
+//!   whose id is 100 kB long (about 100 kB): every rebuilt change holds
+//!   the id twice, cloned again into the error (about 2.4 GB).
 //! - `small.bin`: an ordinary small document.
 
 use std::path::PathBuf;
@@ -63,6 +66,12 @@ fn main() {
     .unwrap();
 
     std::fs::write(dir.join("keys.bin"), craft::repeated_keys(16_000, 100_000)).unwrap();
+
+    std::fs::write(
+        dir.join("actors.bin"),
+        craft::long_actor_changes(6_000, 100_000),
+    )
+    .unwrap();
 
     let mut small = AutoCommit::new().with_actor(ActorId::from([2u8; 16]));
     small.put(ROOT, "status", "small").unwrap();
