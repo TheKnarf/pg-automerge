@@ -2,6 +2,10 @@
 rust = { version = "1.98.1", components = "rustfmt,clippy" }
 # Must match the `pgrx` crate version in Cargo.toml exactly.
 "cargo:cargo-pgrx" = "0.19.3"
+# Workflow and shell linting for tests/check_ci.sh (mise run lint); prebuilt
+# binaries. actionlint runs shellcheck on the workflow's run: scripts.
+actionlint = "1.7.12"
+shellcheck = "0.11.0"
 
 [settings]
 # Build cargo tools from source with --locked for reproducibility.
@@ -91,7 +95,7 @@ description = "Build a release package for the Postgres 18 of $PG_CONFIG (requir
 run = "bash scripts/package.sh"
 
 [tasks.lint]
-description = "CI/packaging checks, rustfmt check, clippy -D warnings for each build configuration, rustdoc -D warnings"
+description = "CI/packaging checks (actionlint, shellcheck, workflow and Docker invariants), rustfmt check, clippy -D warnings for each build configuration, rustdoc -D warnings"
 run = [
   "bash tests/check_ci.sh",
   "cargo fmt --all --check",

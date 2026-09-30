@@ -1,6 +1,14 @@
-# Runs what `mise run ci` runs locally: lint, all test suites and the
-# regress tests, against the pgrx-managed Postgres 18; then builds the
-# Docker image and runs `mise run docker-test` against it.
+# Two jobs on every push and pull request, in parallel:
+#   - ci: what `mise run ci` runs locally (lint, all test suites and the
+#     regress tests, against the pgrx-managed Postgres 18); on tags also the
+#     release tarball.
+#   - docker: builds the Docker image (BuildKit, layers cached in the GitHub
+#     Actions cache) and runs tests/docker.sh against it, including the
+#     container variants of the multi-session suites. On tags it runs on an
+#     amd64 and a native arm64 runner and uploads each image as a workflow
+#     artifact.
+# On tags, publish pushes those images to a registry, but only once one is
+# configured (README.md, "Publishing the image"); until then it skips.
 name: CI
 
 on:
@@ -19,6 +27,10 @@ on:
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
+
+# Read-only by default; no job needs to write to the repository.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,22 +79,12 @@ jobs:
       - name: Lint, test, regress
         run: mise run ci
 
-      # The Docker image (official postgres:18 + the extension built against
-      # its PGDG Postgres), then tests/docker.sh against containers of it,
-      # including the regress examples and the multi-session suites (they
-      # use the pgrx Postgres' client tools initialized above). A cold
-      # build: the runner starts without BuildKit's cache mounts. Never
-      # pushed.
-      - name: Docker image build and test
-        run: mise run docker-test
-
       - name: Benchmarks (nightly only)
         if: github.event_name == 'schedule'
         run: |
           mise run bench-core | tee bench-core.txt
           BENCH_REPS=2 mise run bench-expanded | tee bench-expanded.txt
           mise run bench-sql | tee bench-sql.txt
-          mise run docker-bench-sql | tee bench-sql-docker.txt
 
       - name: Upload benchmark tables
         if: github.event_name == 'schedule'
@@ -126,3 +128,165 @@ jobs:
         with:
           name: pg_automerge-pg18
           path: target/release/pg_automerge-pg18.tar.gz
+
+  # The Docker image (official postgres:18 + the extension built against
+  # its PGDG Postgres, docker/Dockerfile), tested with tests/docker.sh.
+  # Independent of the ci job: it needs neither pgrx nor its Postgres.
+  docker:
+    name: docker (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # amd64 always; on tags also arm64, on GitHub's native arm64 runner
+        # (no QEMU, no cross-compilation; see docs/DESIGN.md, "Docker image
+        # in CI"). Set the repository variable PG_AUTOMERGE_ARM64=false
+        # where that runner is not available.
+        arch: ${{ fromJSON((startsWith(github.ref, 'refs/tags/') && vars.PG_AUTOMERGE_ARM64 != 'false') && '["amd64", "arm64"]' || '["amd64"]') }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches the crate version (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sh scripts/versions.sh | sed -n 's/^CRATE_VERSION=//p')"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml's version $version"
+            exit 1
+          fi
+
+      # Rust as pinned in mise.toml, for the suites' fixture generators
+      # (cargo run -p pg_automerge_core --example ...). Only Rust: the image
+      # builds its own toolchain, and nothing here needs cargo-pgrx.
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: rust
+          cache: true
+
+      # The client tools of the same major as the server (psql, pg_dump,
+      # pg_restore, pg_regress, pg_config): PGDG's postgresql-client-18,
+      # the package the image's own Postgres comes from. No server, no
+      # cluster.
+      - name: Install the PGDG Postgres 18 client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-18
+          /usr/lib/postgresql/18/bin/psql --version
+          docker version --format 'docker {{.Server.Version}}'
+          docker compose version
+
+      # A docker-container builder (BuildKit), which can export its cache;
+      # the runtime token lets `docker build` in a run step reach the
+      # GitHub Actions cache (type=gha).
+      - uses: docker/setup-buildx-action@v3
+        id: buildx
+      - uses: crazy-max/ghaction-github-runtime@v3
+
+      # scripts/docker-build.sh, as `mise run docker-build` runs it (the
+      # version, source and revision arguments), plus: --load (the
+      # docker-container builder keeps results to itself otherwise) and
+      # the layer cache, one scope per architecture, mode=max so the
+      # builder stage's toolchain layers are cached too. BuildKit's cache
+      # mounts (cargo registry, target/) are not part of it, so a source
+      # change recompiles the dependencies. A failed cache export does not
+      # fail the build. Nothing is pushed.
+      - name: Build the image
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          bash scripts/docker-build.sh -- --load \
+            --cache-from "type=gha,scope=pg-automerge-${{ matrix.arch }}" \
+            --cache-to "type=gha,scope=pg-automerge-${{ matrix.arch }},mode=max,ignore-error=true"
+          docker image ls pg-automerge
+
+      - name: Test the image (tests/docker.sh)
+        env:
+          PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config
+        run: bash tests/docker.sh
+
+      - name: Benchmark against the image (nightly only)
+        if: github.event_name == 'schedule'
+        env:
+          PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config
+        run: bash tests/docker_bench.sh | tee bench-sql-docker.txt
+
+      - name: Upload the benchmark table (nightly only)
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-docker
+          path: bench-sql-docker.txt
+
+      # `docker load -i` reads it back; the publish job pushes it.
+      - name: Save the image (tags only)
+        id: archive
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          file="$(bash scripts/docker-archive.sh "" dist)"
+          echo "file=$file" >>"$GITHUB_OUTPUT"
+          echo "name=$(basename "$file" .tar.gz)" >>"$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Upload the image (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.name }}
+          path: ${{ steps.archive.outputs.file }}
+          # Already gzipped.
+          compression-level: 0
+          if-no-files-found: error
+
+  # Pushes the tested images of a tag as one multi-architecture image.
+  # Prepared, not enabled: it does nothing until the repository has the
+  # secret PG_AUTOMERGE_REGISTRY_TOKEN and the variables
+  # PG_AUTOMERGE_REGISTRY_IMAGE (e.g. ghcr.io/you/pg-automerge) and
+  # PG_AUTOMERGE_REGISTRY_USERNAME. See README.md, "Publishing the image".
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [ci, docker]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      REGISTRY_IMAGE: ${{ vars.PG_AUTOMERGE_REGISTRY_IMAGE }}
+      REGISTRY_USERNAME: ${{ vars.PG_AUTOMERGE_REGISTRY_USERNAME }}
+      REGISTRY_TOKEN: ${{ secrets.PG_AUTOMERGE_REGISTRY_TOKEN }}
+    steps:
+      - name: Registry configured?
+        id: cfg
+        run: |
+          if [ -z "$REGISTRY_TOKEN" ]; then
+            echo "::notice::No PG_AUTOMERGE_REGISTRY_TOKEN secret: not pushing (the images are this run's artifacts)."
+            echo "push=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$REGISTRY_IMAGE" ] || [ -z "$REGISTRY_USERNAME" ]; then
+            echo "::error::PG_AUTOMERGE_REGISTRY_TOKEN is set, but PG_AUTOMERGE_REGISTRY_IMAGE or PG_AUTOMERGE_REGISTRY_USERNAME is not"
+            exit 1
+          fi
+          echo "push=true" >>"$GITHUB_OUTPUT"
+          echo "registry=${REGISTRY_IMAGE%%/*}" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.push == 'true'
+
+      - uses: actions/download-artifact@v4
+        if: steps.cfg.outputs.push == 'true'
+        with:
+          pattern: pg-automerge-*-linux-*
+          path: dist
+          merge-multiple: true
+
+      - uses: docker/login-action@v3
+        if: steps.cfg.outputs.push == 'true'
+        with:
+          registry: ${{ steps.cfg.outputs.registry }}
+          username: ${{ env.REGISTRY_USERNAME }}
+          password: ${{ env.REGISTRY_TOKEN }}
+
+      - name: Push
+        if: steps.cfg.outputs.push == 'true'
+        run: bash scripts/docker-push.sh "$REGISTRY_IMAGE" dist/pg-automerge-*-linux-*.tar.gz

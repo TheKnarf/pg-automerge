@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helpers of the Docker image tests (tests/docker.sh,
 # tests/docker_bench.sh). Sourced, not run.
 #
@@ -25,7 +26,7 @@ VERSION="$(sh scripts/versions.sh | sed -n 's/^CRATE_VERSION=//p')"
 IMAGE="${PG_AUTOMERGE_IMAGE:-pg-automerge:$VERSION}"
 LABEL=pg-automerge-test
 PROJECT="pg-automerge-test-$$"
-PG_PASSWORD=test
+PG_PASSWORD="test"
 DWORK="$(mktemp -d)"
 CONTAINERS=()
 VOLUMES=()

@@ -82,7 +82,6 @@ for src in $(grep -E '^COPY ' "$df" | grep -v -- '--from=' | sed -E 's/^COPY( --
   [ "$src" = . ] && continue
   grep -qxF "!$src" .dockerignore || fail ".dockerignore does not let $src through (COPY in $df)"
 done
-grep -qE '^        run: mise run docker-test$' "$wf" || fail "$wf: CI must run mise run docker-test"
 for f in docker/initdb-pg-automerge.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh; do
   bash -n "$f" || fail "$f: syntax"
 done
@@ -92,3 +91,51 @@ grep -qE '^      - pgdata:/var/lib/postgresql$' compose.yaml \
   || fail "compose.yaml: mount the volume at /var/lib/postgresql (postgres:18 keeps PGDATA in 18/docker below it)"
 
 echo "check_ci: docker ok"
+
+# ---------------------------------------------------------------------------
+# The workflow: actionlint (syntax, expressions, runner labels, and
+# running shellcheck on every run: script), shellcheck on the scripts CI
+# runs, and the invariants of the docker and publish jobs.
+command -v actionlint >/dev/null && command -v shellcheck >/dev/null \
+  || fail "actionlint and shellcheck are needed (pinned in mise.toml: mise install)"
+actionlint "$wf" || fail "$wf: actionlint"
+shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh \
+  docker/initdb-pg-automerge.sh || fail "shellcheck"
+
+# job NAME: the lines of that job (from "  NAME:" to the next job).
+job() { awk -v j="  $1:" '$0 == j {p=1; print; next} p && /^  [a-z]/ {exit} p' "$wf"; }
+for j in ci docker publish; do [ -n "$(job "$j")" ] || fail "$wf: no $j job"; done
+docker_job="$(job docker)"; publish_job="$(job publish)"
+has() { grep -qE -- "$2" <<<"$1"; }
+
+# docker: runs on every push and PR (no job-level if), amd64 always and
+# arm64 on tags on the native runner, the layer cache, the tests with the
+# PGDG client tools, the tag/version check and the artifact.
+if has "$docker_job" '^    if:'; then fail "$wf: the docker job must run for every event"; fi
+has "$docker_job" "^        arch: .*startsWith\(github\.ref, 'refs/tags/'\).*'\[\"amd64\", \"arm64\"\]'.*'\[\"amd64\"\]'" \
+  || fail "$wf: docker matrix must be amd64, plus arm64 on tags"
+has "$docker_job" "^    runs-on: .*'ubuntu-24.04-arm'" || fail "$wf: arm64 must build on the native arm64 runner"
+has "$docker_job" 'bash scripts/docker-build.sh -- --load ' || fail "$wf: build with scripts/docker-build.sh --load"
+has "$docker_job" '--cache-from "type=gha,scope=pg-automerge-\$\{\{ matrix.arch \}\}"' || fail "$wf: cache-from type=gha per arch"
+has "$docker_job" '--cache-to "type=gha,scope=pg-automerge-\$\{\{ matrix.arch \}\},mode=max' || fail "$wf: cache-to type=gha,mode=max per arch"
+has "$docker_job" '^        run: bash tests/docker.sh$' || fail "$wf: the docker job must run tests/docker.sh"
+has "$docker_job" '^          PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config$' || fail "$wf: the docker tests use PGDG's client tools"
+has "$docker_job" 'DOCKER_TEST_SUITES' && fail "$wf: the docker job must run the suites"
+has "$docker_job" 'GITHUB_REF_NAME" != "v\$version"' || fail "$wf: tags must be checked against the crate version"
+has "$docker_job" 'bash scripts/docker-archive.sh' || fail "$wf: tags must save the image (scripts/docker-archive.sh)"
+
+# Pushing: only the publish job, only on tags, only after both test jobs,
+# and every step after the configuration check gated by it (so without
+# the secret nothing is pushed). Nothing else pushes or logs in.
+has "$publish_job" "^    if: startsWith\(github\.ref, 'refs/tags/'\)$" || fail "$wf: publish must be tags only"
+has "$publish_job" '^    needs: \[ci, docker\]$' || fail "$wf: publish must need ci and docker"
+has "$publish_job" '^          if \[ -z "\$REGISTRY_TOKEN" \]; then$' || fail "$wf: publish must check the secret"
+steps=$(grep -cE '^      - ' <<<"$publish_job")
+gated=$(grep -cE "^        if: steps\.cfg\.outputs\.push == 'true'$" <<<"$publish_job")
+[ "$gated" -eq $((steps - 1)) ] || fail "$wf: publish: $gated of $((steps - 1)) steps after the check are gated on it"
+outside="$(awk -v j="  publish:" '$0 == j {p=1} p && /^  [a-z]/ && $0 != j {p=0} !p' "$wf")"
+if has "$outside" 'docker/login-action|docker-push\.sh|docker push|imagetools'; then fail "$wf: pushing outside the publish job"; fi
+if grep -qE 'push: true|packages: write|write-all' "$wf"; then fail "$wf: no push: true or write permissions"; fi
+grep -qE '^permissions:$' "$wf" && grep -qE '^  contents: read$' "$wf" || fail "$wf: top-level permissions must be contents: read"
+
+echo "check_ci: workflow ok"

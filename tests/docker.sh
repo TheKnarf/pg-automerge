@@ -9,6 +9,12 @@
 # exit, with their volumes (tests/docker_lib.sh). Checks:
 #   - the image: OCI labels, the version file, no toolchain, lz4 support,
 #     only the expected extension files;
+#   - the release scripts: scripts/docker-archive.sh saves the image as
+#     pg-automerge-<version>-linux-<arch>.tar.gz, scripts/docker-push.sh
+#     --dry-run loads it back (the same image), prints the per-arch push
+#     and the multi-arch index it would make, and refuses a repository
+#     without a registry host, an archive of another version and two of
+#     one architecture, leaving no tags behind;
 #   - default init: the container turns healthy, the init script installed
 #     pg_automerge in POSTGRES_DB (at the Cargo.toml version) and nowhere
 #     else, the server is a release build (debug_assertions off);
@@ -31,9 +37,10 @@
 #     ALTER EXTENSION pg_automerge UPDATE is a no-op at the current version;
 #   - PG_AUTOMERGE_CREATE_EXTENSION=0 skips the extension (and it can then
 #     be created by hand into a schema); an invalid value fails init;
-#   - the suites (unless DOCKER_TEST_SUITES=0; they need pgrx's pg18 client
-#     tools and cargo): the regress examples (pg_regress --use-existing,
-#     the same expected output as `mise run regress`), and concurrency.sh,
+#   - the suites (unless DOCKER_TEST_SUITES=0; they need Postgres 18 client
+#     tools, PG_CONFIG's or by default pgrx's, and cargo): the regress
+#     examples (pg_regress --use-existing, the same expected output as
+#     `mise run regress`), and concurrency.sh,
 #     notify.sh, dump.sh and extension.sh in tests/lib.sh's external mode,
 #     against one container; limits.sh in its container mode against a
 #     container started with --memory (no swap): without the limit the
@@ -47,6 +54,7 @@
 #     is there, and `down -v` removes everything.
 #
 # Env: PG_AUTOMERGE_IMAGE (default pg-automerge:<Cargo.toml version>),
+# PG_CONFIG (the suites' client tools, default pgrx's pg18),
 # DOCKER_TEST_SUITES=0 (skip the suites), DOCKER_TEST_MEMORY (the limits
 # container's memory cap, default 1g).
 
@@ -101,6 +109,31 @@ contents="$(docker run --rm --label "$LABEL" --entrypoint bash "$IMAGE" -euc "
 " 2>&1)" || { echo "$contents" >&2; fail "image contents"; }
 files="$(sort <<<"$contents" | tr '\n' ' ')"
 expect "extension files" "pg_automerge--$VERSION.sql pg_automerge.control pg_automerge.so " "$files"
+
+log "release archive (scripts/docker-archive.sh) and a push dry run (scripts/docker-push.sh)"
+ARCH="$(docker image inspect -f '{{.Architecture}}' "$IMAGE")"
+archive="$(bash scripts/docker-archive.sh "$IMAGE" "$DWORK/release")"
+expect "archive name" "$DWORK/release/pg-automerge-$VERSION-linux-$ARCH.tar.gz" "$archive"
+PUSH_REPO=registry.invalid/pg-automerge-test
+out="$(bash scripts/docker-push.sh --dry-run "$PUSH_REPO" "$archive")"
+expect "push dry run" "$(printf '%s\n' "+ docker push $PUSH_REPO:$VERSION-$ARCH" \
+    "+ docker buildx imagetools create -t $PUSH_REPO:$VERSION -t $PUSH_REPO:latest $PUSH_REPO:$VERSION-$ARCH")" "$out"
+expect "dry run leaves no tags" "" "$(docker image ls -q "$PUSH_REPO")"
+expect "the loaded archive is the image" "$(docker image inspect -f '{{.Id}}' "$IMAGE")" \
+    "$(docker image inspect -f '{{.Id}}' "pg-automerge:$VERSION")"
+# Refused: a repository without a registry host (Docker would pick Docker
+# Hub), an archive of another version, the same architecture twice.
+for bad in "pg-automerge|REPOSITORY must be registry-host/path" \
+           "$PUSH_REPO $DWORK/release/pg-automerge-0.0.0-linux-$ARCH.tar.gz|version 0.0.0, Cargo.toml says $VERSION" \
+           "$PUSH_REPO $archive|two archives for $ARCH"; do
+    args="${bad%%|*}"; want="${bad#*|}"
+    cp "$archive" "$DWORK/release/pg-automerge-0.0.0-linux-$ARCH.tar.gz"
+    # shellcheck disable=SC2086 # args is a word list
+    if out="$(bash scripts/docker-push.sh --dry-run $args "$archive" 2>&1)"; then fail "docker-push.sh accepted: $args"; fi
+    grep -qF "$want" <<<"$out" || fail "docker-push.sh $args: expected '$want', got: $out"
+done
+expect "refusals leave no tags" "" "$(docker image ls -q "$PUSH_REPO")"
+rm -rf "$DWORK/release"
 
 # ---------------------------------------------------------------------------
 log "default init: healthy, extension in POSTGRES_DB only, settings from -c"
@@ -286,7 +319,7 @@ docker rm -f -v "$(cname bad)" >/dev/null
 # ---------------------------------------------------------------------------
 if [[ "${DOCKER_TEST_SUITES:-1}" == 1 ]]; then
     PG_CONFIG="${PG_CONFIG:-$(sed -n 's/^pg18 *= *"\(.*\)"/\1/p' "${PGRX_HOME:-$HOME/.pgrx}/config.toml" 2>/dev/null)}"
-    [[ -x "$PG_CONFIG" ]] || fail "the suites need pgrx's pg18 client tools (mise run pgrx-init), or DOCKER_TEST_SUITES=0"
+    [[ -x "$PG_CONFIG" ]] || fail "the suites need Postgres 18 client tools: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config (PGDG's postgresql-client-18), pgrx's (mise run pgrx-init), or DOCKER_TEST_SUITES=0"
     export PG_CONFIG
 
     log "suites against a fresh container"

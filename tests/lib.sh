@@ -26,8 +26,10 @@
 #     superuser), PG_AUTOMERGE_TEST_PASSWORD (optional). The scripts create
 #     and drop their own databases (and extension.sh a role) on it, so use
 #     a throwaway server.
-# The client tools are pgrx's pg18 build in both modes (same major version
-# as the server, as pg_dump requires).
+# The client tools are PG_CONFIG's bindir in both modes: by default pgrx's
+# pg18 build; any Postgres 18 client works in external mode (CI's docker job
+# uses PGDG's postgresql-client-18). Same major version as the server, as
+# pg_dump requires.
 #
 # Env: PG_CONFIG (default: pgrx's pg18), PG_AUTOMERGE_INSTALLED=1 (skip the
 # dev-build install: `mise run test` installs once for all scripts).

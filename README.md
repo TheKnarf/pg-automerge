@@ -94,11 +94,12 @@ The extension is compiled in a builder stage from the same base image,
 against that image's own PGDG Postgres 18 (release build, no assertions),
 with Rust and cargo-pgrx as pinned in `mise.toml`. Nothing is pushed
 anywhere; the image lives in your local Docker until you push it to a
-registry of your own.
+registry of your own (CI can do that for tags once you
+[configure it](#publishing-the-image)).
 
 ```sh
 mise run docker-build        # pg-automerge:0.1.0 and pg-automerge:dev
-mise run docker-test         # builds, then tests the image and compose.yaml (about 2 minutes)
+mise run docker-test         # builds, then tests the image and compose.yaml (about 4 minutes once built)
 ```
 
 The image is 3.5 MB larger than `postgres:18`. A first build takes about
@@ -220,8 +221,12 @@ for `automerge_notify()`, the settings and their privileges),
 same volume, the regress examples and the concurrency, notify, dump and
 extension suites, the load memory limit against a container started with
 `--memory=1g`, and that no server log shows an assertion failure, panic
-or crashed backend. The suites use the client tools of the pgrx Postgres
-(`mise run pgrx-init`); `DOCKER_TEST_SUITES=0` skips them.
+or crashed backend. The suites need Postgres 18 client tools and cargo:
+those of the pgrx Postgres by default (`mise run pgrx-init`), or PGDG's
+`postgresql-client-18` with
+`PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config` (what CI uses);
+`DOCKER_TEST_SUITES=0` skips them. It also checks the release scripts:
+`scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
 
 The multi-session suites run against any server of yours, too (it needs
 the extension available, a superuser, and room for scratch databases):
@@ -234,6 +239,63 @@ PG_AUTOMERGE_TEST_USER=postgres PG_AUTOMERGE_TEST_PASSWORD=... \
 
 `mise run docker-bench-sql` times the everyday SQL paths against the
 image; see [Performance](#performance) for how it compares.
+
+### CI
+
+`.github/workflows/ci.yml` has a `docker` job next to the `ci` job, on
+every push and pull request: it builds the image with BuildKit, caching
+its layers in the GitHub Actions cache (so the Rust toolchain and
+cargo-pgrx are built once, not on every run), and runs `tests/docker.sh`
+in full against it, with PGDG's client tools. It does not need pgrx.
+
+On a `v*` tag (which must equal the `Cargo.toml` version) the job runs
+twice, on an amd64 and on GitHub's native arm64 runner
+(`ubuntu-24.04-arm`), each building and testing its own image, and
+uploads each as a workflow artifact
+(`pg-automerge-<version>-linux-<arch>.tar.gz`, under Actions > the run >
+Artifacts). To use one:
+
+```sh
+docker load -i pg-automerge-0.1.0-linux-arm64.tar.gz   # loads pg-automerge:0.1.0
+```
+
+The arm64 image is built and tested natively, without QEMU or
+cross-compilation ([why](docs/DESIGN.md#docker-image-in-ci)). Where the
+arm64 runner is not available (it depends on the repository's plan and
+visibility), set the repository variable `PG_AUTOMERGE_ARM64` to `false`:
+tags then build amd64 only.
+
+### Publishing the image
+
+The workflow's `publish` job pushes a tag's tested images to a registry of
+yours as one multi-architecture image, `<image>:<version>` and
+`<image>:latest` (plus the per-architecture `<image>:<version>-amd64` and
+`-arm64` it is made of). It is prepared but off: without the secret
+below it only logs a notice. To turn it on, in the repository's Settings >
+Secrets and variables > Actions:
+
+| Kind | Name | Value |
+|---|---|---|
+| Variable | `PG_AUTOMERGE_REGISTRY_IMAGE` | the image, registry host first, lower case: `ghcr.io/you/pg-automerge`, `docker.io/you/pg-automerge`, ... |
+| Variable | `PG_AUTOMERGE_REGISTRY_USERNAME` | the registry user |
+| Secret | `PG_AUTOMERGE_REGISTRY_TOKEN` | a token that may push to that image only (for ghcr.io a personal access token with `write:packages`; for Docker Hub an access token with Read & Write) |
+
+It runs only for tags, only after both the `ci` and the `docker` jobs
+passed, and pushes exactly the archives those jobs tested
+(`scripts/docker-push.sh`, which checks each one's version and
+architecture first). Nothing else in the workflow logs in to a registry or
+pushes, and its token is read-only (`contents: read`); `tests/check_ci.sh`
+fails if that changes. To require an approval for every push, move the
+secret into a GitHub environment with required reviewers and add
+`environment: <name>` to the job. By hand, the same script pushes archives
+you built yourself:
+
+```sh
+bash scripts/docker-archive.sh                     # pg-automerge-0.1.0-linux-amd64.tar.gz
+docker login ghcr.io
+bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz  # prints the pushes
+bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz
+```
 
 ## Quick start
 
@@ -607,8 +669,8 @@ Tooling runs through [mise](https://mise.jdx.dev):
 mise run pgrx-init   # once: build the Postgres pgrx develops against
 mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump, upgrade, extension and limits scripts
 mise run regress     # pg_regress examples in tests/pg_regress (checks their fixtures first)
-mise run lint        # CI/packaging checks, rustfmt, clippy -D warnings (all build configurations), rustdoc
-mise run ci          # lint + test + regress: what CI runs
+mise run lint        # CI/packaging checks (actionlint, shellcheck, workflow invariants), rustfmt, clippy -D warnings (all build configurations), rustdoc
+mise run ci          # lint + test + regress: what CI's ci job runs (its docker job: docker-test)
 mise run concurrency # only: two real psql sessions merging into one row
 mise run notify      # only: a real LISTEN session receiving automerge_notify() payloads
 mise run dump        # only: pg_dump/pg_restore and COPY round trips of every object kind
@@ -625,6 +687,7 @@ mise run docker-build   # the Docker image (see Docker)
 mise run docker-test    # build it, then test it against containers: SQL, dump/restore, suites, memory limit, compose.yaml (not part of test)
 mise run docker-bench-sql  # bench-sql against the image (release build on PGDG Postgres, no assertions)
 mise run docker-up      # compose.yaml's development Postgres; docker-down stops it
+# scripts/docker-archive.sh and scripts/docker-push.sh: release archives and pushing (see Publishing the image)
 mise run run         # install and open psql against the pgrx-managed Postgres
 ```
 
