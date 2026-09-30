@@ -2616,12 +2616,22 @@ that script, and so does 0.2.0's.
 
 Images built from the tree after 720c5f0 and before the bump were still
 labelled 0.1.0, but their install script created `automerge_spans`
-(identical to 0.2.0's, statement for statement) and their library still
-had the deep-block crash ([Deep blocks](#deep-blocks)). Databases created
-by them exist, so their catalog is kept as
-`sql/snapshots/variants/pg_automerge--0.1.0+spans.sql` (the script of
-555110e, the last such commit), a variant of 0.1.0 that the tests update
-with 0.1.0's upgrade scripts like the release.
+(identical to 0.2.0's, statement for statement). Their library has the
+deep-block crash ([Deep blocks](#deep-blocks)) if it was built from a
+commit up to 555110e (the last commit before the fix, ee574e1), but not
+necessarily if it was built from a working tree: the fix was made
+uncommitted on top of 555110e, and an image built from that tree is
+labelled revision `555110e-dirty` and has it (7c6d11f23a6f, skjera's
+`pg-automerge:0.1.0` at the time of the bump: the 2,000-level deep block
+of the regress fixtures reads as jsonb there, and crashes the backend of
+the released b946069dce9a). A `-dirty` label cannot tell which, so the
+docs do not promise either for such images; reading that document as
+jsonb in a throwaway container does. Databases created by these images
+exist, and their catalog is the same whatever the library, so it is kept
+as `sql/snapshots/variants/pg_automerge--0.1.0+spans.sql` (the script of
+555110e; ee574e1, the one commit after it before the bump, changed only
+the library), a variant of 0.1.0 that the tests update with 0.1.0's
+upgrade scripts like the release.
 
 ### 0.1.0 to 0.2.0
 
@@ -2680,12 +2690,21 @@ with `psql`.
   tables with a generated `doc::jsonb` column, GIN and B-tree expression
   indexes, a view, a notify trigger and documents; it is stopped and the
   new image started on the same volume (init not re-run, still 0.1.0, the
-  same data, and the deep block, which crashes 0.1.0's library in the
+  same data, and the deep block, which crashes the released 0.1.0 library in the
   generated column, stored fine); `ALTER EXTENSION pg_automerge UPDATE`;
   then the same data, the indexes valid, used and agreeing with a
   sequential scan, the trigger's notification, `automerge_spans` (54000
   on the deep block), the catalog equal to a fresh install's in the same
-  container, and clean server logs. Run against the released image
+  container, and clean server logs. It follows the README's compose
+  steps as written: the cluster's superuser is an app's own
+  `POSTGRES_USER`, not `postgres` (as in skjera, which has no `postgres`
+  role), the dump of step 1 and the `ALTER EXTENSION` and version check
+  of step 5 are the README's commands (read from it, `docker compose
+  exec` run as `docker exec`, `<user>` and `<db>` filled in), and a
+  service with `image:` and a `build:` section with `args:
+  PG_AUTOMERGE_VERSION` (skjera's shape) fails to build with the old
+  version (the Dockerfile's version guard) and builds after step 3's
+  edit. Run against the released image
   (b946069dce9a), against an image of the `0.1.0+spans` variant, and with
   the image built from 0918f56: all pass.
 

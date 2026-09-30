@@ -222,13 +222,26 @@ e.g. through a generated `doc::jsonb` column) and adds
 `automerge_spans`. No index rebuild and no data rewrite are needed: every
 0.1.0 result stays the same.
 
-1. Optionally, keep a dump: `docker compose exec -T postgres pg_dump -U postgres -Fc <db> >before-0.2.0.dump`.
+Below, `<user>` is the service's `POSTGRES_USER`, the superuser the
+image created on first start (`skjera` for skjera, `postgres` for this
+repository's `compose.yaml`; a cluster has a `postgres` role only if that
+was its `POSTGRES_USER`), and `<db>` a database with the extension (the
+service's `POSTGRES_DB`, `skjera` for skjera, and any other you created
+it in).
+
+1. Optionally, keep a dump: `docker compose exec -T postgres pg_dump -U <user> -Fc <db> >before-0.2.0.dump`.
 2. Build the new image in this repository: `mise run docker-build`
    (tags `pg-automerge:0.2.0` and `pg-automerge:dev`), or `docker pull`
    it from your registry if you publish one.
 3. Point the app's service at it: `image: pg-automerge:0.2.0` in its
    `compose.yaml` (pin the version tag: the images are local, and a
-   rebuilt image moves `:dev`).
+   rebuilt image moves `:dev`). If the service also has a `build:`
+   section (skjera's builds the image from a checkout of this
+   repository), set its `args: PG_AUTOMERGE_VERSION:` to `0.2.0` too, or
+   remove the section: compose builds when the tag is missing or with
+   `--build`, and the Dockerfile refuses a version other than
+   Cargo.toml's (`versions: PG_AUTOMERGE_VERSION=0.1.0 != 0.2.0
+   (Cargo.toml)`).
 4. `docker compose up -d`: compose recreates the container from the new
    image on the same volume (the data stays; the init script does not
    run again). From here on the fixed library serves every query, even
@@ -236,8 +249,8 @@ e.g. through a generated `doc::jsonb` column) and adds
 5. In every database with the extension:
 
    ```sh
-   docker compose exec postgres psql -U postgres -d <db> -c 'ALTER EXTENSION pg_automerge UPDATE'
-   docker compose exec postgres psql -U postgres -d <db> -Atc "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'"   # 0.2.0
+   docker compose exec postgres psql -U <user> -d <db> -c 'ALTER EXTENSION pg_automerge UPDATE'
+   docker compose exec postgres psql -U <user> -d <db> -Atc "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'"   # 0.2.0
    ```
 
    This adds `automerge_spans`; nothing else in the catalog changes, and
@@ -250,7 +263,10 @@ e.g. through a generated `doc::jsonb` column) and adds
 There is no downgrade script: to go back, restore the dump into the old
 image. `mise run docker-upgrade-test` rehearses these steps against
 throwaway containers (the old image from `PG_AUTOMERGE_OLD_IMAGE`, or
-built from the 0.1.0 source).
+built from the 0.1.0 source), with a `POSTGRES_USER` other than
+`postgres` as skjera has: it runs the commands of steps 1 and 5 as
+written here, and builds a service like step 3's (its `build.args`
+updated, and, to show why, not).
 
 **A new Postgres 18 minor release or Debian security fixes**: the base
 image is pinned by digest in `docker/Dockerfile` (`ARG PG_IMAGE`, with how

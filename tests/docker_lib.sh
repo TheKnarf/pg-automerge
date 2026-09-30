@@ -9,8 +9,9 @@
 # the compose project PROJECT), every image tag in IMAGES, and DWORK.
 #
 # Containers are named "$PROJECT-<name>" and labelled pg-automerge-test;
-# every container gets the password $PG_PASSWORD, POSTGRES_DB=app, a named
-# volume, and its port 5432 published on a free port of 127.0.0.1 (see
+# every container gets the superuser $PG_USER (POSTGRES_USER; postgres unless
+# the script sets PG_USER after sourcing this), the password $PG_PASSWORD,
+# POSTGRES_DB=app, a named volume, and its port 5432 published on a free port of 127.0.0.1 (see
 # host_port).
 #
 # Env: PG_AUTOMERGE_IMAGE (default pg-automerge:<Cargo.toml version>).
@@ -29,6 +30,7 @@ VERSION="$(sh scripts/versions.sh | sed -n 's/^CRATE_VERSION=//p')"
 IMAGE="${PG_AUTOMERGE_IMAGE:-pg-automerge:$VERSION}"
 LABEL=pg-automerge-test
 PROJECT="pg-automerge-test-$$"
+PG_USER=postgres
 PG_PASSWORD="test"
 DWORK="$(mktemp -d)"
 CONTAINERS=()
@@ -64,7 +66,7 @@ start() {
     done
     docker volume inspect "$vol" >/dev/null 2>&1 || { docker volume create --label "$LABEL" "$vol" >/dev/null; VOLUMES+=("$vol"); }
     docker run -d --name "$name" --label "$LABEL" \
-        -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB=app \
+        -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB=app \
         -p 127.0.0.1::5432 \
         -v "$vol:/var/lib/postgresql" "${run_args[@]}" "${RUN_IMAGE:-$IMAGE}" postgres "${pg_args[@]}" >/dev/null
     CONTAINERS+=("$name")
@@ -78,7 +80,7 @@ wait_ready() {
     local name; name="$(cname "$1")"
     for _ in $(seq 1 300); do
         [[ "$(docker inspect -f '{{.State.Running}}' "$name")" == true ]] || return 1
-        docker exec "$name" pg_isready -q -h 127.0.0.1 -U postgres && return 0
+        docker exec "$name" pg_isready -q -h 127.0.0.1 -U "$PG_USER" && return 0
         sleep 0.2
     done
     fail "$name: not ready after 60s"
@@ -99,14 +101,14 @@ host_port() {
 # Environment for the tests/lib.sh scripts (external mode) against NAME.
 external_env() {
     printf '%s\n' PG_AUTOMERGE_TEST_HOST=127.0.0.1 "PG_AUTOMERGE_TEST_PORT=$(host_port "$1")" \
-        PG_AUTOMERGE_TEST_USER=postgres "PG_AUTOMERGE_TEST_PASSWORD=$PG_PASSWORD"
+        "PG_AUTOMERGE_TEST_USER=$PG_USER" "PG_AUTOMERGE_TEST_PASSWORD=$PG_PASSWORD"
 }
 
-# psql in container NAME against database DB as postgres (the local
+# psql in container NAME against database DB as $PG_USER (the local
 # socket); extra args passed through.
 psql_in() {
     local name; name="$(cname "$1")"; local db="$2"; shift 2
-    docker exec -i "$name" psql -X -q -At -v ON_ERROR_STOP=1 -U postgres -d "$db" "$@"
+    docker exec -i "$name" psql -X -q -At -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$db" "$@"
 }
 
 # The server log of NAME has no sign of an assertion failure, a panic or a

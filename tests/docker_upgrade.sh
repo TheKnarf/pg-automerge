@@ -18,14 +18,24 @@
 #   2. stop it (the volume stays) and start the CURRENT image on the same
 #      volume: init is not re-run, the extension is still 0.1.0 (its
 #      catalog on the new library) and every document reads the same; the
-#      2,000-level deep block, which crashes 0.1.0's library in a
-#      generated doc::jsonb column, is stored fine already;
+#      2,000-level deep block, which crashes the released 0.1.0 library in
+#      a generated doc::jsonb column, is stored fine already;
 #   3. ALTER EXTENSION pg_automerge UPDATE: 0.2.0; the documents, the view
 #      and the generated column read the same; the indexes are valid, used
 #      and agree with a sequential scan; the trigger sends its
 #      notification; automerge_spans works (54000 on the deep block); the
 #      extension's catalog (tests/catalog.sql) is that of a fresh CREATE
 #      EXTENSION in the same container; no server log shows a crash.
+#
+# The README's compose steps ("From 0.1.0 to 0.2.0 with compose") are
+# followed as written: the cluster's superuser is not postgres (POSTGRES_USER
+# is the app's, as in skjera's compose.yml, so there is no postgres role),
+# the pg_dump of step 1 and the psql commands of step 5 are read from the
+# README and run with `docker compose exec [-T] postgres` as `docker exec -i`
+# on the container and <user>/<db> filled in; and a service like skjera's
+# (image: plus build: with args PG_AUTOMERGE_VERSION) is built with the old
+# version arg (the Dockerfile refuses it) and after step 3's edit (it
+# builds, reusing the cache of the image just built).
 #
 # Env: PG_AUTOMERGE_IMAGE (the new image, default
 # pg-automerge:<Cargo.toml version>), PG_AUTOMERGE_OLD_IMAGE (the 0.1.0
@@ -41,6 +51,9 @@ OLD_VERSION=0.1.0
 # The last commit before automerge_spans: its SQL is 0.1.0's (the same
 # statements as the snapshot; pgrx may order them differently).
 RELEASE_REV=0918f56
+
+# Not postgres: an app's own POSTGRES_USER (skjera's is skjera).
+PG_USER=appowner
 
 on_exit() {
     if [[ $1 == 0 ]]; then log "all docker upgrade checks passed"; else echo "docker upgrade test FAILED" >&2; fi
@@ -88,6 +101,48 @@ done
 log "  its install script is $known"
 if grep -q automerge_spans "$DWORK/old.sql"; then OLD_HAS_SPANS=f; else OLD_HAS_SPANS=t; fi
 
+# The README's compose steps, as shell commands: [0] the pg_dump of step 1,
+# [1] the ALTER EXTENSION and [2] the version check of step 5.
+section="$(sed -n "/^\*\*From $OLD_VERSION to $VERSION with compose\*\*/,/^There is no downgrade script/p" README.md)"
+[[ -n "$section" ]] || fail "README.md has no section \"From $OLD_VERSION to $VERSION with compose\""
+mapfile -t README_CMDS < <(grep -o 'docker compose exec [^`]*' <<<"$section")
+expect "README compose commands" 3 "${#README_CMDS[@]}"
+# readme_cmd NAME I: run README_CMDS[I] against container NAME, in DWORK.
+readme_cmd() {
+    local cmd="${README_CMDS[$2]}"
+    [[ "$cmd" =~ ^docker\ compose\ exec\ (-T\ )?postgres\  ]] || fail "README command not of the form 'docker compose exec [-T] postgres ...': $cmd"
+    cmd="docker exec -i $(cname "$1") ${cmd#"${BASH_REMATCH[0]}"}"
+    cmd="${cmd//<user>/$PG_USER}"; cmd="${cmd//<db>/app}"
+    [[ "$cmd" != *'<'*'>'* ]] || fail "README command with an unknown placeholder: $cmd"
+    (cd "$DWORK" && eval "$cmd")
+}
+
+log "README step 3: a service with image: and build: args, like skjera's"
+step3_tag="pg-automerge-test-step3-$$:$VERSION"
+cat >"$DWORK/step3.yml" <<YAML
+services:
+  postgres:
+    image: pg-automerge-test-step3-$$:$OLD_VERSION
+    build:
+      context: $ROOT_DIR
+      dockerfile: docker/Dockerfile
+      args:
+        PG_AUTOMERGE_VERSION: $OLD_VERSION
+YAML
+if docker compose -p "$PROJECT-step3" -f "$DWORK/step3.yml" build >"$DWORK/step3-old.log" 2>&1; then
+    IMAGES+=("pg-automerge-test-step3-$$:$OLD_VERSION")
+    fail "the image built with PG_AUTOMERGE_VERSION=$OLD_VERSION"
+fi
+grep -q "versions: PG_AUTOMERGE_VERSION=$OLD_VERSION != $VERSION (Cargo.toml)" "$DWORK/step3-old.log" \
+    || { tail -30 "$DWORK/step3-old.log" >&2; fail "the old version arg failed for another reason"; }
+# Step 3's edit: the image tag and the build arg.
+sed -i "s/:$OLD_VERSION\$/:$VERSION/; s/PG_AUTOMERGE_VERSION: $OLD_VERSION\$/PG_AUTOMERGE_VERSION: $VERSION/" "$DWORK/step3.yml"
+IMAGES+=("$step3_tag")
+docker compose -p "$PROJECT-step3" -f "$DWORK/step3.yml" build >"$DWORK/step3-new.log" 2>&1 \
+    || { tail -30 "$DWORK/step3-new.log" >&2; fail "the service did not build after step 3"; }
+expect "step 3 image version label" "$VERSION" \
+    "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$step3_tag")"
+
 # ---------------------------------------------------------------------------
 log "old image: pg_automerge $OLD_VERSION with tables, indexes, a view, a trigger and documents"
 RUN_IMAGE="$OLD_IMAGE" start_ready old data
@@ -115,6 +170,11 @@ FINGERPRINT="SELECT string_agg(d.id || ':' || md5(d.doc::bytea) || ':' || autome
 SELECT string_agg(id || ':' || md5(a::bytea) || ':' || coalesce(md5((a || b)::jsonb::text), '-'), ',' ORDER BY id) FROM pairs;"
 before="$(psql_in old app -c "$FINGERPRINT")"
 [[ -n "$before" ]] || fail "old: no fingerprint"
+log "README step 1: the dump, as $PG_USER"
+readme_cmd old 0
+[[ -s "$DWORK/before-$VERSION.dump" ]] || fail "README step 1 wrote no before-$VERSION.dump"
+docker exec -i "$(cname old)" pg_restore --list <"$DWORK/before-$VERSION.dump" | grep -q 'EXTENSION - pg_automerge' \
+    || fail "the dump of README step 1 has no pg_automerge"
 check_log old
 docker stop -t 30 "$(cname old)" >/dev/null
 docker rm "$(cname old)" >/dev/null
@@ -128,13 +188,18 @@ expect "new, before UPDATE: extension version, automerge_spans absent" "$OLD_VER
     "$(psql_in new app -c "SELECT extversion, to_regprocedure('automerge_spans(automerge,text[])') IS NULL FROM pg_extension WHERE extname = 'pg_automerge'")"
 expect "new, before UPDATE: documents" "$before" "$(psql_in new app -c "$FINGERPRINT")"
 # The library is the new one: the deep block is stored through the
-# generated column (0.1.0's library crashes here).
+# generated column (the released 0.1.0 library crashes here).
 psql_in new app -v deep="$DEEP_BLOCK" <<<"INSERT INTO docs VALUES (6, :'deep');"
 
-log "ALTER EXTENSION pg_automerge UPDATE"
-psql_in new app -c 'ALTER EXTENSION pg_automerge UPDATE'
-expect "version after UPDATE" "$VERSION" \
-    "$(psql_in new app -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")"
+log "README step 5: ALTER EXTENSION pg_automerge UPDATE, as $PG_USER"
+# What the README's commands used to hardcode fails here, as in skjera's
+# cluster.
+if out="$(docker exec "$C" psql -X -U postgres -d app -c 'SELECT 1' 2>&1)"; then
+    fail "the cluster has a postgres role: the README's commands are not tested with another superuser"
+fi
+grep -q 'role "postgres" does not exist' <<<"$out" || fail "psql -U postgres: $out"
+readme_cmd new 1 >/dev/null
+expect "version after UPDATE (README step 5)" "$VERSION" "$(readme_cmd new 2)"
 expect "documents after UPDATE" "$before" "$(psql_in new app -c "$FINGERPRINT")"
 
 out="$(psql_in new app <<'SQL'

@@ -18,7 +18,8 @@ stored format is unchanged.
 Fixed:
 
 - **Server crash on deeply nested blocks.** Reading a document whose rich
-  text has a block nested a few thousand levels deep as jsonb (the
+  text has a block nested a few hundred levels deep (about 700 with an
+  8 MB stack; a few kB of document) as jsonb (the
   `doc::jsonb` cast, a STORED generated column or expression index on it,
   `automerge_to_jsonb`, a jsonb operator on the column) overflowed the
   stack inside Automerge; the backend died with SIGSEGV and Postgres
@@ -43,10 +44,17 @@ Changed:
 
 Note on 0.1.0 images: Docker images built from this repository between
 the addition of `automerge_spans` and this release were still labelled
-0.1.0 and created `automerge_spans` at `CREATE EXTENSION` time, but
-carried the crash above. Their databases update to 0.2.0 the same way
-(the upgrade script replaces the two functions in place with identical
-definitions), and so does a database of the released 0.1.0 image.
+0.1.0 and created `automerge_spans` at `CREATE EXTENSION` time. Whether
+they carry the crash above depends on the tree they were built from:
+those built from a commit up to 555110e do, while one built from a
+working tree that already had the uncommitted fix does not (for example
+image 7c6d11f23a6f, labelled revision `555110e-dirty`). The
+`org.opencontainers.image.revision` label alone does not tell; reading
+the deep-block document of `tests/pg_regress/sql/automerge.sql` as jsonb
+in a throwaway container does. Their catalog is the same either way, and
+their databases update to 0.2.0 the same way (the upgrade script
+replaces the two functions in place with identical definitions), as does
+a database of the released 0.1.0 image, which has the crash.
 
 ## 0.1.0 (2026-09-30)
 

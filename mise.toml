@@ -127,7 +127,7 @@ depends = ["docker-build"]
 run = "bash tests/docker.sh"
 
 [tasks.docker-upgrade-test]
-description = "Upgrade a 0.1.0 deployment to the current image: a 0.1.0 container (PG_AUTOMERGE_OLD_IMAGE, or built from the release revision) with tables, a generated doc::jsonb column, indexes, a notify trigger and data; the new image on the same volume; ALTER EXTENSION pg_automerge UPDATE; data, indexes, trigger, automerge_spans and the catalog checked; not part of test or docker-test"
+description = "Upgrade a 0.1.0 deployment to the current image: a 0.1.0 container (PG_AUTOMERGE_OLD_IMAGE, or built from the release revision) with tables, a generated doc::jsonb column, indexes, a notify trigger and data; the new image on the same volume, following the README compose steps (a non-postgres superuser, the README's pg_dump and psql commands, a service build: with the version arg); ALTER EXTENSION pg_automerge UPDATE; data, indexes, trigger, automerge_spans and the catalog checked; not part of test or docker-test"
 depends = ["docker-build"]
 run = "bash tests/docker_upgrade.sh"
 
