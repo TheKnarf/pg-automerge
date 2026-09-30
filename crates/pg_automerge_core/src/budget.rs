@@ -30,9 +30,10 @@
 //!   summed (successors, dependencies), and [`DocCounts::gmax`] is found
 //!   by merging the object, key, insert and successor columns run by run.
 //!   What rebuilding its changes copies beyond the chunk's own bytes
-//!   ([`DocCounts::rebuilt`]: strings repeated by a run and actor ids
+//!   ([`DocCounts::rebuilt`]: messages repeated by a run and actor ids
 //!   longer than 16 bytes, copied into every rebuilt change that holds
-//!   them) is computed from the run headers.
+//!   them; [`DocCounts::rebuilt_keys`]: keys and mark names repeated by a
+//!   run) is computed from the run headers.
 //! - A change chunk (compressed or not): its dependencies, actors and op
 //!   columns. Its list of other actors is priced per entry, duplicates
 //!   included (Automerge keeps every entry); a list longer than the limit
@@ -134,11 +135,17 @@ const PER_OTHER_ACTOR: u128 = 100;
 /// Bytes charged per byte that a document's rebuilt changes hold beyond
 /// the chunk's own bytes ([`DocCounts::rebuilt`]): Automerge rebuilds
 /// every change of a document with its own copy of the message, held
-/// twice (in the change's bytes and as a `String`), and of the keys and
-/// mark names of its ops (in its bytes), and a load whose heads do not
-/// match clones every rebuilt change into its error. Measured 4.0 per
-/// byte (messages), 2.0 (keys).
+/// twice (in the change's bytes and as a `String`), and of its actor ids
+/// (in its bytes and as `ActorId`s), and a load whose heads do not match
+/// clones every rebuilt change into its error. Measured 4.0 per byte.
 const PER_REBUILT: u128 = 5;
+/// Bytes charged per byte of the keys and mark names that a document's
+/// rebuilt changes hold beyond the chunk's own bytes
+/// ([`DocCounts::rebuilt_keys`]): held once, in the change's bytes (and
+/// again in the error of a load whose heads do not match). Measured 2.0
+/// per byte with the error's clone, 1.6-1.7 for saves written by
+/// Automerge whose keys are overwritten many times.
+const PER_REBUILT_KEY: u128 = 3;
 /// Bytes charged per byte that applying changes copies beyond the
 /// chunks' own bytes ([`ChangeCounts::repeated`]): Automerge makes an
 /// owned `String` of every op's key and mark name when it imports a
@@ -216,12 +223,16 @@ pub struct DocCounts {
     /// Bytes of the chunk with its columns inflated.
     pub inflated: u64,
     /// Bytes that rebuilding the document's changes copies beyond the
-    /// chunk's own bytes: a repeat run of `n` change messages, op keys or
-    /// mark names of `len` bytes is `(n - 1) * len` (every change holds
-    /// its own copy), and the actor ids longer than 16 bytes that each
-    /// change holds (its own, and the others its ops refer to). Computed
-    /// from the run headers, never expanded.
+    /// chunk's own bytes: a repeat run of `n` change messages of `len`
+    /// bytes is `(n - 1) * len` (every change holds its own copy), and the
+    /// actor ids longer than 16 bytes that each change holds (its own, and
+    /// the others its ops refer to). Computed from the run headers, never
+    /// expanded.
     pub rebuilt: u64,
+    /// The same for the op keys and mark names repeated by a run (a
+    /// rebuilt change holds them once, in its bytes; priced lower than
+    /// [`DocCounts::rebuilt`]).
+    pub rebuilt_keys: u64,
     /// Column metadata entries beyond one per column Automerge writes (an
     /// empty column's entry takes two input bytes; Automerge keeps every
     /// entry while it parses the chunk).
@@ -268,6 +279,7 @@ impl DocCounts {
         self.actors = self.actors.saturating_add(other.actors);
         self.inflated = self.inflated.saturating_add(other.inflated);
         self.rebuilt = self.rebuilt.saturating_add(other.rebuilt);
+        self.rebuilt_keys = self.rebuilt_keys.saturating_add(other.rebuilt_keys);
         self.extra_columns = self.extra_columns.saturating_add(other.extra_columns);
     }
 
@@ -309,8 +321,10 @@ impl DocCounts {
             inflated: 0,
             // Applying the rebuilt changes copies what rebuilding them did
             // (a bound: keys and mark names are copied per op when
-            // applied; messages and actors at most once more).
-            repeated: self.rebuilt,
+            // applied, and held literally by the result where its other
+            // rows come between theirs; messages and actors at most once
+            // more).
+            repeated: self.rebuilt.saturating_add(self.rebuilt_keys),
             // Its metadata is priced with the chunk; the changes Automerge
             // rebuilds list only the columns it writes.
             extra_columns: 0,
@@ -368,8 +382,9 @@ fn sat(value: u128) -> u64 {
 /// op or successor for rebuilding the changes, 200 per dependency and per
 /// actor, 0.3 per change × actor (Automerge caches a clock every 16
 /// changes), 3 per actor for each change with more than about 16 ops, 10
-/// per inflated byte, 5 per byte the rebuilt changes copy beyond the
-/// chunk's own bytes, 200 per column metadata entry beyond one per column
+/// per inflated byte, 5 per byte of messages and actor ids the rebuilt
+/// changes copy beyond the chunk's own bytes and 3 per byte of keys and
+/// mark names, 200 per column metadata entry beyond one per column
 /// Automerge writes, and 64 kB whatever the document holds.
 pub fn doc_estimate(d: &DocCounts) -> u64 {
     let (ops, succ, gmax, changes, deps, actors, inflated) = (
@@ -394,6 +409,7 @@ pub fn doc_estimate(d: &DocCounts) -> u64 {
         + 3 * changes.min(rows / 16) * actors
         + u128::from(PER_BYTE) * inflated
         + PER_REBUILT * u128::from(d.rebuilt)
+        + PER_REBUILT_KEY * u128::from(d.rebuilt_keys)
         + PER_EXTRA_COLUMN * u128::from(d.extra_columns))
 }
 
@@ -1555,23 +1571,20 @@ impl Scanner {
         let (ops, succ) = (op_tally.rows, op_tally.entries);
         // A change refers to another actor for each successor entry, at
         // most three times (a rebuilt op's pred, or a delete Automerge
-        // rebuilds from it: its object, key and pred); and at most to
-        // every long actor.
+        // rebuilds from it: its object, key and pred). It holds every
+        // actor once at most, its own included, so its own and the others
+        // are at most every long actor.
         let longest = long.iter().map(|&(_, len)| len).max().unwrap_or(0);
         let all = long
             .iter()
             .map(|&(_, len)| len)
             .fold(0, u64::saturating_add);
-        let others = referred
-            .saturating_add(succ.saturating_mul(3).saturating_mul(longest))
-            .min(changes.saturating_mul(all));
-        // Every rebuilt change holds its own message, its ops' keys and
-        // mark names (in its bytes), and its actors.
-        counts.rebuilt = change_tally
-            .excess
-            .saturating_add(op_tally.excess)
-            .saturating_add(own)
-            .saturating_add(others);
+        let others = referred.saturating_add(succ.saturating_mul(3).saturating_mul(longest));
+        let actors_held = own.saturating_add(others).min(changes.saturating_mul(all));
+        // Every rebuilt change holds its own message and its actors, and
+        // its ops' keys and mark names (in its bytes).
+        counts.rebuilt = change_tally.excess.saturating_add(actors_held);
+        counts.rebuilt_keys = op_tally.excess;
         counts.extra_columns = change_meta.extra.saturating_add(op_meta.extra);
         counts.changes = changes;
         counts.deps = change_tally.entries;

@@ -617,3 +617,41 @@ pub fn change_columns(n: u64) -> Vec<u8> {
 pub fn compressed_change_columns(n: u64) -> Vec<u8> {
     compress(&change_data_with(&list_change_ops(4), n))
 }
+
+/// Read a ULEB128 at `*at`, advancing it.
+fn read_uleb(bytes: &[u8], at: &mut usize) -> u64 {
+    let (mut v, mut shift) = (0u64, 0);
+    loop {
+        let b = bytes[*at];
+        *at += 1;
+        v |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return v;
+        }
+        shift += 7;
+    }
+}
+
+/// A document chunk built by [`document_with`] (no heads) listing one
+/// made-up head instead: a load of it after another document chunk
+/// rebuilds its changes and applies them (Automerge does not check a
+/// later chunk's changes against its heads), where a chunk without heads
+/// is skipped as already contained.
+pub fn with_head(doc: &[u8]) -> Vec<u8> {
+    assert_eq!(doc[8], 0, "a document chunk");
+    let mut at = 9;
+    let len = read_uleb(doc, &mut at) as usize;
+    let data = &doc[at..];
+    assert_eq!(data.len(), len);
+    let mut at = 0;
+    for _ in 0..read_uleb(data, &mut at) {
+        let n = read_uleb(data, &mut at) as usize;
+        at += n;
+    }
+    assert_eq!(data[at], 0, "no heads");
+    let mut out = data[..at].to_vec();
+    out.push(1);
+    out.extend([0x5a; 32]);
+    out.extend(&data[at + 1..]);
+    chunk(0, &out)
+}

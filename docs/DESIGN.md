@@ -1274,8 +1274,9 @@ In bytes, saturating, from counts read from the chunks:
   be saved as): 450 per op + 30 per successor entry + 600 × Gmax + 1600 per
   change + min(130 × (ops + successors), 1600 × changes) + 200 per
   dependency entry + 200 per actor + 0.3 × changes × actors + 3 × min(changes,
-  (ops + successors) / 16) × actors + 5 per *rebuilt* byte (below) + 200
-  per *extra* column metadata entry (below).
+  (ops + successors) / 16) × actors + 5 per *rebuilt* byte of messages
+  and actor ids and 3 per rebuilt byte of keys and mark names (below) +
+  200 per *extra* column metadata entry (below).
 - **Change chunks, or changes about to be applied** to a document with
   *base* changes and actors: 1000 per op + 80 per pred entry + 2500 per
   change + 200 per dependency + 200 per distinct actor + 100 per entry of
@@ -1295,29 +1296,34 @@ without expanding them: a repeat run of `n` strings of `len` bytes
 expands to `(n - 1) × len` bytes beyond the input's own (literal values
 are input bytes, already charged 10 each).
 
-- Rebuilt bytes of a document chunk: its change messages, and its ops'
-  keys and mark names (every rebuilt change holds its message twice, in
-  its bytes and as a `String`, and its ops' keys and mark names in its
-  bytes, and a load whose heads do not match clones every rebuilt change
-  into its error: 4.0 bytes per byte measured for messages, 2.0 for keys,
-  charged 5), and the actor ids longer than the 16 bytes Automerge's
-  `ActorId` holds inline (every rebuilt change holds its own actor and
-  the other actors its ops refer to, in its bytes and as `ActorId`s:
-  4.0 bytes per byte measured). A change's own actor is counted from the
-  change actor column, run length × length; the others from the object
-  and key actor columns, each run at most once per change (min(run
-  length, changes) × length), plus three references of the longest actor
-  per successor entry (the pred of a rebuilt op, or the delete Automerge
-  rebuilds from it: its object, key and pred), and at most every change
-  referring to every long actor (changes × their total length).
+- Rebuilt bytes of a document chunk: its change messages (every rebuilt
+  change holds its message twice, in its bytes and as a `String`, and a
+  load whose heads do not match clones every rebuilt change into its
+  error: 4.0 bytes per byte measured, charged 5), and the actor ids
+  longer than the 16 bytes Automerge's `ActorId` holds inline (every
+  rebuilt change holds its own actor and the other actors its ops refer
+  to, in its bytes and as `ActorId`s: 4.0 bytes per byte measured,
+  charged 5). A change's own actor is counted from the change actor
+  column, run length × length; the others from the object and key actor
+  columns, each run at most once per change (min(run length, changes) ×
+  length), plus three references of the longest actor per successor
+  entry (the pred of a rebuilt op, or the delete Automerge rebuilds from
+  it: its object, key and pred); a change holds every actor once at
+  most, so its own and the others together are at most changes × the
+  long actors' total length.
+- Rebuilt key bytes of a document chunk: its ops' keys and mark names,
+  which a rebuilt change holds once, in its bytes (2.0 bytes per byte
+  measured with the error's clone, 1.6-1.7 for saves written by
+  Automerge whose keys are overwritten many times; charged 3).
 - Repeated bytes of changes: the keys and mark names of change chunks
   (importing a change's ops makes an owned `String` of every op's key and
   mark name, and the document holds a key literally wherever other keys
   come between its rows: 1.0 bytes per byte measured for one key, 2.0 for
   mark names, 4.0 for a key the document then holds literally, 5.9 with
   the save of the result that `normalize` makes; charged 8), and those
-  of a document chunk turned into changes (its rebuilt bytes, which
-  applying copies again).
+  of a document chunk turned into changes (its rebuilt bytes and rebuilt
+  key bytes, which applying copies again: its keys can end up between
+  the rows of the document they are applied to).
 
 A load of input on its own is the first document chunk as a document plus
 everything after it as changes applied to it (Automerge turns a later
@@ -1400,7 +1406,7 @@ inputs of `tests/memory_bounds.rs` (release build):
 | A change header's list of other actors | 100 per entry, duplicates included | 0.64 (2,200,000 empty actors) |
 | Bytes, inflated (values, strings, the chunk buffers) | 10 per byte | 0.71 (1 MB of bytes, compressed save) |
 | Change messages repeated by a run, copied into every rebuilt change (document chunk) | 5 per rebuilt byte | 0.80 (2,000 changes, one 100 kB message) |
-| Keys and mark names repeated by a run, copied into every rebuilt change (document chunk) | 5 per rebuilt byte | 0.40 (2,000 changes, one 100 kB key) |
+| Keys and mark names repeated by a run, copied into every rebuilt change (document chunk) | 3 per rebuilt key byte | 0.67 (2,000 changes, one 100 kB key) |
 | Actor ids over 16 bytes, copied into every rebuilt change that refers to them (document chunk) | 5 per rebuilt byte | 0.80 (2,000 changes by, or referring to, a 100 kB actor) |
 | Keys and mark names repeated by a run, one owned copy per op when applied, and held literally by the document where other keys come between (change chunks) | 8 per repeated byte | 0.59 (500 maps, one 50 kB key interleaved) |
 | Column metadata entries beyond one per column Automerge writes | 200 per entry | 0.79 (4,200,000 empty columns, compressed change chunk) |
@@ -1561,10 +1567,14 @@ again as new input, which is what a restore does:
   duplicate dependencies, plain and compressed, a save with 2,000
   trailing change chunks, strings repeated by a run (change messages,
   keys, mark names; interleaved keys the document then holds literally),
-  long actor ids, millions of empty column metadata entries; and the
-  same strings and actor ids in saves written by Automerge, on their own
-  and after another save, where a load rebuilds and applies them): at
-  the limit set to the estimate
+  long actor ids, millions of empty column metadata entries; the
+  crafted document chunks again with a made-up head, after another save
+  and through `merge_changes`, where a load rebuilds and applies them
+  (without heads it skips them as already contained); and the same
+  strings and actor ids in saves written by Automerge, on their own and
+  after another save, through `normalize` and `merge_changes`), and
+  ordinary documents with long keys overwritten many times or 32-byte
+  actor ids: at the limit set to the estimate
   the input is accepted (or refused by Automerge, for crafted input that
   does not load) with a peak below it; one byte lower it is refused before
   loading with a peak that is a small fraction of it; when the document
@@ -2772,7 +2782,7 @@ of [The estimate](#the-estimate) that price them:
 | Document chunk, 3 changes sharing one 30 MB message (30 MB) | 372 | 286 (1.30x) | 572 (0.65) |
 | Document chunk, 2,000 empty changes by a 100 kB actor (100 kB) | 766 | 4.6 (167x) | 958 (0.80) |
 | Document chunk, 2,000 changes of a 16-byte actor, each putting a key in a map a 100 kB actor made (100 kB) | 766 | 5.7 (135x) | 960 (0.80) |
-| Document chunk, 2,000 changes sharing one 100 kB key (100 kB) | 384 | 5.7 (68x) | 959 (0.40) |
+| Document chunk, 2,000 changes sharing one 100 kB key (100 kB) | 384 | 5.7 (68x) | 578 (0.67; 959 before keys were priced below messages, below) |
 | Change chunk, 2,000 puts of one 100 kB key (100 kB) | 192 | 3.1 (63x) | 1,528 (0.13) |
 | Change chunk, 2,000 marks with one 100 kB name (100 kB) | 383 | 3.1 (125x) | 1,528 (0.25) |
 | Change chunk, 500 maps each given one 50 kB key between two others (52 kB; `normalize`, with its save) | 141 | 2.1 (67x) | 239 (0.59) |
@@ -2818,15 +2828,53 @@ read (12,000,000 entries in 24 kB: refused at the default limit with a
 peak under 72 MB, in under 2 s).
 
 Saves written by Automerge of the same shapes load (2,000 commits
-sharing one 100 kB message 0.40, one 100 kB key 0.20, by a 100 kB actor
-0.20), and so do they after another save, where they are rebuilt and
-applied as changes (0.15). The estimate of the long-actor save is loose:
-it assumes each of its 1,999 overwrites refers to another actor, three
-times, where they refer to the changes' own (a run-level bound cannot
-tell); ordinary documents, whose actor ids are 16 bytes, are unaffected.
-Every other input of the battery kept its estimate within 1% (map keys
-repeated by a run: one key overwritten 40,000 times +0.5%, 400 actors ×
-400 changes of 16 keys +1%), and its worst ratio stays 0.80. A 200,000-
+sharing one 100 kB message 0.40, one 100 kB key 0.33, by a 100 kB actor
+0.40, one 100 kB mark name, whose rows text characters come between,
+so the document holds it literally, 0.60), and so do they after another
+save, where they are rebuilt and applied as changes (0.15, 0.18, 0.31,
+0.60), and through `merge_changes` (0.15, 0.18, 0.31, 0.70). The
+crafted document chunks list no heads, so a load after another save,
+or `merge_changes`, skips them as already contained (a peak of 32
+bytes); with one made-up head they are rebuilt and applied (Automerge
+does not check a later chunk's changes against its heads): 0.15 to
+0.46 after a save, 0.18 to 0.36 through `merge_changes`.
+
+These terms raise the estimate of ordinary documents too, where they
+repeat keys longer than a few bytes or have actor ids longer than 16
+bytes (their other inputs moved by at most +1%: map keys repeated by a
+run, one key overwritten 40,000 times +0.3%, 400 actors × 400 changes
+of 16 keys +0.6%; worst ratio still 0.80). An overwritten key is a
+repeat run of the document's key column, and every overwrite a rebuilt
+copy; a long actor id is counted per change and per successor. Measured
+against the commit before these terms (`save_nocompress`, MB; the
+"apply" estimate is of `merge_changes` of the save into another
+document), with keys and mark names first priced like messages (5 per
+byte), then at 3:
+
+| Document | Estimate before | 5 per key byte | 3 per key byte | Peak (ratio) | Apply estimate before | 5 | 3 | Peak (ratio) |
+|---|---|---|---|---|---|---|---|---|
+| 8 actors × 2,000 rounds, 20 keys of 64 bytes each round | 28.1 | 40.3 (+43%) | 35.5 (+26%) | 14.1 (0.40) | 74.9 | 106.6 (+42%) | 101.8 (+36%) | 26.9 (0.26) |
+| The same, keys of 36 bytes (UUIDs) | 28.1 | 35.0 (+24%) | 32.2 (+15%) | 12.3 (0.38) | 74.9 | 92.7 (+24%) | 90.0 (+20%) | 24.8 (0.28) |
+| The same, keys of 4 bytes | 28.1 | 28.9 (+3%) | 28.6 (+2%) | 10.2 (0.36) | 74.9 | 76.9 (+3%) | 76.6 (+2%) | 22.3 (0.29) |
+| One 32-byte actor, 20,000 rounds, 20 keys of 64 bytes | 269.5 | 397.7 (+48%) | 345.8 (+28%) | 138.3 (0.40) | 733.0 | 1,066.3 (+45%) | 1,009.5 (+38%) | 295.8 (0.29) |
+| Text, 4 actors with 32-byte ids × 5,000 characters, half deleted | 18.2 | 20.5 (+13%) | 20.0 (+10%) | 7.6 (0.38) | 45.8 | 51.8 (+13%) | 50.5 (+10%) | 23.5 (0.46) |
+| The same, 64-byte ids | 18.2 | 22.8 (+25%) | 21.9 (+20%) | 7.6 (0.35) | 45.8 | 57.7 (+26%) | 55.3 (+21%) | 23.8 (0.43) |
+
+(The "3" column also caps a change's own and other long actors
+together at every long actor once, where before only the others were
+capped.) The real cost of the overwritten 64-byte keys is 1.6-1.7 bytes
+per expanded byte (`normalize` +4.1 MB for 2.6 MB expanded), under the
+3 charged; applied to another document they cost about 1.9 per byte
+against 11 charged (3 rebuilt + 8 applied), because the applied keys
+are priced for the worst case, where the document they are applied to
+has rows between theirs and holds every copy literally (4.0 per byte
+measured, 5.9 with `normalize`'s save). So a document whose keys of
+tens of bytes are overwritten many times, or whose actor ids are long,
+is priced 10-40% higher than before, and one near the limit before
+(1.4-1.6 GB at the default 2 GB) can now exceed it on a merge, an
+`INSERT` or a restore. The battery holds two such documents now
+(`long_keys`: the first row, `long_actors`: the fifth; 0.40 and 0.38 as
+saves). A 200,000-
 input release fuzz session found no violation. `tests/limits.sh` with
 the four inputs (a 1 kB compressed save of 6,000 changes sharing a
 100 kB message, a 100 kB document chunk of 6,000 changes by a 100 kB

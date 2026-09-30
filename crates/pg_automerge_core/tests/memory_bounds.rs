@@ -173,13 +173,50 @@ fn generated(kind: &str, n: usize) -> AutoCommit {
             doc.put(ROOT, "b", ScalarValue::Bytes(letters(n, 11).into_bytes()))
                 .unwrap();
         }
+        "long_keys" => {
+            // 8 actors take turns overwriting 20 keys of 64 bytes, one
+            // change per round: every key is a repeat run of `n` rows of
+            // the document's key column, which its rebuilt changes copy.
+            let keys: Vec<String> = (0..20).map(|j| format!("{j:0>64}")).collect();
+            for i in 0..n {
+                doc.set_actor(actor(i as u64 % 8));
+                for k in &keys {
+                    doc.put(ROOT, k.as_str(), i as i64).unwrap();
+                }
+                doc.commit();
+            }
+        }
+        "long_actors" => {
+            // 4 actors with 32-byte ids type `n` characters each, ten per
+            // change, then delete half of them: every rebuilt change
+            // holds its actor and the others its ops refer to.
+            let t = doc.put_object(ROOT, "t", ObjType::Text).unwrap();
+            doc.commit();
+            let long = |a: u64| ActorId::from([craft::actor(a), craft::actor(a)].concat());
+            for a in 0..4 {
+                doc.set_actor(long(a));
+                for _ in 0..n / 10 {
+                    let len = doc.length(&t);
+                    doc.splice_text(&t, len, 0, "abcdefghij").unwrap();
+                    doc.commit();
+                }
+            }
+            for a in 0..4 {
+                doc.set_actor(long(a));
+                for _ in 0..n / 20 {
+                    let at = doc.length(&t) / 3;
+                    doc.splice_text(&t, at, 10, "").unwrap();
+                    doc.commit();
+                }
+            }
+        }
         other => panic!("unknown kind {other}"),
     }
     doc.commit();
     doc
 }
 
-const KINDS: [(&str, usize); 15] = [
+const KINDS: [(&str, usize); 17] = [
     ("text", 200_000),
     ("typed", 3_000),
     ("deleted", 50_000),
@@ -194,6 +231,8 @@ const KINDS: [(&str, usize); 15] = [
     ("actor_changes", 400),
     ("marks", 6_000),
     ("bytes", 1_000_000),
+    ("long_keys", 2_000),
+    ("long_actors", 5_000),
     ("text", 20),
 ];
 
@@ -417,27 +456,68 @@ fn check_apply(name: &str, input: &[u8]) -> f64 {
 
 /// `input` after another actor's save: a document chunk that is not the
 /// first of an input is rebuilt into changes and applied (unless the
-/// document has its heads: the crafted ones list none, so only the
-/// documents of [`written`] are rebuilt this way).
+/// document has its heads: the crafted ones list none, so they are
+/// rebuilt this way only with a made-up head, [`craft::with_head`]).
 fn after_save(input: &[u8]) -> Vec<u8> {
     let (save, _) = concurrent("text", 100, 9);
     [save.as_slice(), input].concat()
 }
 
+/// A crafted document chunk (which lists no heads, so that a load after
+/// another document, or `merge_changes`, would skip it as already
+/// contained) with a made-up head: after another save and through
+/// `merge_changes`, where Automerge rebuilds its changes and applies them
+/// (the made-up head is not checked: they load).
+fn check_rebuilt(name: &str, crafted: &[u8]) {
+    let input = craft::with_head(crafted);
+    check_apply(&format!("{name}, one head"), &input);
+    check_normalize(
+        &format!("save + {name}, one head"),
+        &after_save(&input),
+        true,
+    );
+}
+
+/// A save written by Automerge ([`written`]) on its own and after another
+/// save (where it is rebuilt and applied), through `normalize` and
+/// `merge_changes`.
+fn check_written(kind: &str, name: &str) {
+    let input = written(kind);
+    check_normalize(&format!("written: {name}"), &input, true);
+    check_apply(&format!("written: {name}"), &input);
+    let input = after_save(&input);
+    check_normalize(&format!("save + written: {name}"), &input, true);
+    check_apply(&format!("save + written: {name}"), &input);
+}
+
 /// A compressed save written by Automerge of 2,000 one-op changes that
 /// share a 100 kB string: every change's message (`"message"`, one repeat
 /// run of the message column), their actor id (`"actor"`), or the key
-/// every change puts (`"key"`, one repeat run of the key column). Loads
-/// fine, and its heads are real.
+/// every change puts (`"key"`, one repeat run of the key column), or the
+/// name of the mark every change makes on a 2,000-character text
+/// (`"mark"`, one repeat run of the mark name column). Loads fine, and
+/// its heads are real.
 fn written(kind: &str) -> Vec<u8> {
     let big = "x".repeat(100_000);
     let mut doc = match kind {
         "actor" => AutoCommit::new().with_actor(ActorId::from(vec![7u8; 100_000])),
         _ => AutoCommit::new().with_actor(actor(3)),
     };
+    let text = (kind == "mark").then(|| {
+        let t = doc.put_object(ROOT, "t", ObjType::Text).unwrap();
+        doc.splice_text(&t, 0, 0, &letters(2_000, 13)).unwrap();
+        doc.commit();
+        t
+    });
     for i in 0..2_000i64 {
-        let key = if kind == "key" { big.as_str() } else { "k" };
-        doc.put(ROOT, key, i).unwrap();
+        if let Some(t) = &text {
+            let at = i as usize;
+            doc.mark(t, Mark::new(big.clone(), i, at, at + 1), ExpandMark::None)
+                .unwrap();
+        } else {
+            let key = if kind == "key" { big.as_str() } else { "k" };
+            doc.put(ROOT, key, i).unwrap();
+        }
         let mut options = CommitOptions::default();
         if kind == "message" {
             options.set_message(big.clone());
@@ -469,15 +549,9 @@ fn repeated_messages_are_priced() {
     ] {
         check_normalize(name, &input, false);
         check_apply(name, &input);
+        check_rebuilt(name, &input);
     }
-    let input = written("message");
-    check_normalize("written: 2000 changes, one 100 kB message", &input, true);
-    let input = after_save(&input);
-    check_normalize(
-        "save + written: 2000 changes, one 100 kB message",
-        &input,
-        true,
-    );
+    check_written("message", "2000 changes, one 100 kB message");
 }
 
 /// Keys and mark names repeated by a run: applying a change makes an
@@ -513,10 +587,12 @@ fn repeated_keys_and_mark_names_are_priced() {
         check_normalize(name, &input, loads);
         check_apply(name, &input);
     }
-    let input = written("key");
-    check_normalize("written: 2000 changes, one 100 kB key", &input, true);
-    let input = after_save(&input);
-    check_normalize("save + written: 2000 changes, one 100 kB key", &input, true);
+    check_rebuilt(
+        "doc 2000 changes, one 100 kB key",
+        &craft::repeated_doc_keys(2_000, 100_000),
+    );
+    check_written("key", "2000 changes, one 100 kB key");
+    check_written("mark", "2000 changes, one 100 kB mark name");
 }
 
 /// Actor ids longer than the 16 bytes an `ActorId` holds inline: every
@@ -541,15 +617,9 @@ fn long_actor_ids_are_priced() {
     ] {
         check_normalize(name, &input, false);
         check_apply(name, &input);
+        check_rebuilt(name, &input);
     }
-    let input = written("actor");
-    check_normalize("written: 2000 changes by a 100 kB actor", &input, true);
-    let input = after_save(&input);
-    check_normalize(
-        "save + written: 2000 changes by a 100 kB actor",
-        &input,
-        true,
-    );
+    check_written("actor", "2000 changes by a 100 kB actor");
 }
 
 /// Column metadata entries: Automerge keeps every entry of a metadata
