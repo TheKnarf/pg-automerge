@@ -62,7 +62,7 @@ SQL
 
 # The listener: psql reading commands from a FIFO kept open on fd 3.
 mkfifo "$WORK/listener.in"
-PGAPPNAME=notify_listener "$BINDIR/psql" -X -At -h localhost -p "$PORT" -d "$DB" \
+PGAPPNAME=notify_listener "$BINDIR/psql" -X -At "${CONN[@]}" -d "$DB" \
     <"$WORK/listener.in" >"$WORK/listener.out" 2>&1 &
 LISTENER_PID=$!
 exec 3>"$WORK/listener.in"

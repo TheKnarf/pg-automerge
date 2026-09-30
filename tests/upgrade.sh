@@ -25,6 +25,8 @@
 
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# It copies SQL scripts into the server's extension directory.
+require_pgrx_mode
 
 DB=pg_automerge_upgrade_old
 DB_NEW=pg_automerge_upgrade_new

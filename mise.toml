@@ -118,9 +118,14 @@ description = "Build the Docker image (official postgres:18 + pg_automerge, buil
 run = "bash scripts/docker-build.sh"
 
 [tasks.docker-test]
-description = "Build the Docker image, then smoke-test it: init, extension, merge + jsonb, settings, restart on a volume, PG_AUTOMERGE_CREATE_EXTENSION, compose.yaml; not part of test"
+description = "Build the Docker image, then test it: init, SQL (casts, merge, jsonb + GIN index, history, LISTEN/NOTIFY), settings, dump/restore into a second container, restart on a volume, PG_AUTOMERGE_CREATE_EXTENSION, the regress examples and the concurrency/notify/dump/extension suites against a container, limits.sh against a memory-capped one, server logs, compose.yaml; not part of test"
 depends = ["docker-build"]
 run = "bash tests/docker.sh"
+
+[tasks.docker-bench-sql]
+description = "bench-sql against the Docker image (release build on the PGDG Postgres 18, no assertions) in a throwaway container; not part of test"
+depends = ["docker-build"]
+run = "bash tests/docker_bench.sh"
 
 [tasks.docker-up]
 description = "Start the compose.yaml development Postgres (builds the image first) on 127.0.0.1:${PG_AUTOMERGE_PORT:-5432} and wait until it is healthy"

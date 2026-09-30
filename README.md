@@ -98,7 +98,7 @@ registry of your own.
 
 ```sh
 mise run docker-build        # pg-automerge:0.1.0 and pg-automerge:dev
-mise run docker-test         # builds, then smoke-tests the image and compose.yaml
+mise run docker-test         # builds, then tests the image and compose.yaml (about 2 minutes)
 ```
 
 The image is 3.5 MB larger than `postgres:18`. A first build takes about
@@ -207,6 +207,33 @@ restore with `pg_automerge.max_load_memory=-1` as the
 with both majors' binaries and pg_automerge built for both (the
 `/var/lib/postgresql` mount lets `pg_upgrade --link` work within one
 volume).
+
+### Testing the image
+
+`mise run docker-test` runs everything against throwaway containers of the
+image (labelled `pg-automerge-test`, removed afterwards with their
+volumes): the init script and its variable, SQL through the container's
+own `psql` (casts, merges, jsonb operators with a GIN expression index
+and a generated column, the history functions, a real `LISTEN` session
+for `automerge_notify()`, the settings and their privileges),
+`pg_dump -Fc` in one container restored into a second, a restart on the
+same volume, the regress examples and the concurrency, notify, dump and
+extension suites, the load memory limit against a container started with
+`--memory=1g`, and that no server log shows an assertion failure, panic
+or crashed backend. The suites use the client tools of the pgrx Postgres
+(`mise run pgrx-init`); `DOCKER_TEST_SUITES=0` skips them.
+
+The multi-session suites run against any server of yours, too (it needs
+the extension available, a superuser, and room for scratch databases):
+
+```sh
+PG_AUTOMERGE_TEST_HOST=127.0.0.1 PG_AUTOMERGE_TEST_PORT=5432 \
+PG_AUTOMERGE_TEST_USER=postgres PG_AUTOMERGE_TEST_PASSWORD=... \
+  bash tests/concurrency.sh   # or notify.sh, dump.sh, extension.sh, bench_sql.sh
+```
+
+`mise run docker-bench-sql` times the everyday SQL paths against the
+image; see [Performance](#performance) for how it compares.
 
 ## Quick start
 
@@ -565,6 +592,13 @@ On an 83 kB document (2,000 list items) the same single-change `UPDATE`
 takes 41 ms, and `doc->>'status'` 33 ms. More numbers, and what each function loads, in
 [DESIGN.md](docs/DESIGN.md#performance).
 
+These were measured on pgrx's development Postgres (assertions on). On
+the [Docker image](#docker) (PGDG Postgres 18, `mise run
+docker-bench-sql`) the paths that load a document take the same time
+(within a few percent: the time is Automerge's), and the millisecond
+paths (heads, no-op merges, containment checks) about half
+([comparison](docs/DESIGN.md#the-docker-image-against-the-pgrx-postgres-2026-09-30)).
+
 ## Development
 
 Tooling runs through [mise](https://mise.jdx.dev):
@@ -588,7 +622,8 @@ mise run bench-expanded  # SQL timings of merge chains and PL/pgSQL loops on a r
 mise run bench-core  # Rust timings of load, normalize and the jsonb walk
 mise run package     # release package for the Postgres of $PG_CONFIG (required)
 mise run docker-build   # the Docker image (see Docker)
-mise run docker-test    # build it, then smoke-test the image and compose.yaml (not part of test)
+mise run docker-test    # build it, then test it against containers: SQL, dump/restore, suites, memory limit, compose.yaml (not part of test)
+mise run docker-bench-sql  # bench-sql against the image (release build on PGDG Postgres, no assertions)
 mise run docker-up      # compose.yaml's development Postgres; docker-down stops it
 mise run run         # install and open psql against the pgrx-managed Postgres
 ```

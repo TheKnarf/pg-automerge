@@ -21,7 +21,9 @@
 # shellcheck source=tests/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+require_pgrx_mode
 PORT="${REPL_PORT:-28819}"
+CONN=(-h localhost -p "$PORT")
 CLUSTER="$WORK/cluster"
 LISTENER_PID=
 DB=pub

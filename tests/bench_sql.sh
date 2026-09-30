@@ -23,7 +23,9 @@
 # BENCH_REPS runs (default 3) in milliseconds per case and document.
 # Run via `mise run bench-sql`. Installs a release build into the
 # pgrx-managed pg18 and uses database pg_automerge_bench_sql. Not part of
-# `mise run test`.
+# `mise run test`. Against an external server (tests/lib.sh), its own
+# build is timed: `mise run docker-bench-sql` runs this against the Docker
+# image (tests/docker_bench.sh).
 #
 # Env: see tests/lib.sh; also BENCH_DOCS (default "items20k text3mb"; also
 # items2k), BENCH_REPS, BENCH_CASES (a grep -E pattern on the case ids,
@@ -95,7 +97,7 @@ run_case() {
         done
     } >"$script"
     PGOPTIONS="-c client_min_messages=warning" "$BINDIR/psql" -X -q -v ON_ERROR_STOP=1 \
-        -h localhost -p "$PORT" -d "$DB" -v d="$doc" -f "$script" \
+        "${CONN[@]}" -d "$DB" -v d="$doc" -f "$script" \
         | sed -n 's/^Time: \([0-9.]*\) ms.*/\1/p'
 }
 

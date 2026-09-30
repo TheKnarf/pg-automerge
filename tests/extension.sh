@@ -32,6 +32,9 @@ DB=pg_automerge_ext
 DB_RESTORE=pg_automerge_ext_restore
 DB_OWNED=pg_automerge_ext_owned
 ROLE=automerge_ext_plain
+# For servers that require passwords over TCP (an external one, e.g. the
+# Docker image); the pgrx cluster trusts local connections.
+ROLE_PASSWORD="automerge-ext-$$"
 DROP_DBS=("$DB" "$DB_RESTORE" "$DB_OWNED")
 
 on_exit() {
@@ -193,8 +196,8 @@ check_after_move "$DB" ext2 "moved" "$INC_B" inc_b
 log "custom-format dump of the moved extension, restored"
 EXPECTED="$(fingerprint "$DB" ext2)"
 sql_on postgres -c "DROP DATABASE IF EXISTS $DB_RESTORE WITH (FORCE)" -c "CREATE DATABASE $DB_RESTORE"
-"$BINDIR/pg_dump" -h localhost -p "$PORT" -d "$DB" -Fc -f "$WORK/dump.custom"
-"$BINDIR/pg_restore" -h localhost -p "$PORT" -d "$DB_RESTORE" --exit-on-error "$WORK/dump.custom" \
+"$BINDIR/pg_dump" "${CONN[@]}" -d "$DB" -Fc -f "$WORK/dump.custom"
+"$BINDIR/pg_restore" "${CONN[@]}" -d "$DB_RESTORE" --exit-on-error "$WORK/dump.custom" \
     || fail "pg_restore failed"
 check_placement "$DB_RESTORE" ext2 "restored"
 [[ "$(fingerprint "$DB_RESTORE" ext2)" == "$EXPECTED" ]] || fail "restored data differs"
@@ -206,8 +209,8 @@ check_after_move "$DB_RESTORE" public "restored, then moved" "$INC_A" inc_a
 
 log "a non-superuser owning the database cannot install it (trusted = false)"
 sql_on postgres -c "DROP DATABASE IF EXISTS $DB_OWNED WITH (FORCE)" -c "DROP ROLE IF EXISTS $ROLE" \
-    -c "CREATE ROLE $ROLE LOGIN" -c "CREATE DATABASE $DB_OWNED OWNER $ROLE"
-as_role() { sql_on "$DB_OWNED" -U "$ROLE" "$@"; }
+    -c "CREATE ROLE $ROLE LOGIN PASSWORD '$ROLE_PASSWORD'" -c "CREATE DATABASE $DB_OWNED OWNER $ROLE"
+as_role() { PGPASSWORD="$ROLE_PASSWORD" sql_on "$DB_OWNED" -U "$ROLE" "$@"; }
 if out="$(as_role -c "CREATE EXTENSION pg_automerge" 2>&1)"; then
     fail "a non-superuser installed the extension"
 fi

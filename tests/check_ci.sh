@@ -82,7 +82,10 @@ for src in $(grep -E '^COPY ' "$df" | grep -v -- '--from=' | sed -E 's/^COPY( --
   [ "$src" = . ] && continue
   grep -qxF "!$src" .dockerignore || fail ".dockerignore does not let $src through (COPY in $df)"
 done
-bash -n docker/initdb-pg-automerge.sh || fail "docker/initdb-pg-automerge.sh: syntax"
+grep -qE '^        run: mise run docker-test$' "$wf" || fail "$wf: CI must run mise run docker-test"
+for f in docker/initdb-pg-automerge.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh; do
+  bash -n "$f" || fail "$f: syntax"
+done
 [ -x docker/initdb-pg-automerge.sh ] || fail "docker/initdb-pg-automerge.sh must be executable (the entrypoint sources non-executable scripts)"
 grep -qE '^    image: pg-automerge:' compose.yaml || fail "compose.yaml: image must be the pg-automerge built by mise run docker-build"
 grep -qE '^      - pgdata:/var/lib/postgresql$' compose.yaml \

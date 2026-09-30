@@ -2016,7 +2016,10 @@ What costs a load, per call:
   superuser-only.
 - `tests/limits.sh` (`mise run limits`, part of `mise run test`): the load
   memory limit against a real crash, in a scratch cluster whose address
-  space is capped (see [Resource limits](#resource-limits)).
+  space is capped (see [Resource limits](#resource-limits)). In its
+  container mode (`LIMITS_CONTAINER`, used by `tests/docker.sh`) the
+  capped server is a container of the Docker image started with
+  `--memory` (see [Docker image](#docker-image)).
 - `tests/replication.sh` (`mise run replication`, not part of `mise run
   test`: it runs its own scratch cluster with `wal_level = logical`):
   logical replication in text and binary mode (see the README's
@@ -2075,10 +2078,21 @@ What costs a load, per call:
   checks these refusals and the workflow's concurrency group and package
   step, and the Docker packaging statically (see [Docker image](#docker-image)).
 - `mise run docker-test` (`tests/docker.sh`, not part of `mise run test`)
-  builds the Docker image and smoke-tests it and `compose.yaml` (see
-  [Docker image](#docker-image)).
+  builds the Docker image and tests it and `compose.yaml` against
+  throwaway containers, including the regress examples, four of the
+  multi-session scripts and `limits.sh` (see [Docker image](#docker-image));
+  CI runs it after `mise run ci`.
 - The multi-session shell scripts share `tests/lib.sh`; they start the pgrx-managed
   Postgres if it is not running and stop it again only if they started it.
+  With `PG_AUTOMERGE_TEST_HOST` (and `_PORT`, `_USER`, `_PASSWORD`) set
+  they run against that server instead (external mode): no install, no
+  start or stop, the connection arguments of every `psql`, `pg_dump` and
+  `pg_restore` taken from there (the client tools stay pgrx's pg18 build).
+  `concurrency.sh`, `notify.sh`, `dump.sh`, `extension.sh` (its plain role
+  gets a password, for servers that do not trust TCP connections) and
+  `bench_sql.sh` work in both modes; `upgrade.sh` (it copies SQL scripts
+  into the server's extension directory) and `replication.sh` (its own
+  scratch cluster) refuse external mode rather than test something else.
 - `mise run lint`: `tests/check_ci.sh`, rustfmt, clippy with `-D warnings` for the default, the
   `pg_test` and the core-only builds, and rustdoc with `-D warnings`.
 
@@ -2361,18 +2375,68 @@ README's Docker section. Packaging decisions:
   and the real server runs. `pull_policy: never`: the image is local.
 - **Tests.** `tests/docker.sh` (`mise run docker-test`, after
   `docker-build`; not part of `mise run test` because it needs Docker and
-  a release build) checks the labels, the version file and license, that
-  no toolchain is in the image, lz4 support and the exact set of
-  extension files; then, against fresh containers and volumes (labelled
-  `pg-automerge-test`, all removed on exit): default init (installed in
-  `POSTGRES_DB` at the crate version, not in `postgres` or `template1`,
-  `debug_assertions` off), a merge of the regress fixtures' concurrent
-  edits with jsonb reads, settings passed with `-c`, lz4 on an `automerge`
-  column, a restart on the same volume (data kept, init not re-run,
-  `ALTER EXTENSION .. UPDATE` a no-op), `PG_AUTOMERGE_CREATE_EXTENSION=0`
-  (then a manual `CREATE EXTENSION .. SCHEMA`), an invalid value failing
-  init, and `compose.yaml` (`up --wait` healthy, settings applied, port on
-  127.0.0.1, `down -v` leaves no volume).
+  a release build; CI runs it after `mise run ci`) checks the labels, the
+  version file and license, that no toolchain is in the image, lz4
+  support and the exact set of extension files. Then, against fresh
+  containers and volumes (labelled `pg-automerge-test`, port 5432
+  published on a free port of 127.0.0.1, all removed on exit; helpers in
+  `tests/docker_lib.sh`):
+  - default init: installed in `POSTGRES_DB` at the crate version, not in
+    `postgres` or `template1`, `debug_assertions` off;
+  - SQL through the container's own `psql`: text and bytea casts
+    round-trip, `||` (documents and bare changes), `merge` and
+    `merge_agg` of the regress fixtures' concurrent edits agree (heads and
+    content: `merge_agg` in another order may lay out the bytes
+    differently), jsonb operators on the type, `22P02` for corrupt input,
+    lz4 on an `automerge` column; a GIN `jsonb_path_ops` index on
+    `(doc::jsonb)` that `doc @> ...` uses (the implicit cast matches the
+    index expression) and a STORED generated `doc::jsonb` column; the
+    history functions against each other (change counts, changes since
+    the base's heads, their bytes merged onto the base give the same
+    heads, jsonb at the base's heads is the base, `automerge_get_change`,
+    `automerge_contains`);
+  - `automerge_notify()` with a separate `LISTEN` session (it holds a
+    statement open until the writer is done, so the delivery is
+    deterministic): payload table, op, key, heads and prev_heads;
+  - the settings' defaults, and a plain role's `SET` of either refused;
+  - `pg_dump -Fc` in one container, `pg_restore --exit-on-error` into a
+    second one initialized with `PG_AUTOMERGE_CREATE_EXTENSION=0` (the
+    dump's `CREATE EXTENSION` installs it): same bytes, heads, jsonb and
+    generated columns, column compression, the index valid and used, the
+    trigger present;
+  - a restart on the same volume (data kept, init not re-run, `ALTER
+    EXTENSION .. UPDATE` a no-op), `PG_AUTOMERGE_CREATE_EXTENSION=0` (then
+    a manual `CREATE EXTENSION .. SCHEMA`), an invalid value failing init;
+  - the regress examples through `pg_regress --use-existing` (the same
+    expected output as `mise run regress`), and `concurrency.sh`,
+    `notify.sh`, `dump.sh` and `extension.sh` in `tests/lib.sh`'s external
+    mode, against one container;
+  - `limits.sh` in container mode, against a container started with
+    `--memory=1g --memory-swap=1g` (`DOCKER_TEST_MEMORY`) and the default
+    limit: without the limit, six of the seven crafted inputs get the
+    backend killed by the cgroup's OOM killer (signal 9) and the
+    postmaster restarts every session, which is what a production
+    container would do; with the limit, every path gets `53400` and
+    nothing restarts (no new "terminated by signal", the sentinel session
+    alive, `pg_postmaster_start_time()`, the container's start time and
+    restart count unchanged). The seventh input, a compressed change
+    chunk listing 20,000,000 empty other actors, gets Automerge's own
+    `22P02` without the limit instead: it reserves a large table that it
+    barely touches before rejecting the chunk, which an address-space cap
+    (`ulimit -v`, the scratch cluster) refuses and a used-memory cap (the
+    cgroup) does not. The limit refuses it first either way.
+  - every container's log (`docker logs`) is free of `TRAP:`, `PANIC:`,
+    Rust panics and backends terminated by a signal or a non-zero exit
+    (not any process's: the logical replication launcher exits with 1 at
+    every shutdown, including the init server's); the limits container
+    may show its deliberate crashes only;
+  - `compose.yaml` (`up --wait` healthy, settings applied, port on
+    127.0.0.1, `down -v` leaves no volume).
+
+  The whole run takes about 2 minutes once the image is built.
+  `mise run docker-bench-sql` (`tests/docker_bench.sh`) runs
+  `tests/bench_sql.sh` against a container of the image (see the
+  appendix).
 
 Measured 2026-09-30 on an 8-core Intel Atom C3758R (2.4 GHz), Docker 29.8
 with BuildKit:
@@ -3026,3 +3090,40 @@ All within ±3.1% (at 83 kB, ±0.6 ms either way), about the drift of R1,
 whose code did not change (−2.2% at 877 kB); the scan, the only code on
 these paths that changed, got faster, by 2 to 26 µs.
 
+### The Docker image against the pgrx Postgres (2026-09-30)
+
+The numbers above were all measured on the pgrx-managed Postgres 18.6,
+which pgrx builds with `--enable-cassert` and
+`RANDOMIZE_ALLOCATED_MEMORY` (every `palloc` filled with noise). The
+Docker image runs the same extension (a release build, the same profile)
+on the PGDG Postgres 18.6 without either. `mise run bench-sql` and
+`mise run docker-bench-sql` (a throwaway container, default settings like
+the pgrx cluster's, over TCP on 127.0.0.1 like the pgrx runs), alternated
+two rounds each, `BENCH_REPS=5`, the mean of the two runs' medians, ms:
+
+| case | 83 kB pgrx | image | 877 kB pgrx | image | 3 MB pgrx | image |
+|---|---:|---:|---:|---:|---:|---:|
+| R1 read | 26 | 25 (−6%) | 258 | 252 (−2%) | 2783 | 2784 (+0%) |
+| R2 three reads | 77 | 74 (−3%) | 782 | 760 (−3%) | 8298 | 8343 (+1%) |
+| R3 heads | 0.4 | 0.3 | 0.4 | 0.3 | 0.4 | 0.3 |
+| I1 insert of a save | 22 | 22 (−2%) | 204 | 200 (−2%) | 2760 | 2728 (−1%) |
+| W1 merge(doc, changes) | 37 | 36 (−3%) | 366 | 353 (−4%) | 5211 | 5170 (−1%) |
+| W2 merge(doc, newer save) | 24 | 21 (−11%) | 206 | 198 (−4%) | 2760 | 2740 (−1%) |
+| W3 the same, cast first | 22 | 21 (−5%) | 206 | 199 (−4%) | 2758 | 2730 (−1%) |
+| W4 upsert | 40 | 36 (−10%) | 367 | 364 (−1%) | 5248 | 5244 (−0%) |
+| W5 no-op merge | 0.8 | 0.6 | 0.9 | 0.7 | 0.9 | 0.6 |
+| W6 W3 as a text parameter | 38 | 37 (−4%) | 372 | 370 (−1%) | 5325 | 5302 (−0%) |
+| A1 merge_agg of one row | 1.4 | 0.7 | 8.7 | 4.3 | 24 | 9.8 |
+| A2 merge_agg of two versions | 18 | 17 (−6%) | 173 | 170 (−2%) | 2548 | 2518 (−1%) |
+| C1 contains(doc, newer save) | 0.9 | 0.4 | 1.2 | 0.7 | 9.1 | 5.2 |
+| C2 contains(doc, stored newer) | 1.2 | 0.6 | 1.2 | 0.8 | 1.1 | 0.6 |
+
+Everything that loads a document is within 0 to 6% (up to 11% at 83 kB,
+where a run is 20 ms and the noise ±1 ms): the time is Automerge's, in
+Rust, and identical code. The paths that avoid the load (heads, no-op
+merges, `merge_agg` of one row, containment by heads and change counts)
+take about half the time on the image: what is left there is Postgres'
+own work (detoasting, `palloc`, the executor), which the assertions and
+the memory randomization slow down. The earlier sections' conclusions
+hold on a production build; their millisecond-scale absolute numbers
+are about twice what a production server shows.

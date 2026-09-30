@@ -1,5 +1,6 @@
-# Runs exactly what `mise run ci` runs locally: lint, all test suites and
-# the regress tests, against the pgrx-managed Postgres 18.
+# Runs what `mise run ci` runs locally: lint, all test suites and the
+# regress tests, against the pgrx-managed Postgres 18; then builds the
+# Docker image and runs `mise run docker-test` against it.
 name: CI
 
 on:
@@ -27,7 +28,7 @@ env:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -66,12 +67,22 @@ jobs:
       - name: Lint, test, regress
         run: mise run ci
 
+      # The Docker image (official postgres:18 + the extension built against
+      # its PGDG Postgres), then tests/docker.sh against containers of it,
+      # including the regress examples and the multi-session suites (they
+      # use the pgrx Postgres' client tools initialized above). A cold
+      # build: the runner starts without BuildKit's cache mounts. Never
+      # pushed.
+      - name: Docker image build and test
+        run: mise run docker-test
+
       - name: Benchmarks (nightly only)
         if: github.event_name == 'schedule'
         run: |
           mise run bench-core | tee bench-core.txt
           BENCH_REPS=2 mise run bench-expanded | tee bench-expanded.txt
           mise run bench-sql | tee bench-sql.txt
+          mise run docker-bench-sql | tee bench-sql-docker.txt
 
       - name: Upload benchmark tables
         if: github.event_name == 'schedule'
