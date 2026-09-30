@@ -1,17 +1,19 @@
 //! Rust-level timings of the core primitives on the benchmark documents
 //! (`mise run bench-core`, release build): loading, normalizing canonical
-//! and compressed input, the load memory scan, saving, and the JSON walk.
+//! and compressed input, the load memory scan, saving, the JSON walk, and
+//! (on documents with a text at `text`) the rich-text spans.
 //!
 //! Env: BENCH_DOCS (space-separated subset of "text3mb items20k items2k
-//! typed5k", default all), BENCH_REPS (default 5). Prints the median in
+//! typed5k rich20k", default all), BENCH_REPS (default 5). Prints the median in
 //! milliseconds per operation and document.
 
 use std::hint::black_box;
 use std::time::Instant;
 
-use automerge::{AutoCommit, Automerge};
+use automerge::{AutoCommit, Automerge, ObjType, ReadDoc};
 use pg_automerge_core::json::{self, JsonSink};
-use pg_automerge_core::{budget, normalize};
+use pg_automerge_core::loaded::{Input, LoadedDoc};
+use pg_automerge_core::{budget, normalize, spans};
 
 #[path = "shared/bench_docs.rs"]
 mod bench_docs;
@@ -72,13 +74,14 @@ fn build(name: &str) -> AutoCommit {
         "items20k" => bench_docs::structured(20_000),
         "items2k" => bench_docs::structured(2_000),
         "typed5k" => bench_docs::typed_text(5_000),
+        "rich20k" => bench_docs::rich_text(20_000),
         other => panic!("unknown document {other}"),
     }
 }
 
 fn main() {
-    let docs =
-        std::env::var("BENCH_DOCS").unwrap_or_else(|_| "text3mb items20k items2k typed5k".into());
+    let docs = std::env::var("BENCH_DOCS")
+        .unwrap_or_else(|_| "text3mb items20k items2k typed5k rich20k".into());
     let reps: usize = std::env::var("BENCH_REPS")
         .ok()
         .and_then(|r| r.parse().ok())
@@ -96,6 +99,10 @@ fn main() {
             compressed.len()
         );
         let loaded = Automerge::load(&stored).unwrap();
+        let text = loaded
+            .get(automerge::ROOT, "text")
+            .unwrap()
+            .map(|(_, id)| id);
 
         let cases: Vec<(&str, Case<'_>)> = vec![
             (
@@ -139,6 +146,36 @@ fn main() {
                 Box::new(|| drop(black_box(json::doc_to_json(&loaded).unwrap()))),
             ),
         ];
+        let mut cases = cases;
+        let is_text = |id: &automerge::ObjId| loaded.object_type(id) == Ok(ObjType::Text);
+        if let Some(text) = text.filter(is_text) {
+            let expanded = LoadedDoc::from_doc(loaded.clone(), false).unwrap();
+            let expanded = Box::leak(Box::new(expanded));
+            let doc = &loaded;
+            cases.push((
+                "automerge ReadDoc::spans (iterate, loaded)",
+                Box::new(move || {
+                    black_box(doc.spans(&text).unwrap().count());
+                }),
+            ));
+            cases.push((
+                "write_spans (no-op sink, loaded)",
+                Box::new(|| {
+                    let mut sink = Discard::default();
+                    spans::write_spans(Input::Loaded(expanded), &["text"], None, &mut sink)
+                        .unwrap();
+                    black_box(sink.0);
+                }),
+            ));
+            cases.push((
+                "spans_to_json (stored: load + serde Value)",
+                Box::new(|| {
+                    drop(black_box(
+                        spans::spans_to_json(Input::Stored(&stored), &["text"], None).unwrap(),
+                    ))
+                }),
+            ));
+        }
         for (label, mut f) in cases {
             let ms = median_ms(reps, &mut f);
             println!("{name:<9} | {ms:>9.1} | {label}");

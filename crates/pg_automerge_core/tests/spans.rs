@@ -624,6 +624,82 @@ fn deep_blocks_are_refused_before_automerge_renders_them() {
 }
 
 #[test]
+fn blocks_are_found_and_checked_as_of_the_heads() {
+    // A block deep at earlier heads whose deep part was deleted since:
+    // refused at those heads (Automerge would render it), fine now.
+    let limit = Error::LimitExceeded(format!(
+        "automerge text block is nested more than {MAX_BLOCK_DEPTH} levels deep"
+    ));
+    let (mut doc, text) = with_text("abc");
+    let b = doc.split_block(&text, 1).unwrap();
+    let mut obj = doc.put_object(&b, "m", ObjType::Map).unwrap();
+    for _ in 0..2000 {
+        obj = doc.put_object(&obj, "m", ObjType::Map).unwrap();
+    }
+    doc.commit();
+    let deep = doc.get_heads();
+    doc.delete(&b, "m").unwrap();
+    // A second block, joined (deleted) again: present only in between.
+    let second = block(&mut doc, &text, 3, "heading", &["ul"]);
+    doc.put(&second, "n", 1).unwrap();
+    doc.commit();
+    let two_blocks = doc.get_heads();
+    doc.join_block(&text, 3).unwrap();
+    doc.commit();
+    let d = doc.document().clone();
+    assert_eq!(spans_at(&mut doc, &["text"], &deep).unwrap_err(), limit);
+    let got = spans_at(&mut doc, &["text"], &two_blocks).unwrap().unwrap();
+    assert_eq!(got, reference(&d, &text, Some(&two_blocks)));
+    assert_eq!(
+        got,
+        json!([
+            {"type": "text", "value": "a"},
+            {"type": "block", "value": {}},
+            {"type": "text", "value": "b"},
+            {"type": "block", "value": {
+                "type": "heading", "parents": ["ul"], "attrs": {}, "isEmbed": false, "n": 1,
+            }},
+            {"type": "text", "value": "c"},
+        ])
+    );
+    let now = assert_matches_reference(&mut doc, &["text"], &text);
+    assert_eq!(
+        now,
+        json!([
+            {"type": "text", "value": "a"},
+            {"type": "block", "value": {}},
+            {"type": "text", "value": "bc"},
+        ])
+    );
+}
+
+#[test]
+fn block_keys_that_collide_after_nul_replacement_are_deterministic() {
+    // "k\0" and "k\u{FFFD}" are one jsonb key after U+0000 is replaced:
+    // the block value keeps the same one as automerge_to_jsonb does for
+    // an ordinary map, whatever the order of the hydrated map (a hash map,
+    // whose order differs between instances).
+    for round in 0..32 {
+        let (mut doc, text) = with_text("ab");
+        let b = doc.split_block(&text, 1).unwrap();
+        let m = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
+        for obj in [&b, &m] {
+            for i in 0..8 {
+                doc.put(obj, format!("x{i}"), i).unwrap();
+            }
+            doc.put(obj, "k\0", "nul").unwrap();
+            doc.put(obj, "k\u{FFFD}", "replacement").unwrap();
+        }
+        let out = spans(&mut doc, &["text"]).unwrap().unwrap();
+        let bytes = doc.save_nocompress();
+        let whole =
+            pg_automerge_core::json::doc_to_json(&Automerge::load(&bytes).unwrap()).unwrap();
+        assert_eq!(out[1]["value"], whole["m"], "round {round}");
+        assert_eq!(out[1]["value"]["k\u{FFFD}"], json!("replacement"));
+    }
+}
+
+#[test]
 fn expanded_and_stored_inputs_agree() {
     let (mut doc, text) = with_text("hello");
     block(&mut doc, &text, 2, "paragraph", &[]);

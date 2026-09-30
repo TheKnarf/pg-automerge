@@ -57,3 +57,34 @@ pub fn typed_text(n: usize) -> AutoCommit {
     doc.commit();
     doc
 }
+
+/// A rich text of `n` paragraphs of 9 characters, each after a block with
+/// the fields editors store (type, parents, attrs, isEmbed), every tenth
+/// paragraph bold; one change.
+pub fn rich_text(n: usize) -> AutoCommit {
+    use automerge::marks::{ExpandMark, Mark};
+    let mut doc = AutoCommit::new().with_actor(ActorId::from([1u8; 16]));
+    let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
+    doc.splice_text(&text, 0, 0, &"paragraph".repeat(n))
+        .unwrap();
+    // Blocks from the end, so the indices before them stay put.
+    for i in (0..n).rev() {
+        let b = doc.split_block(&text, i * 9).unwrap();
+        doc.put(&b, "type", "paragraph").unwrap();
+        doc.put_object(&b, "parents", ObjType::List).unwrap();
+        doc.put_object(&b, "attrs", ObjType::Map).unwrap();
+        doc.put(&b, "isEmbed", false).unwrap();
+    }
+    for i in (0..n).step_by(10) {
+        let start = i * 10 + 1;
+        doc.mark(
+            &text,
+            Mark::new("bold".into(), true, start, start + 9),
+            ExpandMark::After,
+        )
+        .unwrap();
+    }
+    doc.put(ROOT, "status", "new").unwrap();
+    doc.commit();
+    doc
+}

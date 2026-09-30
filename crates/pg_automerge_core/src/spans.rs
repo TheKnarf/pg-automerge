@@ -17,17 +17,18 @@
 //! level: a text holding a block nested a few hundred levels deep (a
 //! document of a few kB) would overflow the backend's stack, which no
 //! guard catches. So before `spans()` runs, every block of the text is
-//! found (from `text()` and `get()`, which do not hydrate) and its depth
-//! measured with an iterative walk; deeper than [`MAX_BLOCK_DEPTH`] is
-//! [`Error::LimitExceeded`]. The block values in the result come from this
-//! crate's own (iterative) walk, not from the hydrated map.
+//! found (one `list_range` over the text, which does not hydrate) and its
+//! depth measured with an iterative walk; deeper than [`MAX_BLOCK_DEPTH`]
+//! is [`Error::LimitExceeded`]. The block values in the result are then
+//! converted from the hydrated maps `spans()` returns, whose depth is known
+//! to be bounded.
 
 use automerge::iter::Span;
 use automerge::{
-    Automerge, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValue, TextEncoding, Value,
+    Automerge, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValue, Value, ValueRef, hydrate,
 };
 
-use crate::json::{JsonSink, ValueSink, sanitize, write_object, write_owned_scalar};
+use crate::json::{JsonSink, ValueSink, sanitize, write_owned_scalar};
 use crate::loaded::{Input, with_doc};
 use crate::{Error, Ticker};
 
@@ -99,14 +100,14 @@ fn write_doc_spans<S: JsonSink + ?Sized>(
     let Some(text) = resolve(doc, path, heads)? else {
         return Ok(false);
     };
-    let blocks = checked_blocks(doc, &text, heads)?;
+    let mut ticker = Ticker::default();
+    let blocks = checked_blocks(doc, &text, heads, &mut ticker)?;
     let spans = match heads {
         Some(heads) => doc.spans_at(&text, heads),
         None => doc.spans(&text),
     }
     .map_err(|e| Error::Internal(format!("could not read automerge spans: {e}")))?;
-    let mut blocks = blocks.into_iter();
-    let mut ticker = Ticker::default();
+    let mut seen = 0usize;
     sink.begin_array(0);
     for span in spans {
         ticker.tick();
@@ -127,20 +128,25 @@ fn write_doc_spans<S: JsonSink + ?Sized>(
                     sink.end_object();
                 }
             }
-            Span::Block(_) => {
-                let id = blocks.next().ok_or_else(|| {
-                    Error::Internal("automerge spans hold more blocks than the text".into())
-                })?;
+            Span::Block(map) => {
+                // Only a block whose depth was checked may be written (the
+                // conversion recurses once per level).
+                seen += 1;
+                if seen > blocks {
+                    return Err(Error::Internal(
+                        "automerge spans hold more blocks than the text".into(),
+                    ));
+                }
                 sink.key("type");
                 sink.string("block");
                 sink.key("value");
-                write_object(doc, heads, &id, ObjType::Map, MAX_BLOCK_DEPTH, sink)?;
+                write_hydrated_map(&map, sink, &mut ticker);
             }
         }
         sink.end_object();
     }
     sink.end_array();
-    if blocks.next().is_some() {
+    if seen < blocks {
         return Err(Error::Internal(
             "automerge spans hold fewer blocks than the text".into(),
         ));
@@ -308,56 +314,63 @@ pub fn parse_index(s: &str) -> Option<i64> {
         .then_some(value)
 }
 
-/// The blocks of `text` in order (the map objects among its elements),
+/// The number of blocks of `text` (the map objects among its elements),
 /// each checked to nest at most [`MAX_BLOCK_DEPTH`] levels deep; see the
-/// module documentation. Found without hydrating: every U+FFFC of
-/// `text()` (a block marker, another non-string element, or a literal
-/// U+FFFC) is looked up with `get()` at its index in the document's text
-/// encoding.
+/// module documentation. Found without hydrating, in one `list_range`
+/// over the text (whose items are its characters, its other elements and
+/// its mark boundaries, the ids built only for the blocks).
 fn checked_blocks(
     doc: &Automerge,
     text: &ObjId,
     heads: Option<&[ChangeHash]>,
-) -> Result<Vec<ObjId>, Error> {
-    let internal = |e: automerge::AutomergeError| {
-        Error::Internal(format!("could not read automerge text: {e}"))
+    ticker: &mut Ticker,
+) -> Result<usize, Error> {
+    let items = match heads {
+        Some(heads) => doc.list_range_at(text, .., heads),
+        None => doc.list_range(text, ..),
     };
-    let chars = match heads {
-        Some(heads) => doc.text_at(text, heads),
-        None => doc.text(text),
-    }
-    .map_err(internal)?;
-    let encoding = doc.text_encoding();
-    let mut blocks = Vec::new();
-    let mut ticker = Ticker::default();
-    let (mut index, mut scanned) = (0usize, 0usize);
-    for (at, _) in chars.match_indices('\u{FFFC}') {
+    let mut blocks = 0;
+    for item in items {
         ticker.tick();
-        index += width(encoding, &chars[scanned..at])?;
-        scanned = at;
-        let got = match heads {
-            Some(heads) => doc.get_at(text, index, heads),
-            None => doc.get(text, index),
-        }
-        .map_err(internal)?;
-        if let Some((Value::Object(ObjType::Map), id)) = got {
-            check_depth(doc, heads, &id, &mut ticker)?;
-            blocks.push(id);
+        if let ValueRef::Object(ObjType::Map) = item.value {
+            check_depth(doc, heads, &item.id(), ticker)?;
+            blocks += 1;
         }
     }
     Ok(blocks)
 }
 
-/// The width of `s` in `encoding`'s units, as Automerge counts indices.
-fn width(encoding: TextEncoding, s: &str) -> Result<usize, Error> {
-    match encoding {
-        TextEncoding::UnicodeCodePoint => Ok(s.chars().count()),
-        TextEncoding::Utf8CodeUnit => Ok(s.len()),
-        TextEncoding::Utf16CodeUnit => Ok(s.encode_utf16().count()),
-        // Documents are loaded with the platform default (code points).
-        TextEncoding::GraphemeCluster => Err(Error::Internal(
-            "automerge spans: unsupported text encoding".into(),
-        )),
+/// Write a block's hydrated map with the scalar mapping of
+/// [`crate::json`], as the per-object walk would write the object (keys in
+/// Automerge's order, so that which of two keys that differ only by U+0000
+/// wins after [`sanitize`] does not depend on hash order; texts as
+/// strings; counters their value). Recurses once per level: only for a
+/// block [`check_depth`] has passed.
+fn write_hydrated_map<S: JsonSink + ?Sized>(map: &hydrate::Map, sink: &mut S, ticker: &mut Ticker) {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    sink.begin_object();
+    for (key, value) in entries {
+        ticker.tick();
+        sink.key(&sanitize(key));
+        write_hydrated(&value.value, sink, ticker);
+    }
+    sink.end_object();
+}
+
+fn write_hydrated<S: JsonSink + ?Sized>(value: &hydrate::Value, sink: &mut S, ticker: &mut Ticker) {
+    match value {
+        hydrate::Value::Scalar(scalar) => write_owned_scalar(scalar, sink),
+        hydrate::Value::Map(map) => write_hydrated_map(map, sink, ticker),
+        hydrate::Value::List(list) => {
+            sink.begin_array(0);
+            for item in list.iter() {
+                ticker.tick();
+                write_hydrated(&item.value, sink, ticker);
+            }
+            sink.end_array();
+        }
+        hydrate::Value::Text(text) => sink.string(&sanitize(&text.to_string())),
     }
 }
 

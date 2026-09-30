@@ -1266,12 +1266,26 @@ the WASM `spans(obj, heads)` as is, and `export_span` in
   U+FFFC typed by a user is text too.
 
 Deliberate deviations, all from the jsonb scalar mapping (see the table
-above), used for mark values and block contents: integers are exact
-numbers (JS: `number`, inexact past 2^53), counters their value (JS: a
-`Counter` object), NaN/±Infinity `null`, timestamps ISO 8601 strings (JS:
-`Date`), bytes base64 strings (JS: `Uint8Array`), U+0000 in strings and
-keys (mark names too) U+FFFD. Text inside a block's map is a string, as
-in JS; conflicting keys in a block show the winner, as in JS.
+above), used for mark values and block contents, compared with what
+`alloc_scalar` / `export_hydrate` give in JS:
+
+- integers (int, uint, counter) are exact JSON numbers. JS gives a
+  `number` for an int or counter within ±(2^53−1) and a `BigInt` outside
+  it (which `JSON.stringify` refuses); a uint is always a `BigInt` there
+  (automerge-wasm's safe range for uints, `0..MIN_SAFE_INTEGER as u64`,
+  is empty);
+- counters are their current value. JS gives a `Counter` object in block
+  values (`registerDatatypes` wraps them; its JSON is the value) and a
+  plain number (or `BigInt`) in mark values, which are not wrapped;
+- NaN/±Infinity are `null`, timestamps ISO 8601 strings (JS: `Date`),
+  bytes base64 strings (JS: `Uint8Array`), U+0000 in strings and keys
+  (mark names too) U+FFFD.
+
+Not deviations: strings in block values are `ImmutableString` objects in
+JS (`registerDatatypes` wraps `str` too), whose JSON is the plain string,
+as here; mark values that are strings are plain strings in both. Text
+inside a block's map is a string, as in JS; conflicting keys in a block
+show the winner, as in JS.
 
 **Positions.** The result has none (neither does JS's), so no text
 encoding is involved in it: a client that needs offsets sums the lengths
@@ -1293,19 +1307,32 @@ level in a release build: a block holding maps nested a few hundred
 levels deep (a document of about 2 kB) overflows the backend's 8 MB stack
 inside `spans()`, a crash (a segfault restarts the cluster) that no guard
 can catch. So before `spans()` is called, every block of the text is
-found without hydrating (each U+FFFC of `text()` is looked up with `get()`
-at its index in the document's text encoding; the map objects are the
-blocks) and its depth is measured with an iterative walk: a block nested
-more than 32 levels deep (the block's map is level 1) is `54000`
-(`automerge text block is nested more than 32 levels deep`), which leaves
-the stack below 0.5 MB. Real blocks are 2 or 3 levels deep. The block
-values in the result are then written by the extension's own iterative
-walk of those objects (the per-object walk of the jsonb mapping, capped at
-the same depth), not converted from the hydrated map; a core test checks
-that they equal Automerge's hydrated values, counters included.
+found without hydrating (one `list_range` over the text, as of the heads;
+the map objects among its elements are the blocks) and its depth is
+measured with an iterative walk: a block nested more than 32 levels deep
+(the block's map is level 1) is `54000` (`automerge text block is nested
+more than 32 levels deep`), which leaves the stack below 0.5 MB. Real
+blocks are 2 or 3 levels deep. The block values in the result are then
+converted from the maps `spans()` hydrated (a recursion as deep as the
+checked block, far smaller frames than `hydrate`'s) with the jsonb
+mapping; keys are taken in Automerge's order, not the hydrated map's hash
+order, so that two keys that become one after U+0000 → U+FFFD keep the
+same one as `automerge_to_jsonb` does.
 
-Cost: one load, one `text()` and one `get()` per U+FFFC, the span
-iteration, and two small walks per block.
+Cost: one load, one `list_range` over the text, the depth walk (one
+`map_range` / `list_range` per map and list inside each block), and
+Automerge's own span iteration, which hydrates every block. Measured with
+`mise run bench-core` (document `rich20k`: 200,000 characters in 20,000
+paragraphs, each block with `type`, `parents`, `attrs` and `isEmbed`,
+every tenth paragraph bold; release build): `ReadDoc::spans` alone
+0.81 s, `write_spans` on the loaded document 1.29 s, of which the depth
+walk is about 0.45 s (some 7 µs per range call, three per block) and
+finding the blocks 0.04 s; `spans_to_json` of the stored value (load
+included) 1.79 s. So `automerge_spans` costs about 1.6 times Automerge's
+own `spans()`, linearly in the number of blocks; the depth walk is the
+price of not crashing on deep blocks. (An earlier version, which found
+blocks with `text()` and one `get()` each and wrote block values with a
+second walk of the objects, took 2.11 s.)
 
 Tests: `crates/pg_automerge_core/tests/spans.rs` compares the result with
 Automerge's own `spans()` / `spans_at()` rendered as `export_span` does
@@ -1316,8 +1343,11 @@ multi-unit characters before blocks and marks with documents loaded in
 each text encoding, literal U+FFFC and non-map objects in a text,
 conflicting texts under one key, historical heads, and random concurrent
 rich-text edits merged, at every intermediate heads), plus path
-resolution, the depth guard (up to 20,000 levels, and at heads before the
-nesting) and NUL replacement; `src/tests/spans.rs` covers the SQL side
+resolution, the depth guard (up to 20,000 levels, at heads before the
+nesting, and at heads where a block since made shallow was deep), blocks
+present only at some heads, NUL replacement, and block keys that collide
+after it (the same winner as `automerge_to_jsonb`, whatever the hash
+order); `src/tests/spans.rs` covers the SQL side
 (paths against `#>`, `22023` messages, heads errors, NULLs, expanded
 values, the labels and the depth error); the regress example shows the
 output.

@@ -507,8 +507,10 @@ there); a path to anything but a text object is an error (22023). Block
 values are the maps the writer stored (the `type`/`parents`/`attrs`
 fields above are the convention of editors such as automerge-prosemirror).
 Mark values and block contents use the jsonb mapping above (timestamps as
-ISO strings, bytes as base64, exact integers), where JavaScript gives
-`Date`, `Uint8Array` and numbers. There are no positions in the result;
+ISO strings, bytes as base64, integers and counters as exact numbers),
+where JavaScript gives `Date`, `Uint8Array`, a `number` or a `BigInt`
+(beyond ±(2^53−1), and always for unsigned integers), and a `Counter` for
+a counter in a block. There are no positions in the result;
 a block counts as one character in the text's indices. Blocks nested more
 than 32 levels deep are refused (54000). Details in
 [DESIGN.md](docs/DESIGN.md#rich-text-spans).
