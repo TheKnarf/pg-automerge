@@ -24,6 +24,9 @@ In scope:
 
 - Storing Automerge documents produced elsewhere.
 - Reading them with every `jsonb` operator/function/index.
+- Reading the structure of rich text (marks and blocks, which the jsonb
+  view flattens to a string) as jsonb spans (see
+  [Rich text spans](#rich-text-spans)).
 - `merge`: CRDT merge so concurrent writers never overwrite each other.
 - Read-only history: listing a document's changes, fetching change bytes
   (e.g. everything since a replica's heads), and the state as of earlier
@@ -505,6 +508,10 @@ implicit).
 - `automerge_to_jsonb(automerge) → jsonb`: the cast function (see
   [jsonb mapping](#jsonb-mapping)). Each call loads the document (an
   expanded value is used in place).
+- `automerge_spans(doc automerge, path text[] [, heads text[]]) → jsonb`:
+  the structure of the text object at `path` (text runs with their marks,
+  and blocks), as Automerge's JavaScript `spans()` returns it; see
+  [Rich text spans](#rich-text-spans).
 - `automerge_heads(automerge) → text[]`: current heads as sorted lowercase hex
   change hashes. Read from the header without loading the document (see
   [Heads fast path](#heads-fast-path)).
@@ -1177,6 +1184,144 @@ like jsonb's own size limits): the walk itself uses an explicit stack, but
 clear error instead). The document is valid and can still be stored,
 merged and read as `bytea`; only its jsonb view fails.
 
+### Rich text spans
+
+A text object maps to a plain string, so formatting (marks) and block
+markers (paragraphs, headings, list items, embeds: maps inserted into the
+text with `splitBlock`) are invisible in the jsonb view: marks leave no
+trace and each block shows up as U+FFFC. `automerge_spans` returns that
+structure:
+
+```sql
+automerge_spans(doc automerge, path text[]) → jsonb
+automerge_spans(doc automerge, path text[], heads text[]) → jsonb  -- as of heads
+```
+
+Both are `IMMUTABLE STRICT PARALLEL SAFE`. The result mirrors the
+Automerge JavaScript API's `spans(doc, path)`, so frontends and backends
+can use it as they use `spans()`:
+
+```json
+[{"type": "block", "value": {"type": "heading", "parents": [], "attrs": {"level": 1}}},
+ {"type": "text", "value": "Shopping tips"},
+ {"type": "block", "value": {"type": "paragraph", "parents": [], "attrs": {}}},
+ {"type": "text", "value": "Buy "},
+ {"type": "text", "value": "fresh milk", "marks": {"bold": true}},
+ {"type": "text", "value": "."}]
+```
+
+**Path.** As jsonb's `#>` takes it: from the root, map keys as strings
+and list indices as integers (`'{notes,0,body}'`; negative indices count
+from the end, and an index is parsed as `#>` parses it: optional leading
+whitespace and sign, `int4` range, nothing after the digits). `'{}'` is
+the root. Where `#>` would return NULL, so does `automerge_spans`: a
+missing key, an index out of range or not an integer, a step into a
+scalar or into a text (jsonb shows it as a string), a NULL path element.
+A map key with conflicting values uses Automerge's winner, as the jsonb
+view does. When the value at the path exists but is not a text object
+(the root, any map, table, list or scalar, including a string scalar,
+which jsonb also shows as a string), it is `22023` naming the path and
+what is there: `automerge value at path {notes,0} is a map, not a text
+object`.
+
+**Heads.** The three-argument form reads the state as of `heads` with the
+semantics and errors of `automerge_to_jsonb(doc, heads)` (see
+[History](#history-read-only)): every hash must be a change of the
+document (`22023`), `'{}'` is the state before any change (whose root is
+empty, so any non-empty path gives NULL), malformed hashes are `22P02` and
+NULL elements `22004`.
+
+**Shape**, checked against the JavaScript implementation at the tag
+`js/automerge-3.5.0` (whose `rust/automerge` is 0.12.0, the version the
+extension pins): `spans()` in `javascript/src/implementation.ts` returns
+the WASM `spans(obj, heads)` as is, and `export_span` in
+`rust/automerge-wasm/src/interop.rs` builds each element from Automerge's
+`Span`:
+
+- `Span::Text` → `{"type": "text", "value": <text>}` plus `"marks": {name:
+  value, ...}` when the mark set is non-empty (no `"marks"` key otherwise,
+  never an empty object).
+- `Span::Block` → `{"type": "block", "value": <the block's map>}`. The
+  value is the block map exactly as stored (JS: `export_hydrate` of the
+  hydrated map). Automerge adds nothing to it: the `type`, `parents`,
+  `attrs` and `isEmbed` fields are a convention of editors such as
+  automerge-prosemirror (JS `splitBlock(doc, path, index, block)` stores
+  whatever map it is given), so they appear only if the writer stored
+  them.
+- Runs come from Automerge's own span iterator (`ReadDoc::spans` /
+  `spans_at`), which the JS API uses too, so the split is identical: a
+  new run wherever the set of marks changes; adjacent text with the same
+  marks is one run; a block ends the run before it, so text is split at
+  every block (the result is flat: blocks do not contain their text,
+  they precede it).
+- Marks whose value is null are removals (`unmark`, or a mark set to
+  null), and Automerge's span iterator already drops them from each run's
+  mark set: a run with only removed marks has no `"marks"`, and a null
+  mark value never appears. Expand flags (`before`/`after`/`both`/`none`)
+  only decide which inserted text a mark covers; they are not part of the
+  output (nor of JS's).
+- Other non-string elements in a text (a list, a nested text, a number
+  inserted with `insert`) are not blocks: like `text()`, the span
+  iterator puts U+FFFC for them in the surrounding text run. A literal
+  U+FFFC typed by a user is text too.
+
+Deliberate deviations, all from the jsonb scalar mapping (see the table
+above), used for mark values and block contents: integers are exact
+numbers (JS: `number`, inexact past 2^53), counters their value (JS: a
+`Counter` object), NaN/±Infinity `null`, timestamps ISO 8601 strings (JS:
+`Date`), bytes base64 strings (JS: `Uint8Array`), U+0000 in strings and
+keys (mark names too) U+FFFD. Text inside a block's map is a string, as
+in JS; conflicting keys in a block show the winner, as in JS.
+
+**Positions.** The result has none (neither does JS's), so no text
+encoding is involved in it: a client that needs offsets sums the lengths
+of the `value`s in its own unit, counting each block as one U+FFFC
+character (JavaScript's `.length`, UTF-16 code units, gives exactly the
+indices of the JS API, whose documents use UTF-16; U+FFFC is one code
+point and one UTF-16 unit, three UTF-8 bytes).
+
+**Protections.** The document is loaded as for any read (`with_doc`: an
+expanded value in place, a stored one loaded; reading stored values is not
+subject to `pg_automerge.max_load_memory`), under the panic guard (a panic
+is `XX000` for a stored value). The span loop and the block walks check
+for interrupts. The result is built with the same `JsonbBuilder` as the
+cast (jsonb's string, element and pair limits, `54000`).
+
+Automerge renders a block's value with `hydrate`, which recurses once per
+level of nesting inside the block and needs about 13 kB of stack per
+level in a release build: a block holding maps nested a few hundred
+levels deep (a document of about 2 kB) overflows the backend's 8 MB stack
+inside `spans()`, a crash (a segfault restarts the cluster) that no guard
+can catch. So before `spans()` is called, every block of the text is
+found without hydrating (each U+FFFC of `text()` is looked up with `get()`
+at its index in the document's text encoding; the map objects are the
+blocks) and its depth is measured with an iterative walk: a block nested
+more than 32 levels deep (the block's map is level 1) is `54000`
+(`automerge text block is nested more than 32 levels deep`), which leaves
+the stack below 0.5 MB. Real blocks are 2 or 3 levels deep. The block
+values in the result are then written by the extension's own iterative
+walk of those objects (the per-object walk of the jsonb mapping, capped at
+the same depth), not converted from the hydrated map; a core test checks
+that they equal Automerge's hydrated values, counters included.
+
+Cost: one load, one `text()` and one `get()` per U+FFFC, the span
+iteration, and two small walks per block.
+
+Tests: `crates/pg_automerge_core/tests/spans.rs` compares the result with
+Automerge's own `spans()` / `spans_at()` rendered as `export_span` does
+(plain and empty text, overlapping marks, marks expanding or not at their
+boundaries, removed marks, every mark value type, nested and adjacent
+blocks and embeds, block values of every type, emoji and other
+multi-unit characters before blocks and marks with documents loaded in
+each text encoding, literal U+FFFC and non-map objects in a text,
+conflicting texts under one key, historical heads, and random concurrent
+rich-text edits merged, at every intermediate heads), plus path
+resolution, the depth guard (up to 20,000 levels, and at heads before the
+nesting) and NUL replacement; `src/tests/spans.rs` covers the SQL side
+(paths against `#>`, `22023` messages, heads errors, NULLs, expanded
+values, the labels and the depth error); the regress example shows the
+output.
+
 ## Resource limits
 
 Automerge input is deflated and run-length encoded, so its size says
@@ -1643,11 +1788,11 @@ array elements, trigger usage, jsonb limits) are built there directly.
 | `22000` data_exception | Two histories that disagree about one actor's changes (a reused actor id): two different changes with the same (actor, seq), or a second author assignment, met by `merge`, `\|\|`, `merge_agg`, `merge(automerge, bytea)`, `automerge_contains(automerge, bytea)` when it loads, or one input holding both (text input, the `bytea` cast) | `conflicting automerge changes: actor <hex> has two different changes with seq N`, or for a second author assignment (Automerge writes an actor's author only on its seq 1 change, so this takes a writer that reuses an actor id across authors or crafts changes) `conflicting automerge changes: actor <hex> is assigned an author again at seq N`; both with DETAIL: `An actor's changes form one sequence; these inputs hold two different ones, which cannot be merged.` HINT: `Each writer must use its own actor id. Automerge picks a random one for every document instance unless the application sets it.`) |
 | `22003` numeric_value_out_of_range | A change's `seq`, `start_op` or `op_count`, or the change count, above `bigint`'s range (Automerge rejects such changes on load, so this is not expected to occur) | `automerge seq N is out of range for type bigint` (DETAIL: the change) |
 | `22004` null_value_not_allowed | A NULL element in `since_heads` / `heads` | `since_heads must not contain NULL` |
-| `22023` invalid_parameter_value | `automerge_to_jsonb(doc, heads)` with a head the document lacks; bad `automerge_notify` arguments (count, channel length, key column listed twice or of type `automerge`) | `automerge document does not contain change <hash>`, `automerge_notify(): ...` (HINT on how to declare the trigger, or which columns to name) |
+| `22023` invalid_parameter_value | `automerge_to_jsonb(doc, heads)` or `automerge_spans(doc, path, heads)` with a head the document lacks; `automerge_spans` with a path to something other than a text object (`automerge value at path {notes,0} is a map, not a text object`); bad `automerge_notify` arguments (count, channel length, key column listed twice or of type `automerge`) | `automerge document does not contain change <hash>`, `automerge_notify(): ...` (HINT on how to declare the trigger, or which columns to name) |
 | `39P01` trigger_protocol_violated | `automerge_notify()` not fired `AFTER ... FOR EACH ROW` for INSERT/UPDATE/DELETE, or called outside a trigger | `automerge_notify() must be fired ...`, `automerge_notify() can only be called as a trigger` (HINT: the correct `CREATE TRIGGER`) |
 | `42703` undefined_column | `automerge_notify()` key column that does not exist | `automerge_notify(): key column "x" does not exist in table ...` |
 | `53400` configuration_limit_exceeded | Client input, changes a merge applies, or a merge result whose estimated load exceeds `pg_automerge.max_load_memory` (see [Resource limits](#resource-limits)) | `estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (2048 MB)`, `estimated memory to load merged automerge document exceeds ...`, `estimated memory for applying automerge changes exceeds ...` (DETAIL: `Loading it could take up to N MB (X operations, Y changes, Z actors, B bytes uncompressed).`, "at least" when the scan stopped early; HINT: `A superuser can raise "pg_automerge.max_load_memory".`) |
-| `54000` program_limit_exceeded | A document nested deeper than 1000 levels, or with more elements, pairs or a longer string than jsonb allows, read as jsonb | `automerge document is nested more than 1000 levels deep`, `number of jsonb array elements exceeds the maximum allowed (N)`, `string too long to represent as jsonb string` (DETAIL, as jsonb's) |
+| `54000` program_limit_exceeded | A document nested deeper than 1000 levels, or with more elements, pairs or a longer string than jsonb allows, read as jsonb; a text block nested deeper than 32 levels read with `automerge_spans` | `automerge document is nested more than 1000 levels deep`, `automerge text block is nested more than 32 levels deep`, `number of jsonb array elements exceeds the maximum allowed (N)`, `string too long to represent as jsonb string` (DETAIL, as jsonb's) |
 | `XX000` internal_error | A stored value that does not load (corruption, or a value stored with `pg_automerge.verify_writes` off that does not survive a save and load), broken invariants (bugs) | `corrupt stored automerge value: ...`, `automerge failed on a stored value: ...`, others naming the invariant |
 
 ### Why `22000` for a reused actor id
@@ -1962,7 +2107,7 @@ What costs a load, per call:
   random-history generator and stored-bytes wrappers around the
   `Input`-based API.
 - `#[pg_test]`s (`cargo pgrx test pg18`) for SQL behaviour, in
-  `src/tests/{io,merge,history,notify,expanded,hardening,loads}.rs`
+  `src/tests/{io,merge,history,notify,expanded,hardening,loads,spans}.rs`
   (`loads.rs` counts the `Automerge::load` calls of each write path and of
   `automerge_contains`, and
   covers the release of the cast's expanded values and the
@@ -2044,6 +2189,8 @@ What costs a load, per call:
   Two of the latter are in the corpus; the deferred check of `merge`
   results is tested with the test hook (see
   [The deferred verification](#the-deferred-verification)).
+- `tests/spans.rs`: `automerge_spans` against Automerge's own spans (see
+  [Rich text spans](#rich-text-spans)).
 - `tests/json_walk.rs`: the one-sweep jsonb walk against the per-object
   walk; `tests/normalize.rs`: the compressed-input shortcut against the
   full check; `tests/interrupts.rs`: the interrupt hook runs in the loops

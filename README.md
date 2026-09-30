@@ -4,8 +4,9 @@ A Postgres 18 extension that stores [Automerge](https://automerge.org)
 documents in an `automerge` column, lets you query them with every `jsonb`
 operator, function and index, and merges concurrent writes so that two
 backends never overwrite each other's changes. It also exposes a
-document's history (changes, and the state as of earlier heads) and
-notifies listening backends when a document changes.
+document's history (changes, and the state as of earlier heads) and the
+structure of its rich text (marks and blocks, as Automerge's `spans()`),
+and notifies listening backends when a document changes.
 
 The extension does not edit documents and never creates changes. Your
 backend syncs with its frontends, owns the actor IDs, and persists
@@ -464,6 +465,7 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `automerge_get_change(doc, hash) → automerge_change` | I S P | One change with its bytes; NULL if absent. |
 | `automerge_change_count(doc) → bigint` | I S P | Number of changes, read from the stored bytes without loading the document. |
 | `automerge_to_jsonb(doc, heads text[]) → jsonb` | I S P | The state as of `heads` (`'{}'`: before any change). |
+| `automerge_spans(doc, path text[] [, heads text[]]) → jsonb` | I S P | The structure of the text object at `path` (as for `#>`: `'{notes,0,body}'`): an array of `{"type":"text","value":…,"marks":{…}}` runs and `{"type":"block","value":{…}}` blocks, the shape of Automerge's JavaScript `spans()`; as of `heads` with the third argument. NULL if nothing is at `path`; 22023 if it is not a text object. See [Rich text](#rich-text). |
 
 Every object has a `COMMENT` (`\df+`, `\dT+`). Error codes are listed in
 [DESIGN.md](docs/DESIGN.md#error-codes).
@@ -475,6 +477,41 @@ counters → exact numbers, NaN/±Infinity → `null`, timestamps → ISO 8601
 UTC strings with milliseconds, bytes → base64 strings. Conflicting
 concurrent values show Automerge's winner. Details in
 [DESIGN.md](docs/DESIGN.md#jsonb-mapping).
+
+## Rich text
+
+The jsonb view shows a text object as a plain string: marks (bold, links,
+...) are not in it, and each block marker (a paragraph, heading or list
+item inserted with `splitBlock`) is a U+FFFC character. `automerge_spans`
+returns the structure, in the shape of `Automerge.spans(doc, path)` in
+JavaScript, so a frontend can render it or a backend index it:
+
+```sql
+SELECT automerge_spans(doc, '{body}') FROM notes WHERE id = $1;
+-- [{"type": "block", "value": {"type": "heading", "parents": [], "attrs": {"level": 1}}},
+--  {"type": "text", "value": "Shopping tips"},
+--  {"type": "block", "value": {"type": "paragraph", "parents": [], "attrs": {}}},
+--  {"type": "text", "value": "Buy "},
+--  {"type": "text", "value": "fresh milk", "marks": {"bold": true}},
+--  {"type": "text", "value": "."}]
+
+-- One row per span; every link in a document; the text as of earlier heads.
+SELECT s->>'type', s->>'value', s->'marks' FROM jsonb_array_elements(automerge_spans(doc, '{body}')) s;
+SELECT s->'marks'->>'link' FROM notes, jsonb_array_elements(automerge_spans(doc, '{body}')) s
+WHERE s->'marks' ? 'link';
+SELECT automerge_spans(doc, '{body}', $2) FROM notes WHERE id = $1;  -- $2: heads (text[])
+```
+
+The path works like `#>` (map keys, list indices, NULL when nothing is
+there); a path to anything but a text object is an error (22023). Block
+values are the maps the writer stored (the `type`/`parents`/`attrs`
+fields above are the convention of editors such as automerge-prosemirror).
+Mark values and block contents use the jsonb mapping above (timestamps as
+ISO strings, bytes as base64, exact integers), where JavaScript gives
+`Date`, `Uint8Array` and numbers. There are no positions in the result;
+a block counts as one character in the text's indices. Blocks nested more
+than 32 levels deep are refused (54000). Details in
+[DESIGN.md](docs/DESIGN.md#rich-text-spans).
 
 ## Configuration
 

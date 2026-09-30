@@ -9,7 +9,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use automerge::iter::{DocItem, ListRange, MapRange, Span};
-use automerge::{Automerge, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValueRef, ValueRef};
+use automerge::{
+    Automerge, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValue, ScalarValueRef, ValueRef,
+};
 use serde_json::{Map, Number, Value};
 
 use crate::Error;
@@ -329,13 +331,33 @@ pub fn write_json_per_object<S: JsonSink + ?Sized>(
     heads: Option<&[ChangeHash]>,
     sink: &mut S,
 ) -> Result<(), Error> {
+    write_object(doc, heads, &ROOT, ObjType::Map, MAX_DEPTH, sink)
+}
+
+/// The per-object walk of [`write_json_per_object`] from the map or list
+/// `obj` of type `typ` (a `Table` is walked as a map; not `Text`): one value
+/// with the mapping of [`doc_to_json`], at most `max_depth` containers deep
+/// (`obj` itself is the first).
+///
+/// # Errors
+///
+/// [`Error::LimitExceeded`] for nesting deeper than `max_depth`;
+/// [`Error::Internal`] if Automerge fails to read a text.
+pub(crate) fn write_object<S: JsonSink + ?Sized>(
+    doc: &Automerge,
+    heads: Option<&[ChangeHash]>,
+    obj: &ObjId,
+    typ: ObjType,
+    max_depth: usize,
+    sink: &mut S,
+) -> Result<(), Error> {
     // Depth-first walk with an explicit stack of the containers being
     // read, so the native stack does not grow with document depth. Every
     // container read with `heads` recomputes Automerge's clock for them,
     // which costs a walk of the change graph back to the nearest cached
     // clock.
     let mut ticker = crate::Ticker::default();
-    let mut stack = vec![Frame::new(doc, heads, &ROOT, ObjType::Map, sink)];
+    let mut stack = vec![Frame::new(doc, heads, obj, typ, sink)];
     while let Some(top) = stack.last_mut() {
         ticker.tick();
         let Some((value, id)) = top.next_item(sink) else {
@@ -356,9 +378,9 @@ pub fn write_json_per_object<S: JsonSink + ?Sized>(
                 sink.string(&sanitize(&text));
             }
             (ValueRef::Object(typ), Some(id)) => {
-                if stack.len() >= MAX_DEPTH {
+                if stack.len() >= max_depth {
                     return Err(Error::LimitExceeded(format!(
-                        "automerge document is nested more than {MAX_DEPTH} levels deep"
+                        "automerge document is nested more than {max_depth} levels deep"
                     )));
                 }
                 stack.push(Frame::new(doc, heads, &id, typ, sink));
@@ -443,6 +465,23 @@ pub fn write_scalar<S: JsonSink + ?Sized>(scalar: &ScalarValueRef<'_>, sink: &mu
         ScalarValueRef::Timestamp(ms) => sink.string(&iso8601_millis(*ms)),
         ScalarValueRef::Bytes(bytes) => sink.string(&base64(bytes)),
         ScalarValueRef::Null | ScalarValueRef::Unknown { .. } => sink.null(),
+    }
+}
+
+/// [`write_scalar`] for an owned [`ScalarValue`] (mark values): the same
+/// mapping; a counter is its current value.
+pub fn write_owned_scalar<S: JsonSink + ?Sized>(scalar: &ScalarValue, sink: &mut S) {
+    match scalar {
+        ScalarValue::Str(s) => sink.string(&sanitize(s)),
+        ScalarValue::Int(i) => sink.int(*i),
+        ScalarValue::Counter(c) => sink.int(i64::from(c)),
+        ScalarValue::Uint(u) => sink.uint(*u),
+        ScalarValue::F64(f) if f.is_finite() => sink.float(*f),
+        ScalarValue::F64(_) => sink.null(),
+        ScalarValue::Boolean(b) => sink.bool(*b),
+        ScalarValue::Timestamp(ms) => sink.string(&iso8601_millis(*ms)),
+        ScalarValue::Bytes(bytes) => sink.string(&base64(bytes)),
+        ScalarValue::Null | ScalarValue::Unknown { .. } => sink.null(),
     }
 }
 
@@ -533,7 +572,7 @@ impl JsonSink for ValueSink {
 /// Postgres text (and therefore jsonb) cannot contain U+0000, and `jsonb_in`
 /// rejects the `\u0000` escape. Replace it with U+FFFD so that one stray NUL
 /// does not make the whole document unreadable as jsonb.
-fn sanitize(s: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn sanitize(s: &str) -> std::borrow::Cow<'_, str> {
     if s.contains('\0') {
         s.replace('\0', "\u{FFFD}").into()
     } else {

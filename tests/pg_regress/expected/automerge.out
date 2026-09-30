@@ -9,6 +9,9 @@
 --   types: one value of every scalar type
 --   log:   three commits (status draft -> review -> published) with messages and times
 --   bob_reused: another writer's change on base, made with bob's actor id
+--   note:  rich text {title: "Tips", body: Text with a heading and a paragraph
+--          block (commit "write"), then bold and link marks (commit "format")}
+--   deep_block: a text whose block holds maps nested 2,000 levels deep
 \set VERBOSITY terse
 \set base '\\x856f4a83f444e24500db0101100101010101010101010101010101010101891e9df3a1166db354fc4f7695411e61a5b6f0fd9d22eb23b814c8307f9f3573060102030213022302400256020c010402081106130b15212102230a3403420a560a57118001027f007f017f0f7f007f007f0700030c00000309017f0c020d00040800000300037e000207017f7700027d056974656d7306737461747573057469746c65000a7e04646f6e65046e616d650f007d0c7f7609017d03027f030a027d02010409017f0002017d00460009167d0001466f70656e47726f6365726965736d696c6b0f0000'
 \set alice '\\x856f4a8390f29d8000a10202100101010101010101010101010101010110aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01701dba8d4bd5c5eaeb864b31653b7e1105a5b0beb72aff635a8774474f20536c0701030303130323024003430256020e010402081108130f15222109230f3403420a560b571c8001068101028301027e00017e01007e0f0c02007e00017f00020700031800000314017f0c030d000409000a01000400037e000208017f0709017f6600037d056974656d7306737461747573057469746c6500150204646f6e657f046e616d650c000b0102007e01007d0c7f7609017f070a017c7202017e0315037d02010414017f0003017d00460014167c000102466f70656e47726f63657269657320666f722053756e6461796d696c6b18007f0102007f017f1001'
@@ -18,6 +21,8 @@
 \set log '\\x856f4a83119ef1ff00be0101100404040404040404040404040404040401e46f848ea5efb4303dcc871802c4c84195c7641acf6bfdf7f67218aa0fe03f6c08010203021302230a35174004430356020a15082102230234014202560557148001048101028301030300030103017fa5facdac060280a3057d06637265617465067375626d6974077075626c6973687f0002017e000103070306737461747573030003010303017d5666960164726166747265766965777075626c697368656402017f0002007e020102'
 \set incremental '\\x856f4a83f444e24500db0101100101010101010101010101010101010101891e9df3a1166db354fc4f7695411e61a5b6f0fd9d22eb23b814c8307f9f3573060102030213022302400256020c010402081106130b15212102230a3403420a560a57118001027f007f017f0f7f007f007f0700030c00000309017f0c020d00040800000300037e000207017f7700027d056974656d7306737461747573057469746c65000a7e04646f6e65046e616d650f007d0c7f7609017d03027f030a027d02010409017f0002017d00460009167d0001466f70656e47726f6365726965736d696c6b0f0000856f4a8379852149017201891e9df3a1166db354fc4f7695411e61a5b6f0fd9d22eb23b814c8307f9f357310030303030303030303030303030303030110000001100101010101010101010101010101010108150834014202560257067002710273027f06737461747573017f017f66636c6f7365647f017f017f0b'
 \set bob_reused '\\x856f4a832b4ce40e00950202100101010101010101010101010101010110bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb019729a1cb30068f72b74da03f18fb6ce1c8187d52569b208bbb301c779e6e28430701030303130323024003430256020e010402081106130b15232106230b3403420c560c571a8001058101028301027e00017e01007e0f0102007e00017f00020700040c00000409017f0c020d00050800000300047e000207017f7700027f056974656d7302067374617475737f057469746c65000a7e04646f6e65046e616d6502007f010d007c0c7f057109017d03027f040a027f0202017f0409017f0002017c004696010009167d0001466f70656e63616e63656c6c656447726f6365726965736d696c6b7e00010e007f017f1001'
+\set note '\\x856f4a83d306762a00ca03011005050505050505050505050505050505013bdea5a91cb549994be3bb11879de5824c49d3f32b7774407339196bb8d28bb9080102030213032302350e4003430256020e0104020a1106131c153b210223273403422056245755800102940103a50112020002017e310402007e05777269746506666f726d61747e00017f0002070002330000022c020329032d7f3000042a000007000202007f030c017f0004017f000a017f0004017f0006017f0000077e04626f6479057469746c65002c7905617474727307706172656e7473047479706505617474727307706172656e74730474797065056c6576656c35007c027f2c560c017e1a6703017e1f6209017e166b03017e136e05017d0e7304027f7f06027f7f03022c077d0401000d017f0004017f070a017f0704017f070601790701000201000202017d0046000d167f0004167f020a167f0004167fa60306167e001602007f960102007e76145469707353686f7070696e672074697073427579206672657368206d696c6b206f6e2068747470733a2f2f6578616d706c652e636f6d2f73756e64617953756e6461792e70617261677261706868656164696e6701350020011400157f04626f6c64000f7f046c696e6b000f01'
+\set deep_block '\\x856f4a8334ad502f00c71f0110060606060606060606060606060606060168363ed47d4724580cc9a975edbd4f6847e190b021fe19f2a1535bc6b44604b2060102030213032302400256020b010502a71e1307150c2103230834044207560757018001037f007f017fd20f7f007f007f070001d10f0000010201b170030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80018101820183018401850186018701880189018a018b018c018d018e018f0190019101920193019401950196019701980199019a019b019c019d019e019f01a001a101a201a301a401a501a601a701a801a901aa01ab01ac01ad01ae01af01b001b101b201b301b401b501b601b701b801b901ba01bb01bc01bd01be01bf01c001c101c201c301c401c501c601c701c801c901ca01cb01cc01cd01ce01cf01d001d101d201d301d401d501d601d701d801d901da01db01dc01dd01de01df01e001e101e201e301e401e501e601e701e801e901ea01eb01ec01ed01ee01ef01f001f101f201f301f401f501f601f701f801f901fa01fb01fc01fd01fe01ff0180028102820283028402850286028702880289028a028b028c028d028e028f0290029102920293029402950296029702980299029a029b029c029d029e029f02a002a102a202a302a402a502a602a702a802a902aa02ab02ac02ad02ae02af02b002b102b202b302b402b502b602b702b802b902ba02bb02bc02bd02be02bf02c002c102c202c302c402c502c602c702c802c902ca02cb02cc02cd02ce02cf02d002d102d202d302d402d502d602d702d802d902da02db02dc02dd02de02df02e002e102e202e302e402e502e602e702e802e902ea02eb02ec02ed02ee02ef02f002f102f202f302f402f502f602f702f802f902fa02fb02fc02fd02fe02ff0280038103820383038403850386038703880389038a038b038c038d038e038f0390039103920393039403950396039703980399039a039b039c039d039e039f03a003a103a203a303a403a503a603a703a803a903aa03ab03ac03ad03ae03af03b003b103b203b303b403b503b603b703b803b903ba03bb03bc03bd03be03bf03c003c103c203c303c403c503c603c703c803c903ca03cb03cc03cd03ce03cf03d003d103d203d303d403d503d603d703d803d903da03db03dc03dd03de03df03e003e103e203e303e403e503e603e703e803e903ea03eb03ec03ed03ee03ef03f003f103f203f303f403f503f603f703f803f903fa03fb03fc03fd03fe03ff0380048104820483048404850486048704880489048a048b048c048d048e048f0490049104920493049404950496049704980499049a049b049c049d049e049f04a004a104a204a304a404a504a604a704a804a904aa04ab04ac04ad04ae04af04b004b104b204b304b404b504b604b704b804b904ba04bb04bc04bd04be04bf04c004c104c204c304c404c504c604c704c804c904ca04cb04cc04cd04ce04cf04d004d104d204d304d404d504d604d704d804d904da04db04dc04dd04de04df04e004e104e204e304e404e504e604e704e804e904ea04eb04ec04ed04ee04ef04f004f104f204f304f404f504f604f704f804f904fa04fb04fc04fd04fe04ff0480058105820583058405850586058705880589058a058b058c058d058e058f0590059105920593059405950596059705980599059a059b059c059d059e059f05a005a105a205a305a405a505a605a705a805a905aa05ab05ac05ad05ae05af05b005b105b205b305b405b505b605b705b805b905ba05bb05bc05bd05be05bf05c005c105c205c305c405c505c605c705c805c905ca05cb05cc05cd05ce05cf05d005d105d205d305d405d505d605d705d805d905da05db05dc05dd05de05df05e005e105e205e305e405e505e605e705e805e905ea05eb05ec05ed05ee05ef05f005f105f205f305f405f505f605f705f805f905fa05fb05fc05fd05fe05ff0580068106820683068406850686068706880689068a068b068c068d068e068f0690069106920693069406950696069706980699069a069b069c069d069e069f06a006a106a206a306a406a506a606a706a806a906aa06ab06ac06ad06ae06af06b006b106b206b306b406b506b606b706b806b906ba06bb06bc06bd06be06bf06c006c106c206c306c406c506c606c706c806c906ca06cb06cc06cd06ce06cf06d006d106d206d306d406d506d606d706d806d906da06db06dc06dd06de06df06e006e106e206e306e406e506e606e706e806e906ea06eb06ec06ed06ee06ef06f006f106f206f306f406f506f606f706f806f906fa06fb06fc06fd06fe06ff0680078107820783078407850786078707880789078a078b078c078d078e078f0790079107920793079407950796079707980799079a079b079c079d079e079f07a007a107a207a307a407a507a607a707a807a907aa07ab07ac07ad07ae07af07b007b107b207b307b407b507b607b707b807b907ba07bb07bc07bd07be07bf07c007c107c207c307c407c507c607c707c807c907ca07cb07cc07cd07ce07cf07d007d107d207d307d407d507d607d707d807d907da07db07dc07dd07de07df07e007e107e207e307e407e507e607e707e807e907ea07eb07ec07ed07ee07ef07f007f107f207f307f407f507f607f707f807f907fa07fb07fc07fd07fe07ff0780088108820883088408850886088708880889088a088b088c088d088e088f0890089108920893089408950896089708980899089a089b089c089d089e089f08a008a108a208a308a408a508a608a708a808a908aa08ab08ac08ad08ae08af08b008b108b208b308b408b508b608b708b808b908ba08bb08bc08bd08be08bf08c008c108c208c308c408c508c608c708c808c908ca08cb08cc08cd08ce08cf08d008d108d208d308d408d508d608d708d808d908da08db08dc08dd08de08df08e008e108e208e308e408e508e608e708e808e908ea08eb08ec08ed08ee08ef08f008f108f208f308f408f508f608f708f808f908fa08fb08fc08fd08fe08ff0880098109820983098409850986098709880989098a098b098c098d098e098f0990099109920993099409950996099709980999099a099b099c099d099e099f09a009a109a209a309a409a509a609a709a809a909aa09ab09ac09ad09ae09af09b009b109b209b309b409b509b609b709b809b909ba09bb09bc09bd09be09bf09c009c109c209c309c409c509c609c709c809c909ca09cb09cc09cd09ce09cf09d009d109d209d309d409d509d609d709d809d909da09db09dc09dd09de09df09e009e109e209e309e409e509e609e709e809e909ea09eb09ec09ed09ee09ef09f009f109f209f309f409f509f609f709f809f909fa09fb09fc09fd09fe09ff09800a810a820a830a840a850a860a870a880a890a8a0a8b0a8c0a8d0a8e0a8f0a900a910a920a930a940a950a960a970a980a990a9a0a9b0a9c0a9d0a9e0a9f0aa00aa10aa20aa30aa40aa50aa60aa70aa80aa90aaa0aab0aac0aad0aae0aaf0ab00ab10ab20ab30ab40ab50ab60ab70ab80ab90aba0abb0abc0abd0abe0abf0ac00ac10ac20ac30ac40ac50ac60ac70ac80ac90aca0acb0acc0acd0ace0acf0ad00ad10ad20ad30ad40ad50ad60ad70ad80ad90ada0adb0adc0add0ade0adf0ae00ae10ae20ae30ae40ae50ae60ae70ae80ae90aea0aeb0aec0aed0aee0aef0af00af10af20af30af40af50af60af70af80af90afa0afb0afc0afd0afe0aff0a800b810b820b830b840b850b860b870b880b890b8a0b8b0b8c0b8d0b8e0b8f0b900b910b920b930b940b950b960b970b980b990b9a0b9b0b9c0b9d0b9e0b9f0ba00ba10ba20ba30ba40ba50ba60ba70ba80ba90baa0bab0bac0bad0bae0baf0bb00bb10bb20bb30bb40bb50bb60bb70bb80bb90bba0bbb0bbc0bbd0bbe0bbf0bc00bc10bc20bc30bc40bc50bc60bc70bc80bc90bca0bcb0bcc0bcd0bce0bcf0bd00bd10bd20bd30bd40bd50bd60bd70bd80bd90bda0bdb0bdc0bdd0bde0bdf0be00be10be20be30be40be50be60be70be80be90bea0beb0bec0bed0bee0bef0bf00bf10bf20bf30bf40bf50bf60bf70bf80bf90bfa0bfb0bfc0bfd0bfe0bff0b800c810c820c830c840c850c860c870c880c890c8a0c8b0c8c0c8d0c8e0c8f0c900c910c920c930c940c950c960c970c980c990c9a0c9b0c9c0c9d0c9e0c9f0ca00ca10ca20ca30ca40ca50ca60ca70ca80ca90caa0cab0cac0cad0cae0caf0cb00cb10cb20cb30cb40cb50cb60cb70cb80cb90cba0cbb0cbc0cbd0cbe0cbf0cc00cc10cc20cc30cc40cc50cc60cc70cc80cc90cca0ccb0ccc0ccd0cce0ccf0cd00cd10cd20cd30cd40cd50cd60cd70cd80cd90cda0cdb0cdc0cdd0cde0cdf0ce00ce10ce20ce30ce40ce50ce60ce70ce80ce90cea0ceb0cec0ced0cee0cef0cf00cf10cf20cf30cf40cf50cf60cf70cf80cf90cfa0cfb0cfc0cfd0cfe0cff0c800d810d820d830d840d850d860d870d880d890d8a0d8b0d8c0d8d0d8e0d8f0d900d910d920d930d940d950d960d970d980d990d9a0d9b0d9c0d9d0d9e0d9f0da00da10da20da30da40da50da60da70da80da90daa0dab0dac0dad0dae0daf0db00db10db20db30db40db50db60db70db80db90dba0dbb0dbc0dbd0dbe0dbf0dc00dc10dc20dc30dc40dc50dc60dc70dc80dc90dca0dcb0dcc0dcd0dce0dcf0dd00dd10dd20dd30dd40dd50dd60dd70dd80dd90dda0ddb0ddc0ddd0dde0ddf0de00de10de20de30de40de50de60de70de80de90dea0deb0dec0ded0dee0def0df00df10df20df30df40df50df60df70df80df90dfa0dfb0dfc0dfd0dfe0dff0d800e810e820e830e840e850e860e870e880e890e8a0e8b0e8c0e8d0e8e0e8f0e900e910e920e930e940e950e960e970e980e990e9a0e9b0e9c0e9d0e9e0e9f0ea00ea10ea20ea30ea40ea50ea60ea70ea80ea90eaa0eab0eac0ead0eae0eaf0eb00eb10eb20eb30eb40eb50eb60eb70eb80eb90eba0ebb0ebc0ebd0ebe0ebf0ec00ec10ec20ec30ec40ec50ec60ec70ec80ec90eca0ecb0ecc0ecd0ece0ecf0ed00ed10ed20ed30ed40ed50ed60ed70ed80ed90eda0edb0edc0edd0ede0edf0ee00ee10ee20ee30ee40ee50ee60ee70ee80ee90eea0eeb0eec0eed0eee0eef0ef00ef10ef20ef30ef40ef50ef60ef70ef80ef90efa0efb0efc0efd0efe0eff0e800f810f820f830f840f850f860f870f880f890f8a0f8b0f8c0f8d0f8e0f8f0f900f910f920f930f940f950f960f970f980f990f9a0f9b0f9c0f9d0f9e0f9f0fa00fa10fa20fa30fa40fa50fa60fa70fa80fa90faa0fab0fac0fad0fae0faf0fb00fb10fb20fb30fb40fb50fb60fb70fb80fb90fba0fbb0fbc0fbd0fbe0fbf0fc00fc10fc20fc30fc40fc50fc60fc70fc80fc90fca0fcb0fcc0fcd0fce0fcf0fd00fd10f0001020000cf0f7f04626f64790002cf0f016dd20f007c01027f02ce0f010102cf0f7d040001cf0f0002007f16cf0f0078d20f0000'
 \set bomb '\\x856f4a832d8188830167001000000000000000000000000000000001010100000009010702071107130a15083405420756057005000180ade20400000180ade204010002fface2040000017e0002feace204017f016c0080ade2040180ade2047f0280ade2040181ade2040081ade20400'
 -- Store documents. Values from the backend arrive as bytea (Automerge.save());
 -- the bytea -> automerge cast validates and normalizes them.
@@ -272,6 +277,118 @@ ERROR:  automerge document does not contain change ababababababababababababababa
 SELECT automerge_changes_bytes(:'log'::automerge, ARRAY['not a hash']);
 ERROR:  invalid automerge change hash "not a hash": expected 64 hexadecimal digits
 RESET timezone;
+-- Rich text. jsonb shows a text object as a plain string (each block
+-- marker as U+FFFC); automerge_spans returns its structure instead: text
+-- runs with their marks and blocks with their values, in the shape of
+-- Automerge's JavaScript spans(), for a path as #> takes it (map keys,
+-- list indices).
+SELECT :'note'::automerge->>'body' AS body;
+                   body                   
+------------------------------------------
+ ￼Shopping tips￼Buy fresh milk on Sunday.
+(1 row)
+
+SELECT jsonb_pretty(automerge_spans(:'note'::automerge, '{body}')) AS spans;
+                      spans                       
+--------------------------------------------------
+ [                                               +
+     {                                           +
+         "type": "block",                        +
+         "value": {                              +
+             "type": "heading",                  +
+             "attrs": {                          +
+                 "level": 1                      +
+             },                                  +
+             "parents": [                        +
+             ]                                   +
+         }                                       +
+     },                                          +
+     {                                           +
+         "type": "text",                         +
+         "value": "Shopping tips"                +
+     },                                          +
+     {                                           +
+         "type": "block",                        +
+         "value": {                              +
+             "type": "paragraph",                +
+             "attrs": {                          +
+             },                                  +
+             "parents": [                        +
+             ]                                   +
+         }                                       +
+     },                                          +
+     {                                           +
+         "type": "text",                         +
+         "value": "Buy "                         +
+     },                                          +
+     {                                           +
+         "type": "text",                         +
+         "marks": {                              +
+             "bold": true                        +
+         },                                      +
+         "value": "fresh milk"                   +
+     },                                          +
+     {                                           +
+         "type": "text",                         +
+         "value": " on "                         +
+     },                                          +
+     {                                           +
+         "type": "text",                         +
+         "marks": {                              +
+             "link": "https://example.com/sunday"+
+         },                                      +
+         "value": "Sunday"                       +
+     },                                          +
+     {                                           +
+         "type": "text",                         +
+         "value": "."                            +
+     }                                           +
+ ]
+(1 row)
+
+SELECT s->>'type' AS type, s->>'value' AS value, s->'marks' AS marks
+FROM jsonb_array_elements(automerge_spans(:'note'::automerge, '{body}')) s;
+ type  |                           value                           |                 marks                  
+-------+-----------------------------------------------------------+----------------------------------------
+ block | {"type": "heading", "attrs": {"level": 1}, "parents": []} | 
+ text  | Shopping tips                                             | 
+ block | {"type": "paragraph", "attrs": {}, "parents": []}         | 
+ text  | Buy                                                       | 
+ text  | fresh milk                                                | {"bold": true}
+ text  |  on                                                       | 
+ text  | Sunday                                                    | {"link": "https://example.com/sunday"}
+ text  | .                                                         | 
+(8 rows)
+
+-- As of each change: the marks came with the second.
+SELECT m.message,
+       jsonb_array_length(s) AS n_spans,
+       jsonb_path_query_array(s, '$[*].marks') AS marks
+FROM automerge_changes_meta(:'note'::automerge) m,
+     automerge_spans(:'note'::automerge, '{body}', ARRAY[m.hash]) s;
+ message | n_spans |                          marks                           
+---------+---------+----------------------------------------------------------
+ write   |       4 | []
+ format  |       8 | [{"bold": true}, {"link": "https://example.com/sunday"}]
+(2 rows)
+
+-- Nothing at the path is NULL, as for #>; a value that is not a text
+-- object is an error (22023).
+SELECT automerge_spans(:'note'::automerge, '{missing}') IS NULL AS missing_is_null;
+ missing_is_null 
+-----------------
+ t
+(1 row)
+
+SELECT automerge_spans(:'note'::automerge, '{title}');
+ERROR:  automerge value at path {title} is a string scalar, not a text object
+SELECT automerge_spans(:'note'::automerge, '{}');
+ERROR:  automerge value at path {} is a map, not a text object
+-- Automerge renders a block's value recursively, which would overflow the
+-- stack on a block nested a few hundred levels deep; such blocks are
+-- refused (54000) before that.
+SELECT automerge_spans(:'deep_block'::automerge, '{body}');
+ERROR:  automerge text block is nested more than 32 levels deep
 -- merge_agg folds many versions (e.g. a history table) into one document.
 SELECT merge_agg(v)->>'title' AS title, jsonb_array_length(merge_agg(v)->'items') AS n_items
 FROM (VALUES (:'base'::automerge), (:'alice'::automerge), (:'bob'::automerge), (NULL)) t(v);

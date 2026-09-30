@@ -12,6 +12,7 @@
 //! - `introspect`: `automerge_heads` and `automerge_contains`.
 //! - `history`: the change types and history functions.
 //! - `notify`: the `automerge_notify()` trigger.
+//! - `spans`: `automerge_spans`, the structure of a text object.
 
 // A cdylib: its docs are for developers (built with
 // --document-private-items), so links to private items are fine.
@@ -26,6 +27,7 @@ mod io;
 mod jsonb;
 mod merge;
 mod notify;
+mod spans;
 
 ::pgrx::pg_module_magic!(name, version);
 

@@ -50,7 +50,7 @@ COMMENT ON TYPE automerge_change_meta IS
 /// A `text[]` argument of change hashes: no NULL elements (22004), every
 /// element 64 hex digits (22P02).
 #[track_caller]
-fn hashes_arg(name: &str, texts: &[Option<String>]) -> Vec<ChangeHash> {
+pub(crate) fn hashes_arg(name: &str, texts: &[Option<String>]) -> Vec<ChangeHash> {
     let mut hashes = Vec::with_capacity(texts.len());
     for text in texts {
         match text {

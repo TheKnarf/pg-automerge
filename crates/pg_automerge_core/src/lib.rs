@@ -22,6 +22,7 @@ pub mod history;
 pub mod json;
 pub mod loaded;
 pub mod notify;
+pub mod spans;
 
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;

@@ -26,7 +26,10 @@
 #     concurrent edits, jsonb operators on automerge values, a GIN
 #     expression index (used by `doc @> ...`) and a STORED generated
 #     doc::jsonb column, the history functions (changes, meta, change
-#     bytes since heads, get_change, jsonb at earlier heads), lz4 TOAST
+#     bytes since heads, get_change, jsonb at earlier heads),
+#     automerge_spans of the regress rich-text fixture (current and at
+#     earlier heads, 22023 for a non-text path, 54000 and no crash for the
+#     2,000-level deep block in this release build), lz4 TOAST
 #     compression of automerge columns, settings passed with -c;
 #   - automerge_notify(): a separate LISTEN session receives the trigger's
 #     payload, whose heads match the row;
@@ -93,7 +96,8 @@ $bad"
 # bob's concurrent edits of it, and bob's changes alone.
 fixture() { sed -n "s/^\\\\set $1 '\\\\\\\\x\\([0-9a-f]*\\)'\$/\\1/p" tests/pg_regress/sql/automerge.sql; }
 BASE="$(fixture base)"; ALICE="$(fixture alice)"; BOB="$(fixture bob)"; BOB_CHANGES="$(fixture bob_changes)"
-[[ -n "$BASE" && -n "$ALICE" && -n "$BOB" && -n "$BOB_CHANGES" ]] || fail "fixtures not found in tests/pg_regress/sql/automerge.sql"
+NOTE="$(fixture note)"; DEEP_BLOCK="$(fixture deep_block)"
+[[ -n "$BASE" && -n "$ALICE" && -n "$BOB" && -n "$BOB_CHANGES" && -n "$NOTE" && -n "$DEEP_BLOCK" ]] || fail "fixtures not found in tests/pg_regress/sql/automerge.sql"
 FIXTURES=(-v base="\\x$BASE" -v alice="\\x$ALICE" -v bob="\\x$BOB" -v bob_changes="\\x$BOB_CHANGES")
 
 # ---------------------------------------------------------------------------
@@ -256,6 +260,34 @@ FROM d, b;
 SQL
 )"
 expect "history" 't|t|t|t|t|t|t' "$out"
+
+log "rich text: automerge_spans"
+out="$(psql_in default app -v note="\\x$NOTE" <<'SQL'
+CREATE TABLE rich (id int PRIMARY KEY, doc automerge NOT NULL);
+INSERT INTO rich VALUES (1, :'note'::bytea);
+SELECT s->>'type', s->>'value', coalesce(s->'marks'->>'bold', s->'marks'->>'link', '')
+FROM rich, jsonb_array_elements(automerge_spans(doc, '{body}')) s;
+SELECT automerge_spans(doc, '{missing}') IS NULL,
+       jsonb_array_length(automerge_spans(doc, '{body}', ARRAY[m.hash])),
+       automerge_spans(doc, '{body}', automerge_heads(doc)) = automerge_spans(doc, '{body}')
+FROM rich, automerge_changes_meta(doc) m WHERE m.message = 'write';
+SQL
+)"
+expect "spans" "$(printf '%s\n' 'block|{"type": "heading", "attrs": {"level": 1}, "parents": []}|' 'text|Shopping tips|' \
+    'block|{"type": "paragraph", "attrs": {}, "parents": []}|' 'text|Buy |' 'text|fresh milk|true' 'text| on |' \
+    'text|Sunday|https://example.com/sunday' 'text|.|' 't|4|t')" "$out"
+# Not a text object: 22023. A block nested 2,000 levels deep: 54000 in
+# this release build, not a crash (check_log below would see a signal).
+for bad in "note|{title}|22023: automerge value at path {title} is a string scalar, not a text object" \
+           "deep_block|{body}|54000: automerge text block is nested more than 32 levels deep"; do
+    IFS='|' read -r fx path want <<<"$bad"
+    var="${fx^^}"
+    if out="$(psql_in default app -v VERBOSITY=verbose -v doc="\\x${!var}" -v path="$path" \
+        <<<"SELECT automerge_spans(:'doc'::automerge, :'path');" 2>&1)"; then
+        fail "automerge_spans($fx, $path) did not fail"
+    fi
+    grep -qF "ERROR:  $want" <<<"$out" || fail "automerge_spans($fx, $path): $out"
+done
 
 log "automerge_notify: a separate LISTEN session receives the payload"
 psql_in default app -c "CREATE TABLE notify_done (x int)" \

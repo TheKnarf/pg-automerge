@@ -333,17 +333,30 @@ pub fn write_json_at<S: JsonSink + ?Sized>(
     sink: &mut S,
 ) -> Result<(), Error> {
     with_doc(input, |doc| {
-        check_heads(doc, heads)?;
-        let mut current = doc.get_heads();
-        current.sort_unstable();
-        let mut wanted = heads.to_vec();
-        wanted.sort_unstable();
-        wanted.dedup();
-        if wanted == current {
-            return crate::json::write_json_at(doc, None, sink);
-        }
-        crate::json::write_json_at(doc, Some(&wanted), sink)
+        let wanted = read_heads(doc, heads)?;
+        crate::json::write_json_at(doc, wanted.as_deref(), sink)
     })
+}
+
+/// The heads to read `doc` at for a state "as of `heads`": `None` when
+/// they are the current heads (Automerge's current-state path, which
+/// needs no clock), otherwise the sorted, de-duplicated `heads`.
+///
+/// # Errors
+///
+/// [`Error::InvalidParameter`] naming the first hash (sorted) that is not
+/// a change of `doc`.
+pub(crate) fn read_heads(
+    doc: &Automerge,
+    heads: &[ChangeHash],
+) -> Result<Option<Vec<ChangeHash>>, Error> {
+    check_heads(doc, heads)?;
+    let mut current = doc.get_heads();
+    current.sort_unstable();
+    let mut wanted = heads.to_vec();
+    wanted.sort_unstable();
+    wanted.dedup();
+    Ok((wanted != current).then_some(wanted))
 }
 
 fn check_heads(doc: &Automerge, heads: &[ChangeHash]) -> Result<(), Error> {

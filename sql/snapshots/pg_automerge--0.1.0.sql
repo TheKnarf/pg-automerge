@@ -309,6 +309,44 @@ AS 'MODULE_PATHNAME', 'automerge_merge_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/spans.rs:45
+-- pg_automerge::spans::automerge_spans
+CREATE  FUNCTION "automerge_spans"(
+	"doc" automerge, /* AutomergeArg */
+	"path" TEXT[] /* Vec < Option < String > > */
+) RETURNS jsonb /* Option < JsonbDatum > */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_spans_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/spans.rs:53
+-- pg_automerge::spans::automerge_spans
+CREATE  FUNCTION "automerge_spans"(
+	"doc" automerge, /* AutomergeArg */
+	"path" TEXT[], /* Vec < Option < String > > */
+	"heads" TEXT[] /* Vec < Option < String > > */
+) RETURNS jsonb /* Option < JsonbDatum > */
+IMMUTABLE STRICT PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_spans_at_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/spans.rs:63
+-- requires:
+--   automerge_spans
+--   automerge_spans_at
+
+
+COMMENT ON FUNCTION automerge_spans(automerge, text[]) IS
+    'The text object at path (as for #>) as jsonb spans: text runs with their marks, and blocks, as Automerge''s JavaScript spans() returns them; NULL if nothing is at path.';
+COMMENT ON FUNCTION automerge_spans(automerge, text[], text[]) IS
+    'automerge_spans(doc, path) as of the given heads (''{}'': before any change).';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/io.rs:122
 -- pg_automerge::io::automerge_to_jsonb
 CREATE  FUNCTION "automerge_to_jsonb"(
