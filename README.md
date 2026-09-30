@@ -99,7 +99,7 @@ registry of your own (CI can do that for tags once you
 [configure it](#publishing-the-image)).
 
 ```sh
-mise run docker-build        # pg-automerge:0.1.0 and pg-automerge:dev
+mise run docker-build        # pg-automerge:0.2.0 and pg-automerge:dev
 mise run docker-test         # builds, then tests the image and compose.yaml (about 4 minutes once built)
 ```
 
@@ -124,7 +124,7 @@ Run it like `postgres:18`. Mount the volume at `/var/lib/postgresql` (the
 docker run -d --name pg -p 127.0.0.1:5432:5432 \
   -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=app \
   -v pgdata:/var/lib/postgresql \
-  pg-automerge:0.1.0 \
+  pg-automerge:0.2.0 \
   postgres -c default_toast_compression=lz4 -c pg_automerge.max_load_memory=1GB
 ```
 
@@ -159,7 +159,7 @@ of your own; do not mount a whole directory over
 `/docker-entrypoint-initdb.d`:
 
 ```sh
-docker run ... -v ./init/20-app.sql:/docker-entrypoint-initdb.d/20-app.sql:ro pg-automerge:0.1.0
+docker run ... -v ./init/20-app.sql:/docker-entrypoint-initdb.d/20-app.sql:ro pg-automerge:0.2.0
 ```
 
 A directory mounted there replaces `10-pg-automerge.sh`, and the database
@@ -210,7 +210,47 @@ SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge';
 The init script does not run on an existing volume, so this step is
 yours (a migration, say). Until you run it the new library serves the old
 SQL definitions, which it keeps supporting (see
-[DESIGN.md](docs/DESIGN.md#versioning-and-upgrades)).
+[DESIGN.md](docs/DESIGN.md#versioning-and-upgrades)). What changed in
+each version, and whether an update needs more than this (a `REINDEX`,
+say), is in [CHANGELOG.md](CHANGELOG.md).
+
+**From 0.1.0 to 0.2.0 with compose** (an app whose `compose.yaml` runs
+this image as a service, called `postgres` below, on a named volume;
+skjera's `postgres` service is one). 0.2.0 fixes a crash (a document
+with deeply nested blocks restarted the whole server when read as jsonb,
+e.g. through a generated `doc::jsonb` column) and adds
+`automerge_spans`. No index rebuild and no data rewrite are needed: every
+0.1.0 result stays the same.
+
+1. Optionally, keep a dump: `docker compose exec -T postgres pg_dump -U postgres -Fc <db> >before-0.2.0.dump`.
+2. Build the new image in this repository: `mise run docker-build`
+   (tags `pg-automerge:0.2.0` and `pg-automerge:dev`), or `docker pull`
+   it from your registry if you publish one.
+3. Point the app's service at it: `image: pg-automerge:0.2.0` in its
+   `compose.yaml` (pin the version tag: the images are local, and a
+   rebuilt image moves `:dev`).
+4. `docker compose up -d`: compose recreates the container from the new
+   image on the same volume (the data stays; the init script does not
+   run again). From here on the fixed library serves every query, even
+   before the next step.
+5. In every database with the extension:
+
+   ```sh
+   docker compose exec postgres psql -U postgres -d <db> -c 'ALTER EXTENSION pg_automerge UPDATE'
+   docker compose exec postgres psql -U postgres -d <db> -Atc "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'"   # 0.2.0
+   ```
+
+   This adds `automerge_spans`; nothing else in the catalog changes, and
+   tables, indexes, generated columns, views and `automerge_notify()`
+   triggers are untouched. It works on both kinds of 0.1.0 database:
+   the released one, and one created by an image built from this
+   repository after `automerge_spans` was added but before the version
+   bump (still labelled 0.1.0, with `automerge_spans` already there).
+
+There is no downgrade script: to go back, restore the dump into the old
+image. `mise run docker-upgrade-test` rehearses these steps against
+throwaway containers (the old image from `PG_AUTOMERGE_OLD_IMAGE`, or
+built from the 0.1.0 source).
 
 **A new Postgres 18 minor release or Debian security fixes**: the base
 image is pinned by digest in `docker/Dockerfile` (`ARG PG_IMAGE`, with how
@@ -248,6 +288,16 @@ those of the pgrx Postgres by default (`mise run pgrx-init`), or PGDG's
 `DOCKER_TEST_SUITES=0` skips them. It also checks the release scripts:
 `scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
 
+`mise run docker-upgrade-test` (not part of `docker-test`) upgrades a
+0.1.0 deployment the way the [Updating](#updating) section describes: a
+container of the 0.1.0 image (`PG_AUTOMERGE_OLD_IMAGE=<tag or image ID>`,
+or by default built from the 0.1.0 source in the git history) with
+tables, a generated `doc::jsonb` column, GIN and B-tree expression
+indexes, a view, an `automerge_notify()` trigger and documents; then the
+new image on the same volume, `ALTER EXTENSION pg_automerge UPDATE`, and
+checks of the data, indexes, trigger, `automerge_spans` and the catalog
+against a fresh install.
+
 The multi-session suites run against any server of yours, too (it needs
 the extension available, a superuser, and room for scratch databases):
 
@@ -276,10 +326,10 @@ uploads each as a workflow artifact
 Artifacts). To use one:
 
 ```sh
-docker load -i pg-automerge-0.1.0-linux-arm64.tar.gz   # loads pg-automerge:0.1.0
+docker load -i pg-automerge-0.2.0-linux-arm64.tar.gz   # loads pg-automerge:0.2.0
 ```
 
-`docker load` moves your local `pg-automerge:0.1.0` tag to the loaded
+`docker load` moves your local `pg-automerge:0.2.0` tag to the loaded
 image, so loading the other architecture's archive leaves that tag on an
 image your host cannot run (`exec format error`) until you
 `mise run docker-build` again. `scripts/docker-push.sh` (below) loads
@@ -317,10 +367,10 @@ secret into a GitHub environment with required reviewers and add
 you built yourself:
 
 ```sh
-bash scripts/docker-archive.sh                     # pg-automerge-0.1.0-linux-amd64.tar.gz
+bash scripts/docker-archive.sh                     # pg-automerge-0.2.0-linux-amd64.tar.gz
 docker login ghcr.io
-bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz  # prints the image IDs and the pushes
-bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz
+bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.2.0-linux-*.tar.gz  # prints the image IDs and the pushes
+bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.2.0-linux-*.tar.gz
 ```
 
 ## Quick start

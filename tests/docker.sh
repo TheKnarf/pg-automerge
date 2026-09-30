@@ -42,7 +42,8 @@
 #     trigger restored;
 #   - a restart on the same volume keeps the data and does not re-run init;
 #     ALTER EXTENSION pg_automerge UPDATE is a no-op at the current version;
-#   - the upgrade path in the image: every sql/snapshots version installed
+#   - the upgrade path in the image: every sql/snapshots version (and
+#     variant, sql/snapshots/variants) installed
 #     under a scratch name with the image's upgrade scripts, documents
 #     stored, ALTER EXTENSION UPDATE to the current version, same data;
 #   - PG_AUTOMERGE_CREATE_EXTENSION=0 skips the extension (and it can then
@@ -78,24 +79,9 @@ on_exit() {
     if [[ $1 == 0 ]]; then log "all docker checks passed"; else echo "docker test FAILED" >&2; fi
 }
 
-# The server log of NAME has no sign of an assertion failure, a panic or a
-# crashed backend. With --crashes-allowed (the limits container), backends
-# killed by a signal are expected.
-check_log() {
-    local name; name="$(cname "$1")"
-    local pattern='TRAP:|PANIC:|failed assertion|panicked|core dumped'
-    # (Not any process's exit code: the logical replication launcher exits
-    # with 1 at every shutdown, e.g. the entrypoint's init server's.)
-    [[ "${2:-}" == --crashes-allowed ]] \
-        || pattern+='|terminated by signal|(client backend|server process).* exited with exit code|memory allocation of'
-    local bad; bad="$(docker logs "$name" 2>&1 | grep -E "$pattern" || true)"
-    [[ -z "$bad" ]] || fail "$name: server log:
-$bad"
-}
-
-# Fixture documents: the regress examples' base shopping list, alice's and
-# bob's concurrent edits of it, and bob's changes alone.
-fixture() { sed -n "s/^\\\\set $1 '\\\\\\\\x\\([0-9a-f]*\\)'\$/\\1/p" tests/pg_regress/sql/automerge.sql; }
+# Fixture documents (fixture, tests/docker_lib.sh): the regress examples'
+# base shopping list, alice's and bob's concurrent edits of it, and bob's
+# changes alone.
 BASE="$(fixture base)"; ALICE="$(fixture alice)"; BOB="$(fixture bob)"; BOB_CHANGES="$(fixture bob_changes)"
 NOTE="$(fixture note)"; DEEP_BLOCK="$(fixture deep_block)"
 [[ -n "$BASE" && -n "$ALICE" && -n "$BOB" && -n "$BOB_CHANGES" && -n "$NOTE" && -n "$DEEP_BLOCK" ]] || fail "fixtures not found in tests/pg_regress/sql/automerge.sql"
@@ -365,7 +351,7 @@ expect "data after restart" "Groceries for Sunday|eggs" "$(psql_in restart app -
 psql_in restart app -c 'SET client_min_messages = warning' -c 'ALTER EXTENSION pg_automerge UPDATE'
 expect "version after UPDATE" "$VERSION" "$(psql_in restart app -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")"
 
-log "upgrade path in the image: each sql/snapshots version, ALTER EXTENSION UPDATE with the image's scripts"
+log "upgrade path in the image: each sql/snapshots version and variant, ALTER EXTENSION UPDATE with the image's scripts"
 # As tests/upgrade.sh does against pgrx's Postgres: install the snapshot
 # under the version name "V-snapshot", plus the first hop of each upgrade
 # path from V that the image ships (renamed to start at V-snapshot), or an
@@ -374,14 +360,15 @@ log "upgrade path in the image: each sql/snapshots version, ALTER EXTENSION UPDA
 EXTDIR=/usr/share/postgresql/18/extension
 DOCS_FINGERPRINT="$(head -1 <<<"$FINGERPRINT")"
 n=0
-for snapshot in sql/snapshots/pg_automerge--*.sql; do
-    v="${snapshot#sql/snapshots/pg_automerge--}"; v="${v%.sql}"; old="$v-snapshot"; n=$((n + 1))
+for snapshot in sql/snapshots/pg_automerge--*.sql sql/snapshots/variants/pg_automerge--*.sql; do
+    [[ -e "$snapshot" ]] || continue
+    v="${snapshot##*/pg_automerge--}"; v="${v%.sql}"; v="${v%%+*}"; old="$v-snapshot"; n=$((n + 1))
     docker cp -q "$snapshot" "$C2:$EXTDIR/pg_automerge--$old.sql"
     if [[ "$v" == "$VERSION" ]]; then
         docker exec "$C2" sh -c ": >'$EXTDIR/pg_automerge--$old--$VERSION.sql'"
     else
-        docker exec "$C2" bash -euc 'cd "$1"; set -- pg_automerge--"$2"--*.sql; [ -e "$1" ] || exit 3
-            for f; do cp "$f" "pg_automerge--$3--${f#pg_automerge--"$2"--}"; done' _ "$EXTDIR" "$v" "$old" \
+        docker exec "$C2" bash -euc 'cd "$1"; from="$2"; old="$3"; set -- pg_automerge--"$from"--*.sql; [ -e "$1" ] || exit 3
+            for f; do cp "$f" "pg_automerge--$old--${f#pg_automerge--"$from"--}"; done' _ "$EXTDIR" "$v" "$old" \
             || fail "the image ships no upgrade script from $v (sql/pg_automerge--$v--*.sql)"
     fi
     psql_in restart postgres -c "CREATE DATABASE upgrade_$n"

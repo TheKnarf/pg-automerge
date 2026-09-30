@@ -48,18 +48,6 @@ COMMENT ON FUNCTION automerge_send(automerge) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/notify.rs:135
--- requires:
---   automerge_type
-
-
-CREATE FUNCTION automerge_notify() RETURNS trigger
-    LANGUAGE c AS 'MODULE_PATHNAME', 'automerge_notify_wrapper';
-COMMENT ON FUNCTION automerge_notify() IS
-    'AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW trigger: automerge_notify(channel, key_column [, ...]) sends NOTIFY channel with the row key and the heads of changed automerge columns.';
-/* </end connected objects> */
-
-/* <begin connected objects> */
 -- src/history.rs:16
 -- requires:
 --   automerge_type
@@ -92,6 +80,18 @@ CREATE TYPE automerge_change_meta AS (
 );
 COMMENT ON TYPE automerge_change_meta IS
     'Metadata of one change of an automerge document (no change bytes).';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/notify.rs:135
+-- requires:
+--   automerge_type
+
+
+CREATE FUNCTION automerge_notify() RETURNS trigger
+    LANGUAGE c AS 'MODULE_PATHNAME', 'automerge_notify_wrapper';
+COMMENT ON FUNCTION automerge_notify() IS
+    'AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW trigger: automerge_notify(channel, key_column [, ...]) sends NOTIFY channel with the row key and the heads of changed automerge columns.';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -306,6 +306,44 @@ AS 'MODULE_PATHNAME', 'automerge_merge_support_wrapper';
 -- src/io.rs:57
 -- pg_automerge::io::automerge_send
 -- Skipped due to `#[pgrx(sql = false)]`
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/spans.rs:45
+-- pg_automerge::spans::automerge_spans
+CREATE  FUNCTION "automerge_spans"(
+	"doc" automerge, /* AutomergeArg */
+	"path" TEXT[] /* Vec < Option < String > > */
+) RETURNS jsonb /* Option < JsonbDatum > */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_spans_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/spans.rs:53
+-- pg_automerge::spans::automerge_spans
+CREATE  FUNCTION "automerge_spans"(
+	"doc" automerge, /* AutomergeArg */
+	"path" TEXT[], /* Vec < Option < String > > */
+	"heads" TEXT[] /* Vec < Option < String > > */
+) RETURNS jsonb /* Option < JsonbDatum > */
+IMMUTABLE STRICT PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_spans_at_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/spans.rs:63
+-- requires:
+--   automerge_spans
+--   automerge_spans_at
+
+
+COMMENT ON FUNCTION automerge_spans(automerge, text[]) IS
+    'The text object at path (as for #>) as jsonb spans: text runs with their marks, and blocks, as Automerge''s JavaScript spans() returns them; NULL if nothing is at path.';
+COMMENT ON FUNCTION automerge_spans(automerge, text[], text[]) IS
+    'automerge_spans(doc, path) as of the given heads (''{}'': before any change).';
 /* </end connected objects> */
 
 /* <begin connected objects> */

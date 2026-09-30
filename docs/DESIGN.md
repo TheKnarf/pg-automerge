@@ -1057,8 +1057,10 @@ it.
 
 ### Naming
 
-The SQL surface was reviewed as a whole before the first release (0.1.0 is
-unreleased, so renames need no aliases or upgrade script). Principles:
+The SQL surface was reviewed as a whole before the first release (0.1.0;
+until then renames needed no aliases or upgrade script, now every change
+needs a version and an upgrade script, see [Versioning and
+upgrades](#versioning-and-upgrades)). Principles:
 objects that cannot collide because they take an `automerge` argument may
 use generic names where that reads better (`merge`, `merge_agg`, `||`);
 everything else carries the `automerge_` prefix; parameter names are the
@@ -1460,9 +1462,10 @@ the depth check use explicit stacks, and jsonb's own recursion
 Automerge would not help: how deep Automerge recurses is decided inside
 it, which is why the fix keeps such calls away from deep structures.
 
-**Upgrading.** No SQL object changed, so the fix needs only the new
-library (no version bump, no `ALTER EXTENSION`), and the jsonb result of
-every document is unchanged (expression indexes and generated columns
+**Upgrading.** The fix changed no SQL object: it takes effect as soon as
+the new library is loaded, before `ALTER EXTENSION .. UPDATE` (which 0.2.0
+needs for `automerge_spans` only, see [0.1.0 to
+0.2.0](#010-to-020)), and the jsonb result of every document is unchanged (expression indexes and generated columns
 stay valid). Values stored by earlier builds read normally with it,
 including documents whose jsonb view crashed those builds (a table
 without a jsonb generated column or expression index could store them).
@@ -2008,7 +2011,7 @@ crafted by adding an author footer to a seq 2 change); the SQL tests
 check the SQLSTATE, DETAIL and HINT for the first, which share one mapping
 in `src/error.rs`.
 
-### Other reclassifications (0.1.0, unreleased)
+### Other reclassifications (before 0.1.0)
 
 - Nesting deeper than 1000 levels: `XX000` → `54000`. The document is
   valid; the jsonb view has a limit, like jsonb's own element and string
@@ -2316,8 +2319,9 @@ What costs a load, per call:
   pg_automerge.max_load_memory=-1'`. A restore and `COPY
   FROM` validate every value (one load each; the generated column is
   recomputed, one more conversion).
-- `tests/upgrade.sh` (`mise run upgrade`, part of `mise run test`): see
-  [Versioning and upgrades](#versioning-and-upgrades).
+- `tests/upgrade.sh` (`mise run upgrade`, part of `mise run test`) and
+  `tests/docker_upgrade.sh` (`mise run docker-upgrade-test`, Docker): see
+  [Upgrade tests](#upgrade-tests).
 - `tests/extension.sh` (`mise run extension`, part of `mise run test`):
   the control-file flags, see
   [Installation, schema and privileges](#installation-schema-and-privileges):
@@ -2569,28 +2573,121 @@ The rest of the review found nothing that would stop it:
 ## Versioning and upgrades
 
 The extension version is the crate version (`default_version =
-'@CARGO_VERSION@'` in `pg_automerge.control`), currently 0.1.0; pgrx
-generates the install script `pg_automerge--X.Y.Z.sql` for the build.
+'@CARGO_VERSION@'` in `pg_automerge.control`; both crates carry it),
+currently 0.2.0; pgrx generates the install script
+`pg_automerge--X.Y.Z.sql` for the build, and the Docker image's version
+label and tag come from it (`scripts/versions.sh`). Released: 0.1.0 and
+0.2.0 (see `CHANGELOG.md`).
 
 Policy:
 
-- After each release, its generated script is committed as
+- A release's generated script is committed as
   `sql/snapshots/pg_automerge--X.Y.Z.sql` (`cargo pgrx schema pg18 -o
-  ...`) and never edited again. 0.1.0 is the first.
+  ...`) and never edited again.
 - Any change to the SQL surface afterwards bumps the version, and comes
   with a hand-written `sql/pg_automerge--A--B.sql` from the previous
   version (`cargo pgrx install` and `package` ship every
-  `sql/pg_automerge--*--*.sql`). C symbols that an older version's script
-  references stay exported (the upgrade test installs the old script
-  against the new library).
+  `sql/pg_automerge--*--*.sql`, so the Docker image does too; the
+  snapshots below `sql/snapshots/` are not shipped). C symbols that an
+  older version's script references stay exported: the new library
+  serves the old catalog from the moment it is installed until the
+  `ALTER EXTENSION .. UPDATE`.
+- A library-only change (a bug fix, a faster path) needs no new version
+  as long as no result changes; one that changes a result of an
+  `IMMUTABLE` function (the jsonb view) is called out in the changelog
+  with the `REINDEX`/rewrite it needs (see below).
+
+### What 0.1.0 shipped
+
+The version was 0.1.0 for the whole development up to the bump, and
+`sql/snapshots/pg_automerge--0.1.0.sql` was regenerated when
+`automerge_spans` was added (720c5f0), which the policy above forbids once
+a version is out. It had been: the Docker image of 0.1.0 (built from
+f061a3b plus uncommitted changes that did not touch the SQL surface)
+installs a script without `automerge_spans`. The snapshot is now that
+image's `/usr/share/postgresql/18/extension/pg_automerge--0.1.0.sql`,
+byte for byte (read from the image with a throwaway container). It has
+the same statements as the snapshot committed at 0918f56 (the last
+commit before `automerge_spans`); only pgrx's order differs, the
+`automerge_notify()` block sitting before instead of after the one
+of the history types `automerge_change` and `automerge_change_meta` (pgrx does not order unrelated objects
+deterministically across builds). Its library exports every symbol of
+that script, and so does 0.2.0's.
+
+Images built from the tree after 720c5f0 and before the bump were still
+labelled 0.1.0, but their install script created `automerge_spans`
+(identical to 0.2.0's, statement for statement) and their library still
+had the deep-block crash ([Deep blocks](#deep-blocks)). Databases created
+by them exist, so their catalog is kept as
+`sql/snapshots/variants/pg_automerge--0.1.0+spans.sql` (the script of
+555110e, the last such commit), a variant of 0.1.0 that the tests update
+with 0.1.0's upgrade scripts like the release.
+
+### 0.1.0 to 0.2.0
+
+The install scripts differ only by the two `automerge_spans` functions
+and their comments: no 0.1.0 object's definition, labels, symbol or
+comment changed (the deep-block fix is inside the library and returns
+the same jsonb), so `sql/pg_automerge--0.1.0--0.2.0.sql` creates those
+and nothing else, and no dependent object (index, generated column,
+trigger, view) is touched. It uses `CREATE OR REPLACE FUNCTION`: it
+creates the functions on a released 0.1.0, and redefines them identically
+in place (same signature, same OID, so views on them survive) on the
+`0.1.0+spans` variant. That is safe in an extension script because
+PostgreSQL refuses to replace an object the extension does not own ("is
+not a member of extension"): a function of the same signature that
+someone else put into the extension's schema makes the update fail
+rather than being adopted. Names stay unqualified, as in pgrx's install
+script, so the extension stays relocatable: `ALTER EXTENSION .. UPDATE`
+runs the script with `search_path` set to the extension's current schema
+and then `pg_temp`, with `pg_catalog` searched first, so `jsonb` and
+`text` are the built-in types and `automerge` the extension's own. The
+script starts with the usual `\echo .. \quit` guard against running it
+with `psql`.
+
+### Upgrade tests
+
 - `tests/upgrade.sh` (part of `mise run test`) installs every snapshot
-  under a scratch version name, stores documents, runs `ALTER EXTENSION
-  pg_automerge UPDATE`, and compares the extension's catalog (member
-  objects and their comments, function definitions with their labels and
-  symbols, aggregates, types, casts, operators) with a fresh `CREATE
-  EXTENSION`, and the stored documents' fingerprints before and after. A
-  snapshot of the current version is compared as is, so an SQL change
-  without a version bump fails.
+  and variant under a scratch version name (with the first hop of each
+  of its version's upgrade paths, which must be installed byte for byte as
+  in `sql/`), creates what a deployed database has on it (a STORED
+  generated `doc::jsonb` column, GIN and B-tree expression indexes, a
+  view and a SQL function over the extension's functions, an
+  `automerge_notify()` trigger, documents including rich text and a
+  2,000-level deep block, and on a catalog with `automerge_spans` a view
+  on it), reads them all before the update (the old catalog on the new
+  library), runs `ALTER EXTENSION pg_automerge UPDATE`, and compares the
+  extension's catalog with a fresh `CREATE EXTENSION` (`tests/catalog.sql`:
+  member objects and their comments, the members' dependencies, function
+  definitions with their labels, symbols and ACLs, aggregates, types,
+  casts, operators, the extension row). Then the documents' fingerprints
+  (bytes, heads, the cast, the generated column, the view, the SQL
+  function), the indexes (valid, used, and agreeing with a sequential
+  scan), the trigger's notification and `automerge_spans`. It repeats the
+  update on an extension relocated with `SET SCHEMA` first (every member
+  ends up in that schema), and, from a version without `automerge_spans`,
+  over a user's `automerge_spans` in the extension's schema (the update
+  fails and the version stays). A snapshot of the current version is
+  required and compared as is, so an SQL change without a version bump
+  fails.
+- `tests/docker.sh` does the snapshot part again with the image's own
+  scripts and library (see [Docker image](#docker-image)).
+- `tests/docker_upgrade.sh` (`mise run docker-upgrade-test`, not part of
+  `docker-test`) upgrades a real 0.1.0 deployment: a container of the 0.1.0
+  image (`PG_AUTOMERGE_OLD_IMAGE`, a tag or an image ID, or by default
+  built from 0918f56 with that commit's own `scripts/docker-build.sh`;
+  its install script must be the 0.1.0 snapshot or a variant) creates
+  tables with a generated `doc::jsonb` column, GIN and B-tree expression
+  indexes, a view, a notify trigger and documents; it is stopped and the
+  new image started on the same volume (init not re-run, still 0.1.0, the
+  same data, and the deep block, which crashes 0.1.0's library in the
+  generated column, stored fine); `ALTER EXTENSION pg_automerge UPDATE`;
+  then the same data, the indexes valid, used and agreeing with a
+  sequential scan, the trigger's notification, `automerge_spans` (54000
+  on the deep block), the catalog equal to a fresh install's in the same
+  container, and clean server logs. Run against the released image
+  (b946069dce9a), against an image of the `0.1.0+spans` variant, and with
+  the image built from 0918f56: all pass.
 
 Data compatibility:
 
@@ -2750,12 +2847,13 @@ README's Docker section. Packaging decisions:
     a manual `CREATE EXTENSION .. SCHEMA`), an invalid value failing init;
   - the upgrade path with the image's own scripts and library, as
     `tests/upgrade.sh` does against pgrx's Postgres: each
-    `sql/snapshots` version is copied into the container under a scratch
+    `sql/snapshots` version and variant is copied into the container under a scratch
     version name, with the first hop of each upgrade path the image ships
     (so an image missing an upgrade script fails), documents are stored,
     `ALTER EXTENSION .. UPDATE` reaches the current version and the
     documents read the same (the catalog comparison stays in
-    `upgrade.sh`);
+    `upgrade.sh`; a real 0.1.0 deployment moved to the image is
+    `tests/docker_upgrade.sh`, see [Upgrade tests](#upgrade-tests));
   - `PGHOST=localhost` and `PGHOSTADDR` in the container's environment
     with an init file mounted as a single file next to ours (the
     extension is created, the file runs after it), and a whole directory
@@ -2966,8 +3064,9 @@ evaluation, for a decision before the first release.
   and hot queries are rewritten deliberately; `IMMUTABLE`, so indexable
   too. Their cost is discoverability.
 - **Recommendation.** If faster single-field reads are wanted, add the
-  functions (no compatibility hazard). Add the operators only before
-  0.1.0 is released, if at all, with a test that an index on
+  functions (no compatibility hazard). 0.1.0 is released without the
+  operators; adding them now is an SQL change like any other (a new
+  version and upgrade script) and, if at all, needs a test that an index on
   `(doc->>'x')` created afterwards is used. For read-heavy tables the
   stored generated jsonb column stays the fastest option either way
   (no load at read time).

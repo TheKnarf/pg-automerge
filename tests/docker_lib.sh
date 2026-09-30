@@ -14,6 +14,9 @@
 # host_port).
 #
 # Env: PG_AUTOMERGE_IMAGE (default pg-automerge:<Cargo.toml version>).
+#
+# Also: check_log NAME [--crashes-allowed], expect WHAT EXPECTED ACTUAL,
+# fixture NAME (a regress example document, hex without \x).
 
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,7 +52,9 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || fail "image $IMAGE not found (r
 
 # start NAME VOLUME [docker run args...] [-- postgres args...]
 # Starts container $PROJECT-NAME (use cname NAME for the full name) with
-# volume $PROJECT-VOLUME (created and registered for removal if new).
+# volume $PROJECT-VOLUME (created and registered for removal if new), from
+# image $RUN_IMAGE if set (tests/docker_upgrade.sh's old image), else
+# $IMAGE.
 start() {
     local name="$PROJECT-$1" vol="$PROJECT-$2"; shift 2
     local run_args=() pg_args=()
@@ -61,7 +66,7 @@ start() {
     docker run -d --name "$name" --label "$LABEL" \
         -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB=app \
         -p 127.0.0.1::5432 \
-        -v "$vol:/var/lib/postgresql" "${run_args[@]}" "$IMAGE" postgres "${pg_args[@]}" >/dev/null
+        -v "$vol:/var/lib/postgresql" "${run_args[@]}" "${RUN_IMAGE:-$IMAGE}" postgres "${pg_args[@]}" >/dev/null
     CONTAINERS+=("$name")
 }
 cname() { printf '%s-%s' "$PROJECT" "$1"; }
@@ -103,6 +108,24 @@ psql_in() {
     local name; name="$(cname "$1")"; local db="$2"; shift 2
     docker exec -i "$name" psql -X -q -At -v ON_ERROR_STOP=1 -U postgres -d "$db" "$@"
 }
+
+# The server log of NAME has no sign of an assertion failure, a panic or a
+# crashed backend. With --crashes-allowed (the limits container), backends
+# killed by a signal are expected.
+check_log() {
+    local name; name="$(cname "$1")"
+    local pattern='TRAP:|PANIC:|failed assertion|panicked|core dumped'
+    # (Not any process's exit code: the logical replication launcher exits
+    # with 1 at every shutdown, e.g. the entrypoint's init server's.)
+    [[ "${2:-}" == --crashes-allowed ]] \
+        || pattern+='|terminated by signal|(client backend|server process).* exited with exit code|memory allocation of'
+    local bad; bad="$(docker logs "$name" 2>&1 | grep -E "$pattern" || true)"
+    [[ -z "$bad" ]] || fail "$name: server log:
+$bad"
+}
+
+# Fixture documents of the regress examples (hex, without the \x).
+fixture() { sed -n "s/^\\\\set $1 '\\\\\\\\x\\([0-9a-f]*\\)'\$/\\1/p" tests/pg_regress/sql/automerge.sql; }
 
 expect() { # <what> <expected> <actual>
     [[ "$3" == "$2" ]] || fail "$1: expected '$2', got '$3'"

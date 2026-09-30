@@ -124,7 +124,7 @@ echo "check_ci: docker ok"
 command -v actionlint >/dev/null && command -v shellcheck >/dev/null \
   || fail "actionlint and shellcheck are needed (pinned in mise.toml: mise install)"
 actionlint "$wf" || fail "$wf: actionlint"
-shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh \
+shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/docker_upgrade.sh \
   docker/initdb-pg-automerge.sh || fail "shellcheck"
 
 # job NAME: the lines of that job (from "  NAME:" to the next job).
