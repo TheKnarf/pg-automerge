@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Static checks of the CI workflow and the package task (part of
-# `mise run lint`). Nothing here builds anything: the package script must
-# refuse a bad PG_CONFIG before it starts cargo.
+# Static checks of the CI workflow, the package task and the Docker
+# packaging (part of `mise run lint`). Nothing here builds anything: the
+# package script must refuse a bad PG_CONFIG before it starts cargo.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -57,3 +57,35 @@ if [ -n "$real" ] && [ -x "$real" ]; then
 fi
 
 echo "check_ci: ok"
+
+# Docker image (tests/docker.sh builds and runs it; these checks need no
+# Docker). The pinned versions come from scripts/versions.sh only.
+df=docker/Dockerfile
+versions="$(sh scripts/versions.sh)" || fail "scripts/versions.sh failed"
+for v in RUST_VERSION CARGO_PGRX_VERSION CRATE_VERSION; do
+  grep -qE "^$v=[0-9]+\.[0-9]+\.[0-9]+$" <<<"$versions" || fail "scripts/versions.sh: no $v in: $versions"
+done
+for v in $(sed -n 's/^[A-Z_]*=//p' <<<"$versions" | sort -u); do
+  if grep -vE '^\s*#' "$df" | grep -qF "$v"; then fail "$df repeats the version $v (read it with scripts/versions.sh)"; fi
+done
+# One pinned base for every stage, so the builder's glibc and Postgres
+# headers are the runtime's.
+grep -qE '^ARG PG_IMAGE=postgres:18-[a-z]+@sha256:[0-9a-f]{64}$' "$df" \
+  || fail "$df: PG_IMAGE must be postgres:18-<debian>@sha256:<digest>"
+if grep -E '^FROM ' "$df" | grep -vqE '^FROM \$\{PG_IMAGE\} AS [a-z]+$'; then
+  fail "$df: every stage must be FROM \${PG_IMAGE}"
+fi
+grep -qE '^COPY .*docker/initdb-pg-automerge.sh /docker-entrypoint-initdb.d/' "$df" || fail "$df: initdb script not installed"
+if grep -qE '^(ENTRYPOINT|CMD|USER|VOLUME) ' "$df"; then fail "$df: keep the official image's entrypoint, cmd, user and volume"; fi
+# Everything COPY'd from the build context is let through .dockerignore.
+for src in $(grep -E '^COPY ' "$df" | grep -v -- '--from=' | sed -E 's/^COPY( --[a-z]+=[^ ]+)* //; s/ [^ ]+$//'); do
+  [ "$src" = . ] && continue
+  grep -qxF "!$src" .dockerignore || fail ".dockerignore does not let $src through (COPY in $df)"
+done
+bash -n docker/initdb-pg-automerge.sh || fail "docker/initdb-pg-automerge.sh: syntax"
+[ -x docker/initdb-pg-automerge.sh ] || fail "docker/initdb-pg-automerge.sh must be executable (the entrypoint sources non-executable scripts)"
+grep -qE '^    image: pg-automerge:' compose.yaml || fail "compose.yaml: image must be the pg-automerge built by mise run docker-build"
+grep -qE '^      - pgdata:/var/lib/postgresql$' compose.yaml \
+  || fail "compose.yaml: mount the volume at /var/lib/postgresql (postgres:18 keeps PGDATA in 18/docker below it)"
+
+echo "check_ci: docker ok"

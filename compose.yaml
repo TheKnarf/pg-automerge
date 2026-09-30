@@ -1,0 +1,63 @@
+# Local development: Postgres 18 with pg_automerge, data in a named volume.
+#
+#   mise run docker-up      # builds the image if needed, starts, waits until healthy
+#   psql postgres://postgres:postgres@localhost:5432/app
+#   mise run docker-down    # stops; the volume (your data) is kept
+#
+# Plain `docker compose up -d` works once the image exists (mise run
+# docker-build); `docker compose build` needs PG_AUTOMERGE_VERSION set to
+# the Cargo.toml version, which the mise tasks pass. The password below is
+# for a laptop only; the port is bound to 127.0.0.1.
+name: pg-automerge
+
+services:
+  postgres:
+    image: pg-automerge:${PG_AUTOMERGE_IMAGE_TAG:-dev}
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        PG_AUTOMERGE_VERSION: ${PG_AUTOMERGE_VERSION:-}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      # 1: CREATE EXTENSION pg_automerge in POSTGRES_DB when the volume is
+      # first initialized; 0: leave it to your migrations.
+      PG_AUTOMERGE_CREATE_EXTENSION: "1"
+    # Suggested settings, passed on the command line so the image keeps
+    # Postgres' defaults (see the Docker section of README.md):
+    # - lz4 TOAST compression: stored documents are uncompressed Automerge
+    #   saves, and lz4 compresses them much faster than the default pglz.
+    # - the load memory limit, sized to this container's memory (each
+    #   session may use up to it at once, like work_mem).
+    command:
+      - postgres
+      - -c
+      - default_toast_compression=lz4
+      - -c
+      - pg_automerge.max_load_memory=1GB
+    ports:
+      - "127.0.0.1:${PG_AUTOMERGE_PORT:-5432}:5432"
+    # The postgres:18 images keep PGDATA in /var/lib/postgresql/18/docker:
+    # mount the parent, so a later major version's image can pg_upgrade
+    # --link within the same volume.
+    volumes:
+      - pgdata:/var/lib/postgresql
+    # Postgres' dynamic shared memory (parallel query) lives in /dev/shm,
+    # which Docker limits to 64 MB by default.
+    shm_size: 256mb
+    # Over TCP on purpose: during first-time initialization the entrypoint's
+    # temporary server listens only on the socket, so the service turns
+    # healthy only once the init scripts (CREATE EXTENSION) are done and the
+    # real server is up.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d \"$${POSTGRES_DB}\" -h 127.0.0.1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  pgdata:

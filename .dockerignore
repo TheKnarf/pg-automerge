@@ -1,0 +1,18 @@
+# Build context of docker/Dockerfile: an allowlist, so target/ (many GB),
+# .git, local settings and anything new stay out unless listed here.
+*
+!Cargo.toml
+!Cargo.lock
+!mise.toml
+!LICENSE
+!pg_automerge.control
+!.cargo/
+!src/
+!sql/
+!crates/pg_automerge_core/Cargo.toml
+!crates/pg_automerge_core/src/
+!scripts/package.sh
+!scripts/versions.sh
+!docker/initdb-pg-automerge.sh
+# Test-only sources are not needed to build the library.
+src/tests/

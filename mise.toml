@@ -112,3 +112,21 @@ run = [
 [tasks.bench-sql]
 description = "Median timings of the everyday SQL paths (reads, inserts, merges, upserts) on a release build; not part of test"
 run = "bash tests/bench_sql.sh"
+
+[tasks.docker-build]
+description = "Build the Docker image (official postgres:18 + pg_automerge, built against its PGDG Postgres) as pg-automerge:<version> and pg-automerge:dev; extra docker build args after --"
+run = "bash scripts/docker-build.sh"
+
+[tasks.docker-test]
+description = "Build the Docker image, then smoke-test it: init, extension, merge + jsonb, settings, restart on a volume, PG_AUTOMERGE_CREATE_EXTENSION, compose.yaml; not part of test"
+depends = ["docker-build"]
+run = "bash tests/docker.sh"
+
+[tasks.docker-up]
+description = "Start the compose.yaml development Postgres (builds the image first) on 127.0.0.1:${PG_AUTOMERGE_PORT:-5432} and wait until it is healthy"
+depends = ["docker-build"]
+run = "docker compose up -d --wait"
+
+[tasks.docker-down]
+description = "Stop the compose.yaml development Postgres (keeps the data volume; docker compose down -v removes it)"
+run = "docker compose down"

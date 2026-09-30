@@ -23,7 +23,8 @@ queryable. [docs/DESIGN.md](docs/DESIGN.md) is the full specification.
 
 ## Install
 
-From source, with [mise](https://mise.jdx.dev):
+To self-host, the [Docker image](#docker) is `postgres:18` with the
+extension built in. From source, with [mise](https://mise.jdx.dev):
 
 ```sh
 mise install                 # Rust and cargo-pgrx as pinned in mise.toml
@@ -82,6 +83,130 @@ The tarball holds `pg_automerge.so`, `pg_automerge.control`, the install
 script `pg_automerge--<version>.sql` and any upgrade scripts. After
 installing a newer version, run `ALTER EXTENSION pg_automerge UPDATE` in
 each database.
+
+## Docker
+
+Managed Postgres services do not load custom C extensions, so for
+self-hosting there is an image: the official `postgres:18` image, untouched
+(entrypoint, environment variables, volume, signals), plus
+`pg_automerge.so`, its control file and SQL scripts, and one init script.
+The extension is compiled in a builder stage from the same base image,
+against that image's own PGDG Postgres 18 (release build, no assertions),
+with Rust and cargo-pgrx as pinned in `mise.toml`. Nothing is pushed
+anywhere; the image lives in your local Docker until you push it to a
+registry of your own.
+
+```sh
+mise run docker-build        # pg-automerge:0.1.0 and pg-automerge:dev
+mise run docker-test         # builds, then smoke-tests the image and compose.yaml
+```
+
+The image is 3.5 MB larger than `postgres:18`. A first build takes about
+8 minutes (Rust, cargo-pgrx and a fat-LTO release build); BuildKit cache
+mounts keep the toolchain and compiled dependencies, so a rebuild after a
+source change takes about a minute ([measurements](docs/DESIGN.md#docker-image)).
+
+Without mise (from the repository root, BuildKit required; the build
+checks the version argument against `Cargo.toml`):
+
+```sh
+docker build -f docker/Dockerfile \
+  --build-arg PG_AUTOMERGE_VERSION="$(sh scripts/versions.sh | sed -n 's/^CRATE_VERSION=//p')" \
+  -t pg-automerge:dev .
+```
+
+Run it like `postgres:18`. Mount the volume at `/var/lib/postgresql` (the
+18 images keep the data in `/var/lib/postgresql/18/docker` below it):
+
+```sh
+docker run -d --name pg -p 127.0.0.1:5432:5432 \
+  -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=app \
+  -v pgdata:/var/lib/postgresql \
+  pg-automerge:0.1.0 \
+  postgres -c default_toast_compression=lz4 -c pg_automerge.max_load_memory=1GB
+```
+
+For local development, `compose.yaml` does the same with a named volume,
+a `pg_isready` healthcheck, the port on `127.0.0.1` only and the suggested
+settings below:
+
+```sh
+mise run docker-up           # build if needed, start, wait until healthy
+psql postgres://postgres:postgres@localhost:5432/app
+mise run docker-down         # stop; `docker compose down -v` also deletes the data
+```
+
+`PG_AUTOMERGE_PORT`, `POSTGRES_PASSWORD` and `POSTGRES_DB` override its
+defaults (5432, `postgres`, `app`).
+
+### Configuration
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PG_AUTOMERGE_CREATE_EXTENSION` | `1` | `1`: `CREATE EXTENSION IF NOT EXISTS pg_automerge` in `POSTGRES_DB` when the data directory is first initialized. `0`: skip it (install it from your migrations, e.g. `CREATE EXTENSION pg_automerge SCHEMA automerge`, as a superuser). Anything else fails initialization. |
+
+The official image's variables (`POSTGRES_PASSWORD`, `POSTGRES_USER`,
+`POSTGRES_DB`, `POSTGRES_INITDB_ARGS`, ...) work as documented for
+`postgres`, and your own files in `/docker-entrypoint-initdb.d` run after
+ours (`10-pg-automerge.sh`) when their names sort after it. Like all init
+scripts, it runs only on an empty data directory, never on an existing
+volume.
+
+The extension goes into `POSTGRES_DB` only, not `template1`: it is not
+trusted (see [Install](#install)), and a copy in `template1` would put it
+into every database a `CREATEDB` role creates later. Other databases get
+it with `CREATE EXTENSION pg_automerge` by a superuser. Your application
+should connect as its own non-superuser role, not as `POSTGRES_USER`.
+
+The image changes no Postgres setting. Suggested, as command-line options
+(as above) or in a mounted `postgresql.conf`:
+
+- `default_toast_compression=lz4`: stored documents are uncompressed
+  Automerge saves, which TOAST compresses; the image's Postgres is built
+  with lz4 (`pg_config --configure` shows `--with-lz4`), which compresses
+  and decompresses much faster than the default `pglz`. It applies to
+  columns created afterwards; `ALTER TABLE .. ALTER COLUMN doc SET
+  COMPRESSION lz4` sets it on an existing one (for new values).
+- `pg_automerge.max_load_memory`: size it to the container. A backend
+  whose Rust allocation fails aborts, and Postgres then restarts every
+  session of the cluster; with a container memory limit (`--memory`), the
+  kernel's OOM killer does the same. Each session can use up to the limit
+  at once, like `work_mem`, so keep it well below the container's memory
+  divided by the sessions you expect to load large documents at once (the
+  default is 2GB; compose uses 1GB). See [Configuration](#configuration).
+
+### Updating
+
+**A new pg_automerge version** (a newer image on the same volume):
+recreate the container from the new image, then in every database that
+has the extension:
+
+```sql
+ALTER EXTENSION pg_automerge UPDATE;   -- as a superuser
+SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge';
+```
+
+The init script does not run on an existing volume, so this step is
+yours (a migration, say). Until you run it the new library serves the old
+SQL definitions, which it keeps supporting (see
+[DESIGN.md](docs/DESIGN.md#versioning-and-upgrades)).
+
+**A new Postgres 18 minor release or Debian security fixes**: the base
+image is pinned by digest in `docker/Dockerfile` (`ARG PG_IMAGE`, with how
+to find the current digest next to it). Update the digest, rebuild,
+recreate the container on the same volume. Nothing else to do: minor
+releases keep the data format and the extension ABI. Check for new
+digests regularly; a pinned image does not get security fixes by itself.
+
+**A new Postgres major version** (19, ...): pg_automerge supports only 18
+so far, and an image of it for 19 does not exist yet. When it does, the
+18 volume cannot simply be mounted into it; either dump and restore (the
+`automerge` text form is the dump format and is stable across versions;
+restore with `pg_automerge.max_load_memory=-1` as the
+[Configuration](#configuration) section describes), or run `pg_upgrade`
+with both majors' binaries and pg_automerge built for both (the
+`/var/lib/postgresql` mount lets `pg_upgrade --link` work within one
+volume).
 
 ## Quick start
 
@@ -462,6 +587,9 @@ mise run bench-sql   # median timings of the everyday SQL paths on a release bui
 mise run bench-expanded  # SQL timings of merge chains and PL/pgSQL loops on a release build (minutes)
 mise run bench-core  # Rust timings of load, normalize and the jsonb walk
 mise run package     # release package for the Postgres of $PG_CONFIG (required)
+mise run docker-build   # the Docker image (see Docker)
+mise run docker-test    # build it, then smoke-test the image and compose.yaml (not part of test)
+mise run docker-up      # compose.yaml's development Postgres; docker-down stops it
 mise run run         # install and open psql against the pgrx-managed Postgres
 ```
 

@@ -14,6 +14,7 @@ Contents: [Scope](#scope) · [Architecture](#architecture) ·
 [Testing](#testing) ·
 [Installation, schema and privileges](#installation-schema-and-privileges) ·
 [Versioning and upgrades](#versioning-and-upgrades) ·
+[Docker image](#docker-image) ·
 [Future work](#future-work) ·
 [Appendix: benchmarks](#appendix-benchmarks)
 
@@ -2067,11 +2068,15 @@ What costs a load, per call:
   refuses one under `$PGRX_HOME` (also through a symlink) or of another
   major version: `cargo pgrx package` mirrors that pg_config's install
   paths, so a package built for pgrx's development Postgres would unpack
-  into `~/.pgrx/...`. It then checks that the tarball holds
+  into `~/.pgrx/...`. It builds with `--locked` (a stale `Cargo.lock`
+  fails). It then checks that the tarball holds
   `pg_automerge.so` under `--pkglibdir` and the control file under
   `--sharedir/extension`. `tests/check_ci.sh` (part of `mise run lint`)
   checks these refusals and the workflow's concurrency group and package
-  step.
+  step, and the Docker packaging statically (see [Docker image](#docker-image)).
+- `mise run docker-test` (`tests/docker.sh`, not part of `mise run test`)
+  builds the Docker image and smoke-tests it and `compose.yaml` (see
+  [Docker image](#docker-image)).
 - The multi-session shell scripts share `tests/lib.sh`; they start the pgrx-managed
   Postgres if it is not running and stop it again only if they started it.
 - `mise run lint`: `tests/check_ci.sh`, rustfmt, clippy with `-D warnings` for the default, the
@@ -2271,6 +2276,113 @@ Data compatibility:
     and each row is re-encoded on its next write.
 - Text output (`\x` + hex of the stored bytes) is the dump format and is
   stable, so dump and restore works across versions.
+
+## Docker image
+
+`docker/Dockerfile` builds the official `postgres:18` image plus the
+extension; `compose.yaml` runs it for local development. Usage is in the
+README's Docker section. Packaging decisions:
+
+- **One pinned base for every stage.** The `versions`, `builder` and
+  `runtime` stages are all `FROM ${PG_IMAGE}`, by default
+  `postgres:18-trixie@sha256:<index digest>` (Debian 13, Postgres 18.6 at
+  the time of writing). Building in the runtime's own image means the
+  library is linked against exactly the glibc it runs with, and compiled
+  against the headers of the very Postgres it is loaded into: the builder
+  installs `postgresql-server-dev-18=$PG_VERSION` (the official image's own
+  package version) from the PGDG repository the image already configures,
+  and `cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config`, so
+  pgrx never builds a Postgres of its own (whose assertions and paths
+  differ). If PGDG has dropped that exact version the newest 18.x headers
+  are used, with a warning: minor releases keep the server ABI. The digest
+  (rather than the tag) makes a rebuild reproducible and a base update a
+  visible one-line change; the price is that security fixes arrive only
+  when someone updates it (the README says how). The tag stays next to the
+  digest for readers. `tests/check_ci.sh` checks that every stage uses
+  `PG_IMAGE` and that it is a digest-pinned `postgres:18-*`.
+- **No hand-copied versions.** `scripts/versions.sh` reads Rust and
+  cargo-pgrx from `mise.toml`, checks cargo-pgrx against the pgrx crate in
+  `Cargo.lock`, and the crate version from `Cargo.toml`; the `versions`
+  stage runs it and hands the builder only `/toolchain.env`. BuildKit keys
+  that `COPY` by content, so editing `mise.toml` or `Cargo.toml` does not
+  rebuild the toolchain layers unless a toolchain version changed.
+  `check_ci.sh` fails if the Dockerfile spells out any of those versions.
+  The crate version is also a required build argument
+  (`PG_AUTOMERGE_VERSION`, for the OCI version label, which a Dockerfile
+  cannot read from a file); the build fails if it disagrees with
+  `Cargo.toml`. `mise run docker-build` passes it, plus the git remote
+  (empty while there is none) and commit for the `source` and `revision`
+  labels.
+- **Toolchain from Debian's rustup.** `rustup` comes from the signed
+  Debian archive (no `curl | sh`) and installs the pinned toolchain
+  (minimal profile); `cargo install --locked cargo-pgrx`. The package is
+  built by `scripts/package.sh`, the script behind `mise run package` and
+  the tag CI job, which now passes `--locked` to cargo, so a stale
+  `Cargo.lock` fails the build instead of being updated. BuildKit cache
+  mounts keep the cargo registry and `target/` between builds; since
+  `target/` is a cache mount, the package is copied out to `/out` in the
+  same step. The build fails if the package holds anything besides the
+  library, the control file and SQL scripts.
+- **Runtime: files only.** The runtime stage copies `pg_automerge.so`
+  (to `pg_config --pkglibdir`), the control file and SQL scripts (to
+  `--sharedir/extension`; the builder asserts these are the paths the
+  `COPY` uses), `LICENSE` as `/usr/share/doc/pg_automerge/copyright` (the
+  MIT notice must travel with copies), the version, and the init script.
+  The entrypoint, `CMD`, user and volume are the official image's
+  (`check_ci.sh` rejects `ENTRYPOINT`/`CMD`/`USER`/`VOLUME` in the
+  Dockerfile). The library links only `libc` and `libgcc_s`. The build
+  targets generic x86-64 (no `target-cpu=native`), so the image runs on
+  any x86-64 host; other architectures (the base image is multi-arch)
+  should build with `docker buildx build --platform linux/arm64` but have
+  not been tested.
+- **Init script.** `10-pg-automerge.sh` runs `CREATE EXTENSION IF NOT
+  EXISTS pg_automerge` in `POSTGRES_DB` on first initialization, unless
+  `PG_AUTOMERGE_CREATE_EXTENSION=0`; any other value than `0`/`1` fails
+  initialization rather than guessing. It is executable, so the entrypoint
+  runs it in its own process instead of sourcing it into its shell. It
+  does not touch `template1`: the extension is not trusted (see [Why the
+  extension is not trusted](#why-the-extension-is-not-trusted)), and a copy
+  in the template would install it into every database a `CREATEDB` role
+  creates.
+- **Settings are suggested, not baked in.** The image keeps Postgres'
+  defaults; `compose.yaml` passes `default_toast_compression=lz4` (the
+  image's Postgres is built `--with-lz4`; stored values are uncompressed
+  saves, see [The `automerge` type](#the-automerge-type)) and
+  `pg_automerge.max_load_memory=1GB` on the command line, which the README
+  explains. A memory-limited container makes the limit matter more: a
+  failed allocation or an OOM kill restarts the cluster.
+- **Compose.** Named volume at `/var/lib/postgresql` (the 18 images'
+  `PGDATA` is `/var/lib/postgresql/18/docker`, so a later major's data
+  directory can sit next to it for `pg_upgrade --link`), port on
+  `127.0.0.1` only, `shm_size` above Docker's 64 MB for parallel query,
+  and a `pg_isready` healthcheck over TCP, which fails during first
+  initialization (the entrypoint's temporary server listens only on the
+  socket), so the service is healthy only once the extension is created
+  and the real server runs. `pull_policy: never`: the image is local.
+- **Tests.** `tests/docker.sh` (`mise run docker-test`, after
+  `docker-build`; not part of `mise run test` because it needs Docker and
+  a release build) checks the labels, the version file and license, that
+  no toolchain is in the image, lz4 support and the exact set of
+  extension files; then, against fresh containers and volumes (labelled
+  `pg-automerge-test`, all removed on exit): default init (installed in
+  `POSTGRES_DB` at the crate version, not in `postgres` or `template1`,
+  `debug_assertions` off), a merge of the regress fixtures' concurrent
+  edits with jsonb reads, settings passed with `-c`, lz4 on an `automerge`
+  column, a restart on the same volume (data kept, init not re-run,
+  `ALTER EXTENSION .. UPDATE` a no-op), `PG_AUTOMERGE_CREATE_EXTENSION=0`
+  (then a manual `CREATE EXTENSION .. SCHEMA`), an invalid value failing
+  init, and `compose.yaml` (`up --wait` healthy, settings applied, port on
+  127.0.0.1, `down -v` leaves no volume).
+
+Measured 2026-09-30 on an 8-core Intel Atom C3758R (2.4 GHz), Docker 29.8
+with BuildKit:
+
+| | |
+|---|---|
+| Image size | 460 MB (`postgres:18` is 457 MB: the extension adds 3.5 MB, of which the library is 3.47 MB) |
+| Cold build (fresh builder, base pulled) | 462 s: apt 51 s, Rust + cargo-pgrx 168 s, the extension (fat LTO) 205 s |
+| Warm build, nothing changed | 1.3 s |
+| Warm build, one source file changed | 65 s (dependencies cached in the `target/` mount; the release profile's fat LTO and one codegen unit dominate) |
 
 ## Future work
 
