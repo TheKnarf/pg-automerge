@@ -256,6 +256,23 @@ fn check_normalize(name: &str, input: &[u8], loads: bool) -> u64 {
         peak as f64 / limit as f64
     );
 
+    // At the input's own estimate, when the document it normalizes to is
+    // priced higher: loading and saving it stay below the input's
+    // estimate, and the result is refused as the normalized document.
+    if stored_estimate > estimate {
+        set_limit(Some(Some(estimate)));
+        let (result, peak) = peak_of(|| normalize(input));
+        assert!(
+            limit_error(result.clone()).is_none_or(|e| e.kind == LimitKind::Normalized),
+            "{name}: rejected at its own estimate: {result:?}"
+        );
+        assert!(
+            peak <= estimate,
+            "{name}: normalize peak {peak} above the input's estimate {estimate} ({:.2})",
+            peak as f64 / estimate as f64
+        );
+    }
+
     set_limit(Some(Some(estimate - 1)));
     let (result, peak) = peak_of(|| normalize(input));
     let err =
@@ -357,6 +374,62 @@ fn crafted_inputs_are_priced_before_they_load() {
     }
     let trailing = [base.as_slice(), &doc.document().save_after(&heads)].concat();
     check_normalize("save + 2000 trailing change chunks", &trailing, true);
+}
+
+/// `merge_changes` of `input` into a small stored document, with the
+/// limit at the stored document's estimate plus the input's (loaded on
+/// its own or applied, whichever is larger): not refused before loading,
+/// and the peak stays below that limit. Returns the peak's ratio.
+fn check_apply(name: &str, input: &[u8]) -> f64 {
+    // Another actor's document (the crafted changes are actor 0's).
+    let (base, _) = concurrent("text", 100, 9);
+    let doc_a = doc_estimate(&scan_doc_exact(&base));
+    let scanned = scan_input_exact(input, None);
+    let input_estimate = scanned
+        .load_estimate()
+        .max(scanned.apply_estimate(Base::from(&scan_doc(&base))));
+    let limit = doc_a + input_estimate;
+    set_limit(Some(Some(limit)));
+    let (result, peak) = peak_of(|| loaded::merge_changes(Input::Stored(&base), input));
+    set_limit(None);
+    assert!(
+        limit_error(result.as_ref().map(|_| ()).map_err(Clone::clone))
+            .is_none_or(|e| e.kind == LimitKind::Merged),
+        "{name}: merge_changes refused before loading: {:?}",
+        result.err()
+    );
+    let ratio = peak as f64 / limit as f64;
+    assert!(
+        peak <= limit,
+        "{name}: merge_changes peak {peak} above {limit} ({ratio:.2})"
+    );
+    eprintln!("{name} merge_changes: estimate {limit}, peak {peak} ({ratio:.2})");
+    ratio
+}
+
+/// A document's change messages, one repeat run of a string: Automerge
+/// rebuilds every change with its own copy of the message (in the
+/// change's bytes and as a `String`), and a load whose heads do not match
+/// clones every rebuilt change into its error.
+#[test]
+fn repeated_messages_are_priced() {
+    for (name, input) in [
+        (
+            "doc 2000 changes, one 100 kB message",
+            craft::repeated_messages(2_000, 100_000, false),
+        ),
+        (
+            "doc 2000 changes, one 100 kB message, deflated",
+            craft::repeated_messages(2_000, 100_000, true),
+        ),
+        (
+            "doc 3 changes, one 30 MB message",
+            craft::repeated_messages(3, 30_000_000, false),
+        ),
+    ] {
+        check_normalize(name, &input, false);
+        check_apply(name, &input);
+    }
 }
 
 #[test]

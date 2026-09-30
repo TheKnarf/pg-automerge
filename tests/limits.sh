@@ -13,6 +13,9 @@
 #      crafted change chunk of 20,000,000 ops each abort the backend and
 #      the cluster restarts (checked in the log), and so does a 19 kB
 #      compressed change chunk listing 20,000,000 empty other actors.
+#      So do the inputs of the estimate's rebuild terms: a document chunk
+#      under 1 kB whose 6,000 changes share one 100 kB message (a repeat
+#      run, which every rebuilt change copies).
 #      This proves the inputs and the cap reproduce the crash.
 #   2. With the default limit, the same inputs through every path (text
 #      input, the bytea cast, merge(automerge, bytea), automerge_contains,
@@ -76,6 +79,7 @@ ssql -c "CREATE EXTENSION pg_automerge" \
 TEXT="pg_read_binary_file('$IN/text.bin')"
 OPS="pg_read_binary_file('$IN/ops.bin')"
 OTHERS="pg_read_binary_file('$IN/others.bin')"
+MESSAGES="pg_read_binary_file('$IN/messages.bin')"
 
 wait_ready() {
     for _ in $(seq 1 300); do
@@ -86,7 +90,7 @@ wait_ready() {
 }
 
 if [[ "${LIMITS_SKIP_CRASH:-0}" != 1 ]]; then
-    for input in "$TEXT" "$OPS" "$OTHERS"; do
+    for input in "$TEXT" "$OPS" "$OTHERS" "$MESSAGES"; do
         log "no limit: $input aborts the backend and restarts the cluster"
         before="$(crashes)"
         if out="$(ssql -c "SET pg_automerge.max_load_memory = -1" \
@@ -129,7 +133,9 @@ for stmt in \
     "COPY docs (doc) FROM '$WORK/text.copy'" \
     "SELECT $OTHERS::automerge" \
     "UPDATE docs SET doc = merge(doc, $OTHERS) WHERE id = 1" \
-    "SELECT automerge_contains(doc, $OTHERS) FROM docs"; do
+    "SELECT automerge_contains(doc, $OTHERS) FROM docs" \
+    "SELECT $MESSAGES::automerge" \
+    "INSERT INTO docs VALUES (4, $MESSAGES)"; do
     out="$(ssql -v VERBOSITY=verbose -c "$stmt" 2>&1)" && fail "no error: ${stmt:0:80}"
     grep -q 'ERROR:  53400: estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (2048 MB)' \
         <<<"$out" || fail "${stmt:0:80}: $out"

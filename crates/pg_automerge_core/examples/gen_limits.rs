@@ -13,6 +13,11 @@
 //!   lists the empty actor id `LIMITS_OTHERS` (default 20,000,000) times;
 //!   Automerge's parse keeps one 32-byte entry each (over a gigabyte)
 //!   before it rejects the change.
+//! - `messages.bin`: a document chunk of 6,000 empty changes whose
+//!   messages are one repeat run of a 100 kB string, its columns deflated
+//!   (under 1 kB): Automerge rebuilds every change with its own copy of
+//!   the message, held twice, and clones them all into the error when the
+//!   heads do not match (about 2.4 GB).
 //! - `small.bin`: an ordinary small document.
 
 use std::path::PathBuf;
@@ -45,6 +50,12 @@ fn main() {
     std::fs::write(
         dir.join("others.bin"),
         craft::compressed_listing(0, others as u64, 0),
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.join("messages.bin"),
+        craft::repeated_messages(6_000, 100_000, true),
     )
     .unwrap();
 

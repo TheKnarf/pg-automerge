@@ -1274,15 +1274,32 @@ In bytes, saturating, from counts read from the chunks:
   be saved as): 450 per op + 30 per successor entry + 600 × Gmax + 1600 per
   change + min(130 × (ops + successors), 1600 × changes) + 200 per
   dependency entry + 200 per actor + 0.3 × changes × actors + 3 × min(changes,
-  (ops + successors) / 16) × actors.
+  (ops + successors) / 16) × actors + 5 per *rebuilt* byte (below).
 - **Change chunks, or changes about to be applied** to a document with
   *base* changes and actors: 1000 per op + 80 per pred entry + 2500 per
   change + 200 per dependency + 200 per distinct actor + 100 per entry of
   a change's list of other actors (duplicates included) + 0.3 × (changes ×
-  (base actors + new actors) + base changes × new actors).
+  (base actors + new actors) + base changes × new actors) + 8 per
+  *repeated* byte (below).
 - **Plus** 10 per byte of the chunks with their columns inflated, and 64 kB
   (Automerge's fixed structures, which the per-unit costs do not cover for
   tiny documents).
+
+**Rebuilt and repeated bytes.** A load rebuilds every change of a
+document as a change chunk of its own, and applying changes turns their
+ops into Automerge's structures; both copy strings that the input may
+hold once for many rows, in a repeat run (`n` copies of a value, stored
+once). The scan computes what such runs expand to from their headers,
+without expanding them: a repeat run of `n` strings of `len` bytes
+expands to `(n - 1) × len` bytes beyond the input's own (literal values
+are input bytes, already charged 10 each).
+
+- Rebuilt bytes of a document chunk: its change messages (every rebuilt
+  change holds its message twice, in its bytes and as a `String`, and a
+  load whose heads do not match clones every rebuilt change into its
+  error: 4.0 bytes per byte measured, charged 5).
+- Repeated bytes of changes: those of a document chunk turned into
+  changes (its rebuilt bytes, which applying copies again).
 
 A load of input on its own is the first document chunk as a document plus
 everything after it as changes applied to it (Automerge turns a later
@@ -1290,6 +1307,10 @@ document chunk into changes: it is charged both as a document and as its
 changes). Loading after a document (`a ++ changes`) or applying chunks to
 it charges every chunk of the input as changes, with the document as the
 base.
+
+For a merge result, the rebuilt bytes of the bound (see [Merge
+results](#merge-results)) add the bytes and the repeated bytes of the
+changes applied: a rebuilt change is the change that was applied.
 
 The counts: ops are the largest row count of the known op columns (not
 the members of a group); Automerge sizes some allocations by one column's

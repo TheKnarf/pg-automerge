@@ -29,6 +29,9 @@
 //!   against each other, so the largest one counts), group columns are
 //!   summed (successors, dependencies), and [`DocCounts::gmax`] is found
 //!   by merging the object, key, insert and successor columns run by run.
+//!   What rebuilding its changes copies beyond the chunk's own bytes
+//!   ([`DocCounts::rebuilt`]: a string repeated by a run, copied into
+//!   every rebuilt change) is computed from the run headers.
 //! - A change chunk (compressed or not): its dependencies, actors and op
 //!   columns. Its list of other actors is priced per entry, duplicates
 //!   included (Automerge keeps every entry); a list longer than the limit
@@ -100,6 +103,8 @@ const KEY_ACTOR: u64 = 0x11;
 const KEY_CTR: u64 = 0x13;
 const KEY_STR: u64 = 0x15;
 const INSERT: u64 = 0x34;
+/// The change message column of a document chunk.
+const MESSAGE: u64 = 0x35;
 
 /// Bytes charged per inflated input byte (values and strings are copied
 /// into the document, 5-7 bytes each measured).
@@ -111,6 +116,16 @@ const PER_BYTE: u64 = 10;
 /// to 63 per entry; 96 is three `ActorId`s, the old and the new buffer
 /// of a growth step both held.
 const PER_OTHER_ACTOR: u128 = 100;
+/// Bytes charged per byte that a document's rebuilt changes hold beyond
+/// the chunk's own bytes ([`DocCounts::rebuilt`]): Automerge rebuilds
+/// every change of a document with its own copy of the message, held
+/// twice (in the change's bytes and as a `String`), and a load whose
+/// heads do not match clones every rebuilt change into its error.
+/// Measured 4.0 per byte.
+const PER_REBUILT: u128 = 5;
+/// Bytes charged per byte that applying changes copies beyond the
+/// chunks' own bytes ([`ChangeCounts::repeated`]).
+const PER_REPEATED: u128 = 8;
 /// Bytes charged for any load or apply, whatever it holds: Automerge's
 /// fixed structures, which the per-unit costs do not cover for tiny
 /// documents.
@@ -171,6 +186,11 @@ pub struct DocCounts {
     pub actors: u64,
     /// Bytes of the chunk with its columns inflated.
     pub inflated: u64,
+    /// Bytes that rebuilding the document's changes copies beyond the
+    /// chunk's own bytes: a string column's repeat run of `n` values of
+    /// `len` bytes is `(n - 1) * len` (every change holds its own copy).
+    /// Computed from the run headers, never expanded.
+    pub rebuilt: u64,
 }
 
 /// What change chunks describe (or changes about to be applied).
@@ -192,6 +212,10 @@ pub struct ChangeCounts {
     pub other_actor_entries: u64,
     /// Bytes of the chunks' data, inflated.
     pub inflated: u64,
+    /// Bytes that applying the changes copies beyond the chunks' own
+    /// bytes (for changes turned from a document chunk, its
+    /// [`DocCounts::rebuilt`]).
+    pub repeated: u64,
 }
 
 impl DocCounts {
@@ -204,6 +228,7 @@ impl DocCounts {
         self.deps = self.deps.saturating_add(other.deps);
         self.actors = self.actors.saturating_add(other.actors);
         self.inflated = self.inflated.saturating_add(other.inflated);
+        self.rebuilt = self.rebuilt.saturating_add(other.rebuilt);
     }
 
     /// An upper bound of the counts of a document with these counts after
@@ -211,7 +236,10 @@ impl DocCounts {
     /// added, every pred becomes a successor entry (possibly all on one
     /// key, so it is added to [`DocCounts::gmax`] too), every actor may be
     /// new. The bytes are added as they are (an approximation: the columns
-    /// of the merged document may encode less compactly).
+    /// of the merged document may encode less compactly). What rebuilding
+    /// the new changes copies is at most their bytes and what applying them
+    /// copies ([`DocCounts::rebuilt`]: a rebuilt change is the change as
+    /// it was applied).
     pub fn plus_changes(&self, delta: &ChangeCounts) -> DocCounts {
         let mut sum = *self;
         sum.ops = sum.ops.saturating_add(delta.ops);
@@ -221,6 +249,10 @@ impl DocCounts {
         sum.deps = sum.deps.saturating_add(delta.deps);
         sum.actors = sum.actors.saturating_add(delta.actors);
         sum.inflated = sum.inflated.saturating_add(delta.inflated);
+        sum.rebuilt = sum
+            .rebuilt
+            .saturating_add(delta.inflated)
+            .saturating_add(delta.repeated);
         sum
     }
 
@@ -235,6 +267,10 @@ impl DocCounts {
             actors: self.actors,
             other_actor_entries: 0,
             inflated: 0,
+            // Applying the rebuilt changes copies what rebuilding them did
+            // (a bound: keys and mark names are copied per op when
+            // applied; messages and actors at most once more).
+            repeated: self.rebuilt,
         }
     }
 }
@@ -252,6 +288,7 @@ impl ChangeCounts {
             .other_actor_entries
             .saturating_add(other.other_actor_entries);
         self.inflated = self.inflated.saturating_add(other.inflated);
+        self.repeated = self.repeated.saturating_add(other.repeated);
     }
 }
 
@@ -287,7 +324,8 @@ fn sat(value: u128) -> u64 {
 /// op or successor for rebuilding the changes, 200 per dependency and per
 /// actor, 0.3 per change × actor (Automerge caches a clock every 16
 /// changes), 3 per actor for each change with more than about 16 ops, 10
-/// per inflated byte, and 64 kB whatever the document holds.
+/// per inflated byte, 5 per byte the rebuilt changes copy beyond the
+/// chunk's own bytes, and 64 kB whatever the document holds.
 pub fn doc_estimate(d: &DocCounts) -> u64 {
     let (ops, succ, gmax, changes, deps, actors, inflated) = (
         u128::from(d.ops),
@@ -309,15 +347,16 @@ pub fn doc_estimate(d: &DocCounts) -> u64 {
         + 200 * actors
         + 3 * changes * actors / 10
         + 3 * changes.min(rows / 16) * actors
-        + u128::from(PER_BYTE) * inflated)
+        + u128::from(PER_BYTE) * inflated
+        + PER_REBUILT * u128::from(d.rebuilt))
 }
 
 /// Estimated peak bytes of parsing and applying changes with these counts
 /// to a document with `base`'s changes and actors: 1000 per op, 80 per
 /// pred, 2500 per change, 200 per dependency and per actor, 100 per entry
 /// of a change's list of other actors (duplicates included), 0.3 per
-/// change × actor of the result's clock cache, 10 per inflated byte, and
-/// 64 kB.
+/// change × actor of the result's clock cache, 10 per inflated byte, 8
+/// per byte applying them copies beyond the chunks' own bytes, and 64 kB.
 pub fn changes_estimate(c: &ChangeCounts, base: Base) -> u64 {
     let (ops, preds, changes, deps, actors, inflated) = (
         u128::from(c.ops),
@@ -336,7 +375,8 @@ pub fn changes_estimate(c: &ChangeCounts, base: Base) -> u64 {
         + 200 * actors
         + PER_OTHER_ACTOR * u128::from(c.other_actor_entries)
         + 3 * (changes * (base_actors + actors) + base_changes * actors) / 10
-        + u128::from(PER_BYTE) * inflated)
+        + u128::from(PER_BYTE) * inflated
+        + PER_REPEATED * u128::from(c.repeated))
 }
 
 /// What a scan of external input found (see [`scan_input`]).
@@ -895,22 +935,26 @@ impl<'a> Reader<'a> {
     /// string that cannot be read ends it, as in [`Runs::value`]).
     fn skip_strings(&mut self, n: u64) -> u64 {
         for done in 0..n {
-            // One-byte lengths (below 128) inline, others decoded.
-            let len = match self.bytes.get(self.pos) {
-                Some(&b) if b < 0x80 => {
-                    self.pos += 1;
-                    usize::from(b)
-                }
-                _ => match self.uleb().and_then(|l| usize::try_from(l).ok()) {
-                    Some(len) => len,
-                    None => return done,
-                },
-            };
-            if self.take(len).is_none() {
+            if self.skip_string().is_none() {
                 return done;
             }
         }
         n
+    }
+
+    /// Step over one length-prefixed string; returns its length (`None`:
+    /// it cannot be read).
+    fn skip_string(&mut self) -> Option<u64> {
+        // One-byte lengths (below 128) inline, others decoded.
+        let len = match self.bytes.get(self.pos) {
+            Some(&b) if b < 0x80 => {
+                self.pos += 1;
+                usize::from(b)
+            }
+            _ => usize::try_from(self.uleb()?).ok()?,
+        };
+        self.take(len)?;
+        Some(len as u64)
     }
 
     fn usize_c(&mut self) -> Option<usize> {
@@ -1099,15 +1143,20 @@ impl<'a> Runs<'a> {
     }
 }
 
-/// Rows of a column, and for a group column the sum of its values.
+/// Rows of a column, for a group column the sum of its values, and for a
+/// string column the bytes its repeat runs expand to beyond the one
+/// value each holds.
 #[derive(Debug, Clone, Copy, Default)]
 struct ColumnStats {
     rows: u64,
     sum: u64,
+    /// For each repeat run of `n` strings of `len` bytes, `(n - 1) * len`.
+    excess: u64,
 }
 
-/// Rows of a column, and for a group column the sum of its values: run
-/// by run. Literal values are only stepped over: numbers by their LEB128
+/// Rows of a column, for a group column the sum of its values, for a
+/// string column what its repeat runs expand to ([`ColumnStats::excess`]):
+/// run by run. Literal values are only stepped over: numbers by their LEB128
 /// last bytes, eight bytes at a time ([`Reader::skip_lebs`]), strings by
 /// their lengths; a group's are summed. Lenient like [`Runs`]: anything
 /// that cannot be read ends the column (except an over-long literal
@@ -1164,7 +1213,11 @@ fn column_stats(ty: u64, data: &[u8], ticker: &mut Ticker) -> ColumnStats {
             }
         } else if n > 0 {
             // A repeat run: one value.
-            if skip(&mut r, 1) == 0 {
+            if ty == STRING {
+                let Some(bytes) = r.skip_string() else { break };
+                let extra = (len - 1).saturating_mul(bytes);
+                stats.excess = stats.excess.saturating_add(extra);
+            } else if skip(&mut r, 1) == 0 {
                 break;
             }
             stats.rows = stats.rows.saturating_add(len);
@@ -1322,16 +1375,19 @@ impl Scanner {
         Ok(cols)
     }
 
-    /// Rows of the known non-member, non-value columns (the largest), and
-    /// for the group `group` the larger of its sum and its members' rows.
+    /// Rows of the known non-member, non-value columns (the largest), for
+    /// the group `group` the larger of its sum and its members' rows, and
+    /// what the repeat runs of the string columns `strings` expand to
+    /// (summed).
     fn rows_and_group(
         &mut self,
         cols: &[Column<'_>],
         known: &[u64],
         group: u64,
         members: &[u64],
-    ) -> (u64, u64) {
-        let (mut rows, mut entries) = (0u64, 0u64);
+        strings: &[u64],
+    ) -> (u64, u64, u64) {
+        let (mut rows, mut entries, mut excess) = (0u64, 0u64, 0u64);
         for col in cols.iter().filter(|c| known.contains(&c.spec)) {
             let ty = col.spec & 7;
             if ty == VALUE {
@@ -1346,8 +1402,11 @@ impl Scanner {
             } else {
                 rows = rows.max(stats.rows);
             }
+            if strings.contains(&col.spec) {
+                excess = excess.saturating_add(stats.excess);
+            }
         }
-        (rows, entries)
+        (rows, entries, excess)
     }
 
     /// Scan a document chunk's data. Returns its counts and whether it
@@ -1385,9 +1444,17 @@ impl Scanner {
                 return Err(Stop::Malformed);
             }
         }
-        let (changes, deps) =
-            self.rows_and_group(&change_cols, &DOC_CHANGE_SPECS, DEPS_GROUP, &[DEPS_MEMBER]);
-        let (ops, succ) = self.rows_and_group(&op_cols, &DOC_OP_SPECS, SUCC_GROUP, &SUCC_MEMBERS);
+        // Every rebuilt change holds its own message.
+        let (changes, deps, messages) = self.rows_and_group(
+            &change_cols,
+            &DOC_CHANGE_SPECS,
+            DEPS_GROUP,
+            &[DEPS_MEMBER],
+            &[MESSAGE],
+        );
+        let (ops, succ, _) =
+            self.rows_and_group(&op_cols, &DOC_OP_SPECS, SUCC_GROUP, &SUCC_MEMBERS, &[]);
+        counts.rebuilt = messages;
         counts.changes = changes;
         counts.deps = deps;
         counts.ops = ops;
@@ -1457,7 +1524,8 @@ impl Scanner {
         }
         let meta = Self::metadata(&mut r).ok_or_else(malformed)?;
         let cols = self.columns(&mut r, &meta, false)?;
-        let (ops, preds) = self.rows_and_group(&cols, &CHANGE_OP_SPECS, PRED_GROUP, &PRED_MEMBERS);
+        let (ops, preds, _) =
+            self.rows_and_group(&cols, &CHANGE_OP_SPECS, PRED_GROUP, &PRED_MEMBERS, &[]);
         counts.ops = counts.ops.saturating_add(ops);
         counts.preds = counts.preds.saturating_add(preds);
         counts.changes = counts.changes.saturating_add(1);
@@ -1829,7 +1897,7 @@ pub fn gmax_by_rows(bytes: &[u8]) -> Option<u64> {
     let mut scanner = Scanner::new(None, true);
     scanner.columns(&mut r, &change_meta, true).ok()?;
     let cols = scanner.columns(&mut r, &op_meta, true).ok()?;
-    let (rows, _) = scanner.rows_and_group(&cols, &DOC_OP_SPECS, SUCC_GROUP, &SUCC_MEMBERS);
+    let (rows, _, _) = scanner.rows_and_group(&cols, &DOC_OP_SPECS, SUCC_GROUP, &SUCC_MEMBERS, &[]);
     let rows_usize = usize::try_from(rows).ok()?;
     let expand = |spec: u64| -> Vec<Val<'_>> {
         let mut out = Vec::new();
@@ -1901,7 +1969,7 @@ mod tests {
                 STRING => {
                     let len = usize::try_from(r.uleb()?).ok()?;
                     r.take(len)?;
-                    Some(0)
+                    Some(len as u64)
                 }
                 DELTA => r.sleb().map(|_| 0),
                 GROUP => r.uleb(),
@@ -1914,14 +1982,22 @@ mod tests {
                 let Some(v) = value(&mut r) else { break };
                 let n = n.unsigned_abs();
                 stats.rows = stats.rows.saturating_add(n);
-                stats.sum = stats.sum.saturating_add(n.saturating_mul(v));
+                if ty == STRING {
+                    // Expanded, less the one value the run holds.
+                    let expanded = n.saturating_mul(v);
+                    stats.excess = stats.excess.saturating_add(expanded - v);
+                } else {
+                    stats.sum = stats.sum.saturating_add(n.saturating_mul(v));
+                }
             } else if n < 0 {
                 for _ in 0..n.unsigned_abs() {
                     let Some(v) = value(&mut r) else {
                         break 'runs;
                     };
                     stats.rows = stats.rows.saturating_add(1);
-                    stats.sum = stats.sum.saturating_add(v);
+                    if ty != STRING {
+                        stats.sum = stats.sum.saturating_add(v);
+                    }
                 }
             } else {
                 let Some(k) = r.uleb() else { break };
@@ -2038,8 +2114,8 @@ mod tests {
             let reference = column_stats_decoding(ty, &data);
             if well_formed || ty == GROUP || ty == STRING || ty == BOOLEAN {
                 assert_eq!(
-                    (fast.rows, fast.sum),
-                    (reference.rows, reference.sum),
+                    (fast.rows, fast.sum, fast.excess),
+                    (reference.rows, reference.sum, reference.excess),
                     "column {i} of type {ty}: {data:?}"
                 );
             } else {
