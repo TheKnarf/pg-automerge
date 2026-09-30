@@ -367,3 +367,50 @@ fn notify_trigger_validates_usage() {
     );
     assert!(err[3].starts_with("Name the columns that identify the row"), "{err:?}");
 }
+
+// A virtual generated column (PG18) is computed when read and never
+// stored, so the rows an AFTER trigger sees have NULL in it: as a key it
+// used to be reported as null. It is rejected; a stored one works.
+#[pg_test]
+fn notify_trigger_rejects_virtual_generated_keys() {
+    Spi::run(
+        "CREATE TABLE vg (id int, vk int GENERATED ALWAYS AS (id * 10) VIRTUAL, \
+                          sk int GENERATED ALWAYS AS (id * 100) STORED, doc automerge); \
+         CREATE TRIGGER vg_notify AFTER INSERT ON vg \
+           FOR EACH ROW EXECUTE FUNCTION automerge_notify('vg_changes', 'vk', 'id')",
+    )
+    .unwrap();
+    take_sent();
+    let err = sql_error_report("INSERT INTO vg (id, doc) VALUES (7, NULL)");
+    assert_eq!(
+        err,
+        vec![
+            "22023",
+            "automerge_notify(): key column \"vk\" is a virtual generated column \
+             (trigger \"vg_notify\")",
+            "",
+            "Its value is not stored, so the rows a trigger sees have NULL in it; \
+             name a STORED generated column or the columns it is computed from.",
+        ]
+    );
+    assert!(take_sent().is_empty());
+    Spi::run(
+        "DROP TRIGGER vg_notify ON vg; \
+         CREATE TRIGGER vg_notify AFTER INSERT ON vg \
+           FOR EACH ROW EXECUTE FUNCTION automerge_notify('vg_changes', 'sk', 'id')",
+    )
+    .unwrap();
+    Spi::run("INSERT INTO vg (id, doc) VALUES (7, NULL)").unwrap();
+    assert_eq!(
+        take_sent(),
+        vec![(
+            "vg_changes".to_string(),
+            json!({
+                "table": "public.vg",
+                "op": "INSERT",
+                "key": {"sk": 700, "id": 7},
+                "columns": {"doc": {"heads": null}},
+            })
+        )]
+    );
+}

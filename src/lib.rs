@@ -47,8 +47,9 @@ static MAX_LOAD_MEMORY: pgrx::GucSetting<i32> =
 
 /// Library initialization: let the core's long loops (the jsonb walk,
 /// history rows, the input scan) honour query cancel and
-/// `statement_timeout`, and define the `pg_automerge.verify_writes` and
-/// `pg_automerge.max_load_memory` settings.
+/// `statement_timeout`, define the `pg_automerge.verify_writes` and
+/// `pg_automerge.max_load_memory` settings, and reserve the `pg_automerge`
+/// prefix for them.
 #[pgrx::pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     pg_automerge_core::set_interrupt_check(check_for_interrupts);
@@ -81,6 +82,13 @@ pub extern "C-unwind" fn _PG_init() {
         pgrx::GucFlags::UNIT_KB,
     );
     pg_automerge_core::budget::set_limit_source(max_load_memory);
+    // Reserve the prefix: a misspelled pg_automerge.* setting is an error
+    // from now on (42602), and placeholders already set (from
+    // postgresql.conf, ALTER SYSTEM/ROLE/DATABASE or SET before the library
+    // was loaded) are removed with a WARNING, instead of being accepted
+    // silently while the real setting keeps its default.
+    // SAFETY: a NUL-terminated literal; Postgres copies it.
+    unsafe { pgrx::pg_sys::MarkGUCPrefixReserved(c"pg_automerge".as_ptr()) };
 }
 
 /// The current value of `pg_automerge.verify_writes`.

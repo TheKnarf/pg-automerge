@@ -431,3 +431,67 @@ fn history_functions_are_labelled_and_search_path_safe() {
     Spi::run("RESET search_path").unwrap();
     assert_eq!(n, 4);
 }
+
+/// The error of running `alter` then `sql` in a subtransaction that is
+/// rolled back either way ("P0001: no error" if `sql` succeeds).
+fn error_after_alter(alter: &str, sql: &str, doc: &[u8]) -> String {
+    Spi::run(
+        "CREATE OR REPLACE FUNCTION pg_temp.error_after_alter(a text, q text, d bytea) \
+         RETURNS text LANGUAGE plpgsql AS $$ \
+         BEGIN EXECUTE a; EXECUTE q USING d; RAISE EXCEPTION 'no error'; \
+         EXCEPTION WHEN OTHERS THEN RETURN SQLSTATE || ': ' || SQLERRM; END $$",
+    )
+    .unwrap();
+    one(
+        "SELECT pg_temp.error_after_alter($1, $2, $3)",
+        &[alter.into(), sql.into(), doc.to_vec().into()],
+    )
+}
+
+// The owner of the change types can alter them; the rows used to be built
+// from the altered descriptor anyway, so an int8 was read as a text pointer
+// and the backend crashed (SIGSEGV). Now every altered shape is XX000.
+#[pg_test]
+fn changes_reject_altered_result_types() {
+    let (mut merged, mut base, _, _) = history_docs();
+    let doc = merged.save();
+    let head = heads_of(&mut base)[0].clone();
+    let changes = "SELECT count(*) FROM automerge_changes($1::automerge)";
+    let meta = "SELECT count(*) FROM automerge_changes_meta($1::automerge)";
+    let get = format!("SELECT automerge_get_change($1::automerge, '{head}') IS NULL");
+    let full = "type automerge_change has been altered: its attributes must be those \
+                created by extension pg_automerge";
+    let short = "type automerge_change_meta has been altered: its attributes must be those \
+                 created by extension pg_automerge";
+    let cases: [(&str, &str, &str); 7] = [
+        ("ALTER TYPE automerge_change ALTER ATTRIBUTE seq TYPE text", changes, full),
+        ("ALTER TYPE automerge_change ALTER ATTRIBUTE seq TYPE text", &get, full),
+        ("ALTER TYPE automerge_change ALTER ATTRIBUTE change TYPE text", changes, full),
+        ("ALTER TYPE automerge_change_meta ALTER ATTRIBUTE start_op TYPE numeric", meta, short),
+        (
+            "CREATE DOMAIN pg_temp.t AS text; \
+             ALTER TYPE automerge_change_meta ALTER ATTRIBUTE hash TYPE pg_temp.t",
+            meta,
+            short,
+        ),
+        (
+            "ALTER TYPE automerge_change_meta DROP ATTRIBUTE deps, ADD ATTRIBUTE deps text[]",
+            meta,
+            short,
+        ),
+        ("ALTER TYPE automerge_change DROP ATTRIBUTE change", changes, full),
+    ];
+    for (alter, sql, message) in cases {
+        let err = error_after_alter(alter, sql, &doc);
+        assert_eq!(err, format!("XX000: {message}"), "{alter}; {sql}");
+    }
+    // Unaltered (the subtransactions rolled back): rows as before.
+    for sql in [changes, meta] {
+        let err = error_after_alter("SELECT 1", sql, &doc);
+        assert_eq!(err, "P0001: no error", "{sql}");
+        let n: i64 = one(sql, &[doc.clone().into()]);
+        assert_eq!(n, 4);
+    }
+    let found: bool = one(&get, &[doc.clone().into()]);
+    assert!(!found);
+}

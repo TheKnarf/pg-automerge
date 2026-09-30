@@ -8,7 +8,7 @@ use pg_automerge_core::{self as am, Error};
 use pgrx::Internal;
 use pgrx::prelude::*;
 
-use crate::datum::{AutomergeArg, AutomergeDatum, AutomergeValue, Detoasted};
+use crate::datum::{AutomergeArg, AutomergeDatum, AutomergeValue};
 use crate::error::{OrRaise, raise};
 use crate::expanded::new_expanded;
 use crate::jsonb::{JsonbBuilder, JsonbDatum};
@@ -56,10 +56,7 @@ fn automerge_recv(buf: Internal) -> AutomergeDatum {
 
 #[pg_extern(sql = false)]
 fn automerge_send(doc: AutomergeArg) -> Vec<u8> {
-    match doc.detoast() {
-        Detoasted::Flat { bytes, .. } => bytes,
-        expanded => expanded.stored().to_vec(),
-    }
+    doc.detoast().stored().to_vec()
 }
 
 extension_sql!(

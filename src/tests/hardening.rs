@@ -375,3 +375,59 @@ fn jsonb_walk_honours_query_cancel() {
     }
     panic!("the walk finished: {:?}", result.map(|_| ()));
 }
+
+/// Bytes allocated in `CurrentMemoryContext` (and its children).
+fn current_context_bytes() -> usize {
+    // SAFETY: the current memory context is valid.
+    unsafe { pg_sys::MemoryContextMemAllocated(pg_sys::CurrentMemoryContext, true) }
+}
+
+// A flat argument is detoasted once and read in place: the detoasted copy
+// is freed when the call is done with it. It used to be copied again into
+// a Rust Vec, and the palloc'd copy stayed until the per-call context was
+// reset, so a flat argument held about twice its size.
+#[pg_test]
+fn flat_arguments_are_detoasted_once_and_freed() {
+    use crate::datum::AutomergeArg;
+    // About 1 MB of text that pglz cannot shrink much: stored out of line.
+    let mut doc = AutoCommit::new().with_actor(actor(1));
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    let noise: String = (0..1_000_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'!' + (x % 90) as u8)
+        })
+        .collect();
+    doc.put(ROOT, "noise", noise).unwrap();
+    Spi::run("CREATE TEMP TABLE dt (doc automerge)").unwrap();
+    Spi::run_with_args("INSERT INTO dt VALUES ($1::bytea::automerge)", &[doc.save().into()])
+        .unwrap();
+    Spi::connect(|client| {
+        let table = client.select("SELECT doc FROM dt", None, &[]).unwrap().first();
+        let datum = table.get_datum_by_ordinal(1).unwrap().expect("not null");
+        let arg = unsafe {
+            <AutomergeArg as FromDatum>::from_polymorphic_datum(datum, false, pg_sys::InvalidOid)
+        }
+        .unwrap();
+        let size = AutomergeArg::flat_len(datum);
+        assert!(size > 1_000_000, "{size}");
+        // SAFETY: a non-null varlena datum.
+        let raw = unsafe { pgrx::varlena::varsize_any(datum.cast_mut_ptr()) };
+        assert!(raw < size / 2, "not toasted: {raw} of {size} bytes inline");
+
+        let before = current_context_bytes();
+        {
+            let detoasted = arg.detoast();
+            assert_eq!(detoasted.stored().len(), size);
+            let during = current_context_bytes();
+            assert!(during >= before + size, "{before} -> {during}");
+            // Loading works on the bytes in place.
+            let heads = am::stored_heads(detoasted.stored()).unwrap();
+            assert_eq!(heads, doc.get_heads());
+        }
+        let after = current_context_bytes();
+        assert!(after < before + size / 10, "{before} -> {after}: detoasted copy not freed");
+    });
+}

@@ -8,6 +8,9 @@
 //! document without queued (dependency-less) changes.
 
 #![warn(missing_docs)]
+// No unsafe code of its own: all of it is in the pgrx glue (docs/DESIGN.md,
+// "Unsafe code").
+#![forbid(unsafe_code)]
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};

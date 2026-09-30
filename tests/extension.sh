@@ -274,3 +274,25 @@ sql_on "$DB_OWNED" -c "ALTER ROLE $ROLE RESET pg_automerge.max_load_memory" \
         -c "SHOW pg_automerge.max_load_memory" | tail -1)" == -1 ]] \
     || fail "GRANT SET ON PARAMETER did not let $ROLE change max_load_memory"
 sql_on "$DB_OWNED" -c "REVOKE SET ON PARAMETER pg_automerge.max_load_memory FROM $ROLE"
+
+log "misspelled pg_automerge.* settings are removed when the library loads"
+# The library reserves the prefix: a placeholder set before it loaded (here
+# from ALTER DATABASE .. SET, as from postgresql.conf) is removed with a
+# WARNING instead of silently shadowing nothing, and SET of a misspelled
+# name fails once it is loaded.
+sql_on "$DB_OWNED" -c "ALTER DATABASE $DB_OWNED SET pg_automerge.max_load_memroy = '1MB'"
+if out="$(sql_on "$DB_OWNED" -c "SELECT '\\x'::bytea::automerge IS NOT NULL" \
+        -c "SHOW pg_automerge.max_load_memroy" 2>&1)"; then
+    fail "the misspelled setting survived loading the library: $out"
+fi
+grep -q 'invalid configuration parameter name "pg_automerge.max_load_memroy", removing it' <<<"$out" \
+    || fail "no WARNING removing the misspelled setting: $out"
+grep -q 'unrecognized configuration parameter "pg_automerge.max_load_memroy"' <<<"$out" \
+    || fail "unexpected SHOW error: $out"
+if out="$(sql_on "$DB_OWNED" -c "SELECT '\\x'::bytea::automerge IS NOT NULL" \
+        -c "SET pg_automerge.verify_write = off" 2>&1)"; then
+    fail "SET of a misspelled setting succeeded"
+fi
+grep -q 'invalid configuration parameter name "pg_automerge.verify_write"' <<<"$out" \
+    || fail "unexpected SET error: $out"
+sql_on "$DB_OWNED" -c "ALTER DATABASE $DB_OWNED RESET pg_automerge.max_load_memroy"

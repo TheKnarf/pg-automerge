@@ -591,6 +591,13 @@ blocks). Details in [DESIGN.md](docs/DESIGN.md#rich-text-spans) and
 | `pg_automerge.max_load_memory` | `2GB` | superusers, or roles granted `SET` on it; also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Refuse client input and merge results whose estimated load exceeds this (kB, like `work_mem`; `-1`: no limit) |
 | `pg_automerge.verify_writes` | `on` | superusers, or roles granted `SET` on it (`GRANT SET ON PARAMETER pg_automerge.verify_writes TO writer`); also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Load back the normalized save of every value built from client bytes (text input, binary receive, the `bytea` cast, `merge(automerge, bytea)` results) before it is stored or sent |
 
+The `pg_automerge` prefix is reserved: once the library is loaded, a
+misspelled name (`SET pg_automerge.max_load_memroy = ...`) is an error, and
+one set earlier (in `postgresql.conf`, `ALTER SYSTEM`, `ALTER ROLE/DATABASE
+.. SET`) is removed with a `WARNING` naming it, rather than silently
+leaving the real setting at its default. Check the server log for such
+warnings after changing these settings.
+
 `pg_automerge.max_load_memory` protects the server from input that
 describes far more than it holds (see
 [Limitations](#limitations-and-gotchas)). Every value built from client
@@ -731,7 +738,9 @@ Details in
 - `time` is Automerge's commit time in Unix seconds, NULL when unset.
 - `automerge_notify()` checks its arguments when it fires, not at
   `CREATE TRIGGER`: a wrong key column or a BEFORE / statement-level
-  trigger fails the first write. Its channel is used verbatim, like
+  trigger fails the first write. A virtual generated column cannot be a
+  key (a trigger sees NULL in it, so it is refused with `22023`); use a
+  STORED generated column or the columns it is computed from. Its channel is used verbatim, like
   `pg_notify`, while `LISTEN` lower-cases unquoted names: use a lower-case
   channel. On a partitioned table, `table` is the partition.
 - `automerge_changes`, `automerge_changes_bytes` and `automerge_get_change`

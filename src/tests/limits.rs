@@ -425,3 +425,32 @@ fn minus_one_disables_the_limit_but_not_the_bundle_check() {
         }
     }
 }
+
+// The prefix is reserved: a misspelled setting used to be accepted as a
+// placeholder (SHOW gave it back), leaving the real limit at 2 GB.
+#[pg_test]
+fn misspelled_settings_are_rejected() {
+    for stmt in [
+        "SET LOCAL pg_automerge.max_load_memroy = '1MB'",
+        "SET LOCAL pg_automerge.verify_write = off",
+        "SELECT set_config('pg_automerge.nope', 'x', true)",
+    ] {
+        let name = if stmt.starts_with("SELECT") {
+            "pg_automerge.nope"
+        } else {
+            stmt.split_whitespace().nth(2).unwrap()
+        };
+        assert_eq!(
+            sql_error_report(stmt),
+            vec![
+                "42602".to_string(),
+                format!("invalid configuration parameter name \"{name}\""),
+                "\"pg_automerge\" is a reserved prefix.".to_string(),
+                String::new(),
+            ],
+            "{stmt}"
+        );
+    }
+    let shown: String = one("SELECT current_setting('pg_automerge.max_load_memory')", &[]);
+    assert_eq!(shown, "2GB");
+}

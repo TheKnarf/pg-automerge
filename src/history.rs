@@ -114,27 +114,65 @@ fn change_tuple(
     if let Some(bytes) = row.bytes {
         datums.push(bytes.into_datum());
     }
-    let tupdesc = PgTupleDesc::for_composite_type_by_oid(typoid).unwrap_or_else(|| {
-        raise(Error::Internal(format!(
-            "type {typoid:?} is not a composite type"
-        )))
-    });
-    if tupdesc.len() != datums.len() {
-        raise(Error::Internal(format!(
-            "result type has {} attributes, expected {}",
-            tupdesc.len(),
-            datums.len()
-        )));
-    }
-    // SAFETY: the datums are, in order, text, text, int8, int8, int8,
-    // timestamptz, text, text[] and (for automerge_change) bytea, the
-    // attribute types of the types created in `automerge_change_types`;
-    // the count is checked above.
+    let tupdesc = change_tupdesc(typoid, datums.len());
+    // SAFETY: `change_tupdesc` checked that the descriptor has exactly
+    // these attributes, none dropped, of exactly these types: text, text,
+    // int8, int8, int8, timestamptz, text, text[] and (for
+    // automerge_change) bytea, the types of the datums built above.
     unsafe { PgHeapTuple::from_datums(tupdesc, datums) }.unwrap_or_else(|e| {
         raise(Error::Internal(format!(
             "could not build a change row: {e}"
         )))
     })
+}
+
+/// The attribute types of `automerge_change`, in order;
+/// `automerge_change_meta` has all but the last.
+const CHANGE_ATTRIBUTE_TYPES: [pg_sys::Oid; 9] = [
+    pg_sys::TEXTOID,
+    pg_sys::TEXTOID,
+    pg_sys::INT8OID,
+    pg_sys::INT8OID,
+    pg_sys::INT8OID,
+    pg_sys::TIMESTAMPTZOID,
+    pg_sys::TEXTOID,
+    pg_sys::TEXTARRAYOID,
+    pg_sys::BYTEAOID,
+];
+
+/// The row descriptor of the composite type `typoid`, checked to be
+/// exactly the first `natts` of [`CHANGE_ATTRIBUTE_TYPES`], none dropped
+/// (XX000 otherwise).
+///
+/// `heap_form_tuple` reads each datum as its attribute's type, so a type
+/// whose owner changed an attribute (`ALTER TYPE automerge_change ALTER
+/// ATTRIBUTE seq TYPE text`) would have an `int8` read as a pointer and
+/// crash the backend. The descriptor checked is the one the row is built
+/// with, so nothing can change in between.
+fn change_tupdesc(typoid: pg_sys::Oid, natts: usize) -> PgTupleDesc<'static> {
+    let tupdesc = PgTupleDesc::for_composite_type_by_oid(typoid).unwrap_or_else(|| {
+        raise(Error::Internal(format!(
+            "type {typoid:?} is not a composite type"
+        )))
+    });
+    let expected = &CHANGE_ATTRIBUTE_TYPES[..natts];
+    let matches = tupdesc.len() == natts
+        && tupdesc
+            .iter()
+            .zip(expected)
+            .all(|(att, &typ)| !att.attisdropped && att.atttypid == typ);
+    if !matches {
+        let name = if natts == CHANGE_ATTRIBUTE_TYPES.len() {
+            "automerge_change"
+        } else {
+            "automerge_change_meta"
+        };
+        raise(Error::Internal(format!(
+            "type {name} has been altered: its attributes must be those created by \
+             extension pg_automerge"
+        )));
+    }
+    tupdesc
 }
 
 /// Every change of `doc` not reachable from `since_heads` (all of them for

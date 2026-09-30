@@ -177,18 +177,24 @@ impl AutomergeArg {
         }
     }
 
-    /// The whole value for the rest of the call: a flat value detoasted (and
-    /// copied) once, an expanded one used in place.
+    /// The whole value for the rest of the call: a flat value detoasted
+    /// once (not copied again), an expanded one used in place.
     pub(crate) fn detoast(&self) -> Detoasted<'_> {
         match self {
-            // SAFETY: a non-null varlena datum of this call.
-            Self::Flat(datum) => Detoasted::Flat {
-                datum: *datum,
-                bytes: unsafe {
-                    Vec::<u8>::from_polymorphic_datum(*datum, false, pg_sys::InvalidOid)
+            Self::Flat(datum) => {
+                // SAFETY: a non-null, non-expanded varlena datum of this
+                // call. The result is the datum itself (inline, not
+                // compressed) or a fresh palloc'd copy, which `Detoasted`
+                // frees when dropped.
+                let varlena = unsafe {
+                    pg_sys::pg_detoast_datum_packed(datum.cast_mut_ptr::<pg_sys::varlena>())
+                };
+                Detoasted::Flat {
+                    datum: *datum,
+                    varlena,
+                    _borrow: std::marker::PhantomData,
                 }
-                .expect("not null"),
-            },
+            }
             Self::Expanded { datum, .. } => Detoasted::Expanded {
                 datum: *datum,
                 doc: self.loaded().expect("expanded"),
@@ -333,10 +339,15 @@ impl AutomergeArg {
 /// An argument's whole value for the rest of a call (see
 /// [`AutomergeArg::detoast`]).
 pub(crate) enum Detoasted<'a> {
-    /// A flat value: its datum and its detoasted stored bytes.
+    /// A flat value: its datum and its detoasted varlena (the datum itself
+    /// when it was neither compressed nor out of line, otherwise a palloc'd
+    /// copy owned by this value and freed when it is dropped). The stored
+    /// bytes are read in place, not copied into Rust memory: a flat
+    /// argument costs its size once, not twice.
     Flat {
         datum: pg_sys::Datum,
-        bytes: Vec<u8>,
+        varlena: *mut pg_sys::varlena,
+        _borrow: std::marker::PhantomData<&'a ()>,
     },
     /// An expanded value: its datum and its document.
     Expanded {
@@ -345,11 +356,27 @@ pub(crate) enum Detoasted<'a> {
     },
 }
 
+impl Drop for Detoasted<'_> {
+    fn drop(&mut self) {
+        if let Self::Flat { datum, varlena, .. } = *self
+            && varlena != datum.cast_mut_ptr::<pg_sys::varlena>()
+            // While unwinding from an ERROR, leave it to the memory context
+            // reset: the abort frees it, and nothing that can fail runs.
+            && !std::thread::panicking()
+        {
+            // SAFETY: the fresh copy made by `pg_detoast_datum_packed` in
+            // `AutomergeArg::detoast`; every borrow of it (through
+            // `stored`/`input`, tied to `&self`) has ended.
+            unsafe { pg_sys::pfree(varlena.cast()) };
+        }
+    }
+}
+
 impl Detoasted<'_> {
     /// The value as a core [`Input`].
     pub(crate) fn input(&self) -> Input<'_> {
         match self {
-            Self::Flat { bytes, .. } => Input::Stored(bytes),
+            Self::Flat { .. } => Input::Stored(self.stored()),
             Self::Expanded { doc, .. } => Input::Loaded(doc),
         }
     }
@@ -358,7 +385,14 @@ impl Detoasted<'_> {
     /// save (computed once and cached in the object).
     pub(crate) fn stored(&self) -> &[u8] {
         match self {
-            Self::Flat { bytes, .. } => bytes,
+            // SAFETY: a detoasted varlena (inline, 1- or 4-byte header),
+            // alive until `self` is dropped.
+            Self::Flat { varlena, .. } => unsafe {
+                std::slice::from_raw_parts(
+                    pgrx::varlena::vardata_any(*varlena).cast::<u8>(),
+                    pgrx::varlena::varsize_any_exhdr(*varlena),
+                )
+            },
             Self::Expanded { doc, .. } => doc.stored().or_raise(),
         }
     }

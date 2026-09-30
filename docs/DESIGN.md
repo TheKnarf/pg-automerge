@@ -714,6 +714,14 @@ size of the document's history) until the scan ends; in `FROM`, Postgres
 additionally materializes the rows in a tuplestore (spilling to disk past
 `work_mem`). Rows are built with the function's declared result type
 (looked up by the function's OID), so they do not depend on `search_path`.
+The descriptor each row is built with is checked first: exactly the
+attributes the extension created, none dropped, of exactly their types
+(text, text, bigint ×3, timestamptz, text, text[], and bytea). The types'
+owner can `ALTER TYPE automerge_change ALTER ATTRIBUTE seq TYPE text`, and
+`heap_form_tuple` would then read the `bigint` datum as a text pointer and
+crash the backend; an altered type is `XX000` (`type automerge_change has
+been altered: its attributes must be those created by extension
+pg_automerge`) instead.
 
 ### Change notifications
 
@@ -808,8 +816,14 @@ Argument checks, when the trigger fires (Postgres does not validate
 trigger arguments at `CREATE TRIGGER`): not `AFTER` or not `FOR EACH ROW` →
 `39P01` (trigger protocol violated), and so is calling
 `automerge_notify()` outside a trigger; fewer than two arguments, an empty
-channel or one of 64 bytes or more, a key column listed twice or of type
-`automerge` → `22023`; an unknown key column → `42703`. Errors about how
+channel or one of 64 bytes or more, a key column listed twice, of type
+`automerge` or a virtual generated column → `22023`; an unknown key column
+→ `42703`. A virtual generated column (PG18) is computed when read and not
+stored, so the rows an AFTER trigger sees hold NULL in it; reporting that
+NULL as the key would leave a listener unable to find the row, so it is
+refused (HINT: name a STORED generated column or the columns it is
+computed from). A STORED generated column is computed before AFTER
+triggers fire and works as a key. Errors about how
 the trigger is declared carry a HINT with the correct `CREATE TRIGGER`
 (an `automerge` key column, a HINT on which columns to name). These
 errors fail the write, as trigger errors do. The channel is used verbatim,
@@ -1517,6 +1531,15 @@ Like `verify_writes`, only the library defines it: `SHOW` works once the
 library is loaded, and `SET` before that leaves a placeholder that
 Postgres checks when the library loads.
 
+`_PG_init` reserves the `pg_automerge` prefix (`MarkGUCPrefixReserved`,
+which pgrx does not call): a misspelled name such as
+`pg_automerge.max_load_memroy` is an error (`42602`, `"pg_automerge" is a
+reserved prefix.`) once the library is loaded, and a placeholder set before
+it loaded (from `postgresql.conf`, `ALTER SYSTEM`, `ALTER ROLE/DATABASE ..
+SET` or a `SET` in the session) is removed with a WARNING when it loads.
+Without that, a typo was accepted silently and the real setting kept its
+default.
+
 It bounds an *estimate* of the peak memory of one load (or merge), in
 bytes. One setting, not separate caps on operations, changes or actors:
 memory has a changes × actors term, and the same operation costs 5 to 10
@@ -1960,7 +1983,7 @@ array elements, trigger usage, jsonb limits) are built there directly.
 | `42703` undefined_column | `automerge_notify()` key column that does not exist | `automerge_notify(): key column "x" does not exist in table ...` |
 | `53400` configuration_limit_exceeded | Client input, changes a merge applies, or a merge result whose estimated load exceeds `pg_automerge.max_load_memory` (see [Resource limits](#resource-limits)) | `estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (2048 MB)`, `estimated memory to load merged automerge document exceeds ...`, `estimated memory for applying automerge changes exceeds ...` (DETAIL: `Loading it could take up to N MB (X operations, Y changes, Z actors, B bytes uncompressed).`, "at least" when the scan stopped early; HINT: `A superuser can raise "pg_automerge.max_load_memory".`) |
 | `54000` program_limit_exceeded | A document nested deeper than 1000 levels, or with more elements, pairs or a longer string than jsonb allows, read as jsonb; a text block nested deeper than 32 levels read with `automerge_spans` | `automerge document is nested more than 1000 levels deep`, `automerge text block is nested more than 32 levels deep`, `number of jsonb array elements exceeds the maximum allowed (N)`, `string too long to represent as jsonb string` (DETAIL, as jsonb's) |
-| `XX000` internal_error | A stored value that does not load (corruption, or a value stored with `pg_automerge.verify_writes` off that does not survive a save and load), broken invariants (bugs) | `corrupt stored automerge value: ...`, `automerge failed on a stored value: ...`, others naming the invariant |
+| `XX000` internal_error | A stored value that does not load (corruption, or a value stored with `pg_automerge.verify_writes` off that does not survive a save and load), broken invariants (bugs), `automerge_change`/`automerge_change_meta` altered by their owner | `corrupt stored automerge value: ...`, `automerge failed on a stored value: ...`, others naming the invariant |
 
 ### Why `22000` for a reused actor id
 
@@ -2206,10 +2229,15 @@ What costs a load, per call:
   unchanged argument or a new expanded object, e.g. the `bytea` cast's).
 - `AutomergeArg` is not detoasted up front: the heads fast path fetches a
   prefix with `pg_detoast_datum_slice`, and `AutomergeArg::detoast()`
-  returns a `Detoasted` guard holding either the datum and the detoasted
-  bytes of a flat value (fetched once per call and used as the core
-  `Input`; an unchanged result is the original datum, not the bytes) or
-  the loaded document of an expanded one. Neither outlives the call.
+  returns a `Detoasted` guard holding either the datum and its detoasted
+  varlena (`pg_detoast_datum_packed`: the datum itself when inline and
+  uncompressed, else a palloc'd copy the guard frees when dropped; its
+  bytes are the core `Input`, read in place; an unchanged result is the
+  original datum) or the loaded document of an expanded one. Neither
+  outlives the call. (Until 0.2.0 the bytes were copied again into a Rust
+  `Vec` and the palloc'd copy stayed until the per-call context reset, so
+  a flat argument held about twice its size; a pg_test measures the
+  context before and after.)
   `merge`, `merge(automerge, bytea)` and `automerge_contains` first decide
   what they can from the heads (a prefix of a flat value), before
   anything is detoasted.
@@ -2253,6 +2281,48 @@ What costs a load, per call:
   `pg_automerge.max_load_memory` likewise (`budget::set_limit_source`,
   read as bytes by `budget::limit` at every check; the core alone, as in
   its tests, uses the 2 GB default).
+
+## Unsafe code
+
+All `unsafe` is in the pgrx glue (`src/`); the core crate has none of its
+own. Every Postgres function called from Rust goes through pgrx's
+`pg_guard_ffi_boundary` (the generated `pg_sys` bindings, and explicitly
+for the two hand-declared `jsonfuncs.h` functions), so an ERROR inside
+becomes a Rust panic that unwinds through Rust frames (destructors run)
+and is re-raised at the function's `#[pg_guard]` boundary; every callback
+Postgres calls (the expanded-object methods, the memory-context reset
+callback, the trigger entry point) is `#[pg_guard]` or wrapped in
+`pgrx_extern_c_guard`. Automerge calls run under the core's
+`catch_unwind` guard, which turns Automerge's panics into errors and
+passes pgrx's ERROR panics on untouched (they have a non-`String`
+payload). Each area and the invariant it relies on:
+
+| Area | What is unsafe | Invariant relied on |
+|---|---|---|
+| `datum.rs`: `AutomergeArg` | Reading a `Datum` as a varlena or expanded pointer | pgrx calls it with a non-null datum of type `automerge` (functions are `STRICT`; the trigger passes only non-null column values). The 1B_E tag is read before anything else, and an expanded object counts as ours only if its `eoh_methods` pointer is our method table; any other is flat (flattened by its own methods). |
+| `datum.rs`: `flat_prefix`, `flat_len` | `pg_detoast_datum_slice`, `toast_raw_datum_size` | Only on flat (non-expanded) datums. The slice is always a fresh palloc'd copy in PG18 (`detoast_attr_slice`), copied out and freed only when it is not the input. |
+| `datum.rs`: `Detoasted` | A `&[u8]` into a detoasted varlena | `pg_detoast_datum_packed` returns the datum itself or a fresh palloc'd copy; the slice borrows the guard, which frees the copy (not the datum) when dropped, after every borrow has ended. While unwinding it leaves the copy to the context reset. |
+| `datum.rs`: `automerge_type_in` | `GetSysCacheOid(TYPENAMENSP, ..)` with a C-string key | The same call pattern as PG's `TypenameGetTypid`; a NUL-terminated literal. |
+| `expanded.rs` | Creating, reading, replacing and flattening the expanded object | The object lives in its own memory context; the `Box<LoadedDoc>` is moved in only after every fallible allocation, and the reset callback (in the object's own chunk) drops it exactly once. The document is replaced only through a read-write pointer (`with_result`), after the caller's last read of it, with a document built completely beforehand, so a failure leaves it untouched. `get_flat_size` and `flatten_into` agree because the save is cached only on success and re-checked. |
+| `merge.rs`: support function | Walking the planner's `SupportRequestModifyInPlace` node | Node tags are checked before each cast; only a top-level `PARAM_EXTERN` with the requested `paramid` is returned (PG18 `List` layout). |
+| `merge.rs`: `merge_agg` state | `Internal` state as a `MergeAccumulator` | The state is created only by the transition function, in `AggCheckCallContext`'s context, with a drop-on-reset callback; `internal` cannot be built from SQL, so no other value reaches these functions. |
+| `jsonb.rs` | Building a `JsonbValue` tree and `JsonbValueToJsonb` | Arrays are boxed slices (addresses stable when the vectors grow) and strings live in an arena whose chunks never reallocate; all of it outlives `JsonbValueToJsonb`, which copies everything. Counts are bounded by jsonb's own limits before they are built. |
+| `history.rs`: `change_tuple` | `heap_form_tuple` via `PgHeapTuple::from_datums` | The descriptor the row is built with is checked first: exactly the attributes created by the extension, none dropped, each of exactly its type (`XX000` otherwise). pgrx checks only the count, and an owner can `ALTER TYPE .. ALTER ATTRIBUTE`. |
+| `notify.rs`: trigger | `TriggerData`, the relation's `TupleDesc`, `heap_getattr`, raw datum comparisons | `PgTrigger::from_fcinfo` checks `CALLED_AS_TRIGGER`; the relation is open and locked for the call; dropped columns are skipped; raw comparisons are only between non-null values of the same attribute (by value, fixed length, or varlena bytes / TOAST pointer). Virtual generated columns are not stored and are refused as keys. |
+| `notify.rs`: `json_categorize_type`, `datum_to_json`, `Async_Notify` | Hand-declared C functions | Signatures match PG 18.6's `utils/jsonfuncs.h` (the enum passed as `c_int`); called inside `pg_guard_ffi_boundary`. Channel and payload are NUL-free `CString`s within `NAMEDATALEN` and the 8000-byte payload limit. |
+| `io.rs`: `automerge_recv` | Reading the `StringInfo` | Postgres passes a valid buffer; the rest of it is consumed and copied before it is used. |
+| `lib.rs`: `_PG_init` | `MarkGUCPrefixReserved` | A NUL-terminated literal, copied by Postgres. |
+
+What `unsafe` cannot protect against, by design: a Rust stack overflow or
+a failed Rust allocation aborts the backend, and Postgres then restarts
+every session. They are prevented, not caught: the jsonb walk is iterative
+with a 1000-level limit, Automerge never renders blocks (see
+[Deep blocks](#deep-blocks)), and client input is priced before it is
+loaded (see [Resource limits](#resource-limits)). A new use of a recursive
+Automerge API needs the same gating. pgrx internals relied on
+(`pgrx_extern_c_guard`, the callconv traits, ERROR panics with a
+non-`String` payload, `SetOfIterator`'s memory context) are re-checked
+whenever the pinned pgrx version changes.
 
 ## Testing
 
@@ -2329,7 +2399,8 @@ What costs a load, per call:
   dependent objects, a dump and restore of the moved extension, a
   non-superuser's refused `CREATE EXTENSION`, and
   `pg_automerge.verify_writes` and `pg_automerge.max_load_memory` staying
-  superuser-only.
+  superuser-only, and misspelled `pg_automerge.*` settings being removed
+  when the library loads (the prefix is reserved).
 - `tests/limits.sh` (`mise run limits`, part of `mise run test`): the load
   memory limit against a real crash, in a scratch cluster whose address
   space is capped (see [Resource limits](#resource-limits)), and a

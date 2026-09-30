@@ -78,6 +78,9 @@ struct Attr {
     typoid: pg_sys::Oid,
     byval: bool,
     len: i16,
+    /// A virtual generated column: computed when read, never stored, so
+    /// the rows a trigger sees have NULL in it.
+    virtual_generated: bool,
 }
 
 /// Whether two values of column `att` are certainly equal because their
@@ -333,6 +336,16 @@ fn resolve_columns(trigger: &PgTrigger<'_>, key_names: &[String]) -> (Vec<Attr>,
             );
         }
         if let Some(i) = others.iter().position(|a| &a.name == name) {
+            if others[i].virtual_generated {
+                bad_key(
+                    PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                    format!("\"{name}\" is a virtual generated column"),
+                    Some(
+                        "Its value is not stored, so the rows a trigger sees have NULL in it; \
+                         name a STORED generated column or the columns it is computed from.",
+                    ),
+                );
+            }
             keys.push(others.swap_remove(i));
         } else if automerge.iter().any(|a| &a.name == name) {
             bad_key(
@@ -377,6 +390,7 @@ fn live_columns(trigger: &PgTrigger<'_>) -> Vec<Attr> {
                 typoid: att.atttypid,
                 byval: att.attbyval,
                 len: att.attlen,
+                virtual_generated: att.attgenerated as u8 == pg_sys::ATTRIBUTE_GENERATED_VIRTUAL,
             })
         })
         .collect()
