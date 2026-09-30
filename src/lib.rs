@@ -13,11 +13,14 @@
 //! - `history`: the change types and history functions.
 //! - `notify`: the `automerge_notify()` trigger.
 //! - `spans`: `automerge_spans`, the structure of a text object.
+//! - `alloc`: the counting global allocator.
+//! - `memory`: `automerge_memory_usage()` and `automerge_memory_reset()`.
 
 // A cdylib: its docs are for developers (built with
 // --document-private-items), so links to private items are fine.
 #![allow(rustdoc::private_intra_doc_links)]
 
+mod alloc;
 pub mod datum;
 mod error;
 pub mod expanded;
@@ -25,11 +28,18 @@ mod history;
 mod introspect;
 mod io;
 mod jsonb;
+mod memory;
 mod merge;
 mod notify;
 mod spans;
 
 ::pgrx::pg_module_magic!(name, version);
+
+/// Every Rust allocation of the library goes through the system allocator
+/// and is counted, for `automerge_memory_usage()` (docs/DESIGN.md, "Memory
+/// observability").
+#[global_allocator]
+static ALLOCATOR: alloc::Counting = alloc::Counting;
 
 /// `pg_automerge.verify_writes`: whether values built from client input
 /// are loaded back once before they are stored or sent (see

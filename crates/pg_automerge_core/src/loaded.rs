@@ -16,8 +16,6 @@
 
 use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
-#[cfg(feature = "test-hooks")]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use automerge::{Automerge, Change, ChangeHash};
 
@@ -29,15 +27,10 @@ use crate::{
     stored_heads_unguarded, verification_enabled,
 };
 
-/// Number of [`LoadedDoc`]s alive in this process (for leak tests).
-#[cfg(feature = "test-hooks")]
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-/// How many [`LoadedDoc`]s exist right now in this process (only with the
-/// `test-hooks` feature, which the extension's pg_tests enable).
-#[cfg(feature = "test-hooks")]
+/// How many documents exist right now in this process: [`LoadedDoc`]s
+/// and `merge_agg` states (see [`crate::stats`]; for leak tests).
 pub fn live_count() -> usize {
-    LIVE.load(Ordering::Relaxed)
+    crate::stats::snapshot().live_documents
 }
 
 /// A loaded document and its lazily computed stored bytes.
@@ -64,13 +57,8 @@ pub struct LoadedDoc {
     /// Whether `doc` has blocks ([`crate::blocks::has_blocks`]), once
     /// known.
     blocks: OnceCell<bool>,
-}
-
-#[cfg(feature = "test-hooks")]
-impl Drop for LoadedDoc {
-    fn drop(&mut self) {
-        LIVE.fetch_sub(1, Ordering::Relaxed);
-    }
+    /// Counts it as a live document ([`crate::stats`]).
+    _live: crate::stats::Live,
 }
 
 impl LoadedDoc {
@@ -81,8 +69,6 @@ impl LoadedDoc {
         if let Some(bytes) = stored {
             let _ = cell.set(bytes);
         }
-        #[cfg(feature = "test-hooks")]
-        LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             doc,
             heads,
@@ -91,6 +77,7 @@ impl LoadedDoc {
             counts: OnceCell::new(),
             save: RefCell::new(None),
             blocks: OnceCell::new(),
+            _live: crate::stats::Live::new(),
         }
     }
 

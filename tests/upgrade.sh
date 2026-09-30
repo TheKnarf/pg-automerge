@@ -25,11 +25,13 @@
 #      version, check the documents still read the same (bytes, heads, the
 #      cast, the generated column, the view, the SQL function), the indexes
 #      are valid, used and agree with a sequential scan, the trigger sends
-#      its notification, and automerge_spans works;
+#      its notification, and automerge_spans and automerge_memory_usage
+#      work;
 #   4. the same update of an extension relocated (SET SCHEMA) before it:
 #      every member ends up in its schema; and, for a version without
-#      automerge_spans, that the update fails instead of adopting a user's
-#      function of the same signature in the extension's schema.
+#      automerge_spans or automerge_memory_usage, that the update fails
+#      instead of adopting or replacing a user's function of the same
+#      signature in the extension's schema.
 #
 # The current version must have a snapshot, and every upgrade script must
 # be installed byte for byte as in sql/.
@@ -214,6 +216,10 @@ SQL
         fail "$label: automerge_spans of the deep block did not fail"
     fi
     grep -q 'nested more than 32 levels deep' <<<"$out" || fail "$label: automerge_spans of the deep block: $out"
+    # The memory counters (0.3.0) count this session's loads.
+    [[ "$(sql -c "SELECT count(*) FROM docs WHERE doc::jsonb IS NOT NULL" \
+        -c "SELECT loads > 0 AND live_documents = 0 AND peak_allocated_bytes >= allocated_bytes FROM automerge_memory_usage()" | tail -1)" == t ]] \
+        || fail "$label: automerge_memory_usage after the update"
 
     # Relocated before the update: the new objects go to the extension's
     # current schema, every member stays together.
@@ -233,8 +239,9 @@ SQL
             SELECT pronamespace AS nsp FROM pg_proc JOIN m ON classid = 'pg_proc'::regclass AND objid = pg_proc.oid
             UNION ALL SELECT typnamespace FROM pg_type JOIN m ON classid = 'pg_type'::regclass AND objid = pg_type.oid
             UNION ALL SELECT oprnamespace FROM pg_operator JOIN m ON classid = 'pg_operator'::regclass AND objid = pg_operator.oid) s" \
-        -c "SELECT am2.automerge_spans(''::bytea::am2.automerge, '{missing}') IS NULL")"
-    [[ "$out" == $'am2\nt' ]] || fail "$label: relocated update: $out"
+        -c "SELECT am2.automerge_spans(''::bytea::am2.automerge, '{missing}') IS NULL" \
+        -c "SELECT count(*) FROM am2.automerge_memory_usage()")"
+    [[ "$out" == $'am2\nt\n1' ]] || fail "$label: relocated update: $out"
 
     # A function of the new signature that already exists in the
     # extension's schema is not adopted: the update fails and leaves the
@@ -248,6 +255,21 @@ SQL
             fail "$label: the update adopted a user's automerge_spans"
         fi
         grep -q 'is not a member of extension "pg_automerge"' <<<"$out" || fail "$label: update over a user's automerge_spans: $out"
+        [[ "$(sql_on "$DB_REL" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")" == "$old" ]] \
+            || fail "$label: a failed update changed the version"
+    fi
+    # The same for automerge_memory_usage (plain CREATE FUNCTION: the
+    # update fails on the existing function).
+    if ! grep -q 'automerge_memory_usage' "$snapshot"; then
+        log "  $label: a user's automerge_memory_usage in the extension's schema"
+        sql_on "$DB_REL" -c "DROP EXTENSION pg_automerge CASCADE" -c "DROP SCHEMA IF EXISTS am1, am2 CASCADE" \
+            -c "CREATE EXTENSION pg_automerge VERSION '$old'" \
+            -c "CREATE FUNCTION automerge_memory_usage() RETURNS TABLE (allocated_bytes bigint) LANGUAGE sql AS 'SELECT 0::bigint'"
+        if out="$(sql_on "$DB_REL" -c "ALTER EXTENSION pg_automerge UPDATE" 2>&1)"; then
+            fail "$label: the update replaced a user's automerge_memory_usage"
+        fi
+        grep -q 'function "automerge_memory_usage" already exists' <<<"$out" \
+            || fail "$label: update over a user's automerge_memory_usage: $out"
         [[ "$(sql_on "$DB_REL" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")" == "$old" ]] \
             || fail "$label: a failed update changed the version"
     fi

@@ -23,6 +23,7 @@ include!("loads.rs");
 include!("limits.rs");
 include!("spans.rs");
 include!("blocks.rs");
+include!("memory.rs");
 
 fn actor(n: u8) -> ActorId {
     ActorId::from([n; 16])

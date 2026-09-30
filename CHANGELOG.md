@@ -7,11 +7,30 @@ takes an installed one to the library's version; see the README's
 says whether an update needs more than recreating the container (or
 installing the package) and `ALTER EXTENSION pg_automerge UPDATE`.
 
-## Unreleased
+## 0.3.0 (unreleased)
 
-Upgrade: none beyond installing the new library (or recreating the
-container); no SQL object changes, so no `ALTER EXTENSION .. UPDATE`. The
-fixes take effect as soon as a backend loads the new library.
+Upgrade: `ALTER EXTENSION pg_automerge UPDATE` from 0.2.0
+(`sql/pg_automerge--0.2.0--0.3.0.sql`; from 0.1.0 it runs both scripts in
+one step). It only adds the two functions below: no `REINDEX`, no rewrite
+of generated columns, every function returns what it returned in 0.2.0,
+and the stored format is unchanged. The fixes take effect as soon as a
+backend loads the new library, before the `UPDATE`. With compose, set a
+`build:` section's `PG_AUTOMERGE_VERSION` arg to 0.3.0 (the README's
+[Updating](README.md#updating)).
+
+Added:
+
+- **`automerge_memory_usage()`**: the memory pg_automerge holds in the
+  current backend outside Postgres' memory contexts, which
+  `pg_backend_memory_contexts` and `work_mem` do not see: bytes held now
+  and at peak (exact, from a counting allocator), loaded documents alive,
+  and the number and total time of Automerge loads. And
+  `automerge_memory_reset()`, which restarts the peak and the load
+  counters, to measure one statement. Per backend; see the README's
+  [Monitoring](README.md#monitoring). The allocator costs about 1 ns per
+  allocation: not measurable in `mise run bench-sql` (reads, writes,
+  merges, `merge_agg`), and at most a few percent in the Rust-level
+  benchmark of the allocation-heaviest jsonb walk.
 
 Fixed:
 

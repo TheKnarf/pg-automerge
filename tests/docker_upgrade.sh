@@ -20,14 +20,17 @@
 #      catalog on the new library) and every document reads the same; the
 #      2,000-level deep block, which crashes the released 0.1.0 library in
 #      a generated doc::jsonb column, is stored fine already;
-#   3. ALTER EXTENSION pg_automerge UPDATE: 0.2.0; the documents, the view
+#   3. ALTER EXTENSION pg_automerge UPDATE to the current version (0.1.0
+#      -> 0.2.0 -> ..., every script in one step); the documents, the view
 #      and the generated column read the same; the indexes are valid, used
 #      and agree with a sequential scan; the trigger sends its
-#      notification; automerge_spans works (54000 on the deep block); the
+#      notification; automerge_spans works (54000 on the deep block), and
+#      so does automerge_memory_usage() (0.3.0); the
 #      extension's catalog (tests/catalog.sql) is that of a fresh CREATE
 #      EXTENSION in the same container; no server log shows a crash.
 #
-# The README's compose steps ("From 0.1.0 to 0.2.0 with compose") are
+# The README's compose steps (the "From ... to <current> with compose"
+# section that names 0.1.0) are
 # followed as written: the cluster's superuser is not postgres (POSTGRES_USER
 # is the app's, as in skjera's compose.yml, so there is no postgres role),
 # the pg_dump of step 1 and the psql commands of step 5 are read from the
@@ -103,8 +106,8 @@ if grep -q automerge_spans "$DWORK/old.sql"; then OLD_HAS_SPANS=f; else OLD_HAS_
 
 # The README's compose steps, as shell commands: [0] the pg_dump of step 1,
 # [1] the ALTER EXTENSION and [2] the version check of step 5.
-section="$(sed -n "/^\*\*From $OLD_VERSION to $VERSION with compose\*\*/,/^There is no downgrade script/p" README.md)"
-[[ -n "$section" ]] || fail "README.md has no section \"From $OLD_VERSION to $VERSION with compose\""
+section="$(sed -n "/^\*\*From .*$OLD_VERSION.* to $VERSION with compose\*\*/,/^There is no downgrade script/p" README.md)"
+[[ -n "$section" ]] || fail "README.md has no section \"From ... $OLD_VERSION ... to $VERSION with compose\""
 mapfile -t README_CMDS < <(grep -o 'docker compose exec [^`]*' <<<"$section")
 expect "README compose commands" 3 "${#README_CMDS[@]}"
 # readme_cmd NAME I: run README_CMDS[I] against container NAME, in DWORK.
@@ -247,6 +250,11 @@ if out="$(psql_in new app -v VERBOSITY=verbose -c "SELECT automerge_spans(doc, '
     fail "automerge_spans of the deep block did not fail"
 fi
 grep -q 'ERROR:  54000: automerge text block is nested more than 32 levels deep' <<<"$out" || fail "automerge_spans of the deep block: $out"
+
+log "automerge_memory_usage() after the UPDATE"
+expect "memory counters of a session that read documents" "t" \
+    "$(psql_in new app -c "SELECT count(*) FROM docs WHERE id <> 6 AND doc::jsonb IS NOT NULL" \
+        -c "SELECT loads > 0 AND live_documents = 0 AND peak_allocated_bytes >= allocated_bytes FROM automerge_memory_usage()" | tail -1)"
 
 log "the updated catalog is a fresh install's (tests/catalog.sql)"
 psql_in new postgres -c "CREATE DATABASE fresh"

@@ -27,6 +27,7 @@ pub mod json;
 pub mod loaded;
 pub mod notify;
 pub mod spans;
+pub mod stats;
 
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
@@ -464,12 +465,12 @@ pub fn verification_enabled() -> bool {
     VERIFICATION_CHECK.get().is_none_or(|check| check())
 }
 
-/// `Automerge::load`, counted for the tests (see `test_hooks::loads`,
-/// feature `test-hooks`).
+/// `Automerge::load`, counted and timed ([`stats`]; and for the tests,
+/// `test_hooks::loads` with the feature `test-hooks`).
 pub(crate) fn load_bytes(bytes: &[u8]) -> Result<Automerge, AutomergeError> {
     #[cfg(feature = "test-hooks")]
     test_hooks::count_load();
-    Automerge::load(bytes)
+    stats::timed_load(|| Automerge::load(bytes))
 }
 
 /// The safeguard of [`normalize`] for a document built from external
@@ -795,6 +796,8 @@ struct AccDoc {
     counts: Option<budget::DocCounts>,
     /// A save of it made to count it, while nothing has been added.
     save: Option<Vec<u8>>,
+    /// Counts it as a live document ([`stats`]).
+    _live: stats::Live,
 }
 
 impl AccDoc {
@@ -806,6 +809,7 @@ impl AccDoc {
             unverified: input.is_unverified(),
             counts: input.known_counts(),
             save: None,
+            _live: stats::Live::new(),
         }
     }
 
@@ -817,6 +821,7 @@ impl AccDoc {
             unverified: false,
             counts: None,
             save: None,
+            _live: stats::Live::new(),
         }
     }
 

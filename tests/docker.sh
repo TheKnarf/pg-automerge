@@ -55,7 +55,8 @@
 #     tools, PG_CONFIG's or by default pgrx's, and cargo): the regress
 #     examples (pg_regress --use-existing, the same expected output as
 #     `mise run regress`), and concurrency.sh,
-#     notify.sh, dump.sh and extension.sh in tests/lib.sh's external mode,
+#     notify.sh, dump.sh, extension.sh and memory.sh in tests/lib.sh's
+#     external mode,
 #     against one container; limits.sh in its container mode against a
 #     container started with --memory (no swap): without the limit the
 #     crafted inputs get the backend OOM-killed and the cluster restarts,
@@ -463,7 +464,7 @@ if [[ "${DOCKER_TEST_SUITES:-1}" == 1 ]]; then
         cat "$DWORK/regress.log" "$DWORK/regress/regression.diffs" >&2 || true
         fail "regress examples"
     fi
-    for suite in concurrency notify dump extension; do
+    for suite in concurrency notify dump extension memory; do
         log "tests/$suite.sh"
         env "${ENV[@]}" bash "tests/$suite.sh" >"$DWORK/$suite.log" 2>&1 \
             || { cat "$DWORK/$suite.log" >&2; fail "tests/$suite.sh against the container"; }

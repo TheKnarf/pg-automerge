@@ -1,6 +1,6 @@
 [package]
 name = "pg_automerge_core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -11,8 +11,8 @@ categories = ["database"]
 publish = false
 
 [features]
-# Instrumentation for tests: loaded::live_count() and the test_hooks
-# module. The core's own tests enable it through the dev-dependency below.
+# Instrumentation for tests: the test_hooks module. The core's own tests
+# enable it through the dev-dependency below.
 test-hooks = []
 
 [dependencies]

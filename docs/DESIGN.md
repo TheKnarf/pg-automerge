@@ -9,6 +9,7 @@ Contents: [Scope](#scope) · [Architecture](#architecture) ·
 [The `automerge` type](#the-automerge-type) ·
 [SQL API and semantics](#sql-api-and-semantics) ·
 [jsonb mapping](#jsonb-mapping) · [Resource limits](#resource-limits) ·
+[Memory observability](#memory-observability) ·
 [Error codes](#error-codes) ·
 [Performance](#performance) · [Implementation notes](#implementation-notes) ·
 [Testing](#testing) ·
@@ -101,8 +102,10 @@ Two crates:
   before Automerge allocates (`budget`, see
   [Resource limits](#resource-limits)), the history functions
   (`history`), the jsonb mapping as a walk into a `JsonSink` (`json`), the
-  notification payload builder (`notify`), text encodings (`encoding`) and,
-  with the `test-hooks` feature, test instrumentation (`test_hooks`).
+  notification payload builder (`notify`), text encodings (`encoding`),
+  the counters of live documents and loads (`stats`, see
+  [Memory observability](#memory-observability)) and, with the
+  `test-hooks` feature, test instrumentation (`test_hooks`).
   Every Automerge call runs under a panic guard (see
   [Errors](#errors-and-panics)).
 - The root crate (`src/`): the pgrx glue, one module per SQL area:
@@ -111,8 +114,10 @@ Two crates:
   I/O functions and casts), `merge.rs` (`merge`, `||`, `merge_agg`, the
   support function), `introspect.rs` (`automerge_heads`,
   `automerge_contains`), `history.rs`, `notify.rs` (the trigger),
-  `jsonb.rs` (building jsonb from the core's walk) and `error.rs` (raising
-  errors). The glue converts datums, calls the core,
+  `jsonb.rs` (building jsonb from the core's walk), `error.rs` (raising
+  errors), and `alloc.rs` (the counting global allocator) with
+  `memory.rs` (`automerge_memory_usage`, `automerge_memory_reset`). The
+  glue converts datums, calls the core,
   and raises core errors with their SQLSTATE.
 
 Data flow:
@@ -956,7 +961,9 @@ Where it does not:
   (`TransferExpandedObject` when PL/pgSQL keeps it in a variable). The
   Rust document is dropped by a reset callback registered on that
   context, so it lives exactly as long as the object. The Rust heap
-  memory is not counted in the context (as for `merge_agg`'s state).
+  memory is not counted in the context (as for `merge_agg`'s state);
+  `automerge_memory_usage()` shows it (see
+  [Memory observability](#memory-observability)).
 - Flattening: `get_flat_size` computes the stored bytes
   (`save_nocompress()`), caches them in the `LoadedDoc` and returns their
   size; `flatten_into` copies the cached bytes (and checks the size it is
@@ -1960,6 +1967,179 @@ again as new input, which is what a restore does:
   non-superuser database owner (as `verify_writes`).
 - The pg_regress example shows the error.
 
+## Memory observability
+
+Automerge allocates with the Rust global allocator, so every loaded
+document, the buffers around it, the rows a set-returning function holds
+and a `merge_agg` state live in the backend's `malloc` heap, outside
+Postgres' memory contexts: `pg_backend_memory_contexts`,
+`pg_log_backend_memory_contexts()`, `work_mem` and HashAgg's accounting do
+not see them, and a 3 MB document takes about 400 MB loaded (see
+[Input amplification
+measurements](#input-amplification-measurements-2026-09-29)). Since 0.3.0
+two functions show it, for the current backend:
+
+| Column of `automerge_memory_usage()` | Meaning |
+|---|---|
+| `allocated_bytes bigint` | Bytes the library's Rust code holds now: exact, counted by the global allocator |
+| `peak_allocated_bytes bigint` | The most it held since the backend started or the last `automerge_memory_reset()`, including documents a call loads and drops |
+| `live_documents bigint` | Loaded documents alive: `LoadedDoc`s (expanded values: `merge` results, the `bytea` cast's) and `merge_agg` states. A document a read loads and drops within one call is not counted (it shows in the peak and in `loads`) |
+| `loads bigint` | `Automerge::load` calls: every load of a stored value, of client input, and every save-and-load check, failed ones included |
+| `load_time double precision` | Their total time in milliseconds (wall clock, `Instant`) |
+
+`automerge_memory_reset()` sets the peak to the current allocation and
+`loads` and `load_time` to zero (the two others are current values). Both
+are `VOLATILE` and `PARALLEL RESTRICTED` (in a parallel worker they would
+report the worker's own heap; restricted keeps them in the leader), and
+`STRICT` like every pgrx function (they have no arguments). They are
+executable by `PUBLIC`: a session sees and resets only its own backend's
+counters. `automerge_memory_usage()` returns a set (`RETURNS TABLE`, one
+row), pgrx's way to return named columns; `SELECT * FROM
+automerge_memory_usage()` or `(automerge_memory_usage()).loads`.
+
+### Counting allocator or bookkeeping
+
+Two designs were compared:
+
+- **Bookkeeping around documents**: count `LoadedDoc`s and `merge_agg`
+  states, and attribute an estimated size to each (the `budget` model of
+  [Resource limits](#resource-limits)). Free for everything else, but an
+  estimate (plain text is over-counted about five times), known only for
+  documents whose counts were scanned, and blind to the biggest users:
+  the document every read loads and drops within one call (`doc->>'a'`
+  loads the whole document), the rows of a set-returning function, the
+  jsonb builder's tree, merge intermediates.
+- **A counting `#[global_allocator]`** (`src/alloc.rs`): the system
+  allocator plus two atomic counters. Exact, and covers everything the
+  library's Rust code allocates, at a cost on every allocation.
+
+Measured cost of the allocator (release builds, one CPU pinned, median of
+7 runs, minimum of 2 runs per variant, 2026-10-01; bench-core's documents,
+see [Performance](#performance)):
+
+- A 16 to 80-byte allocation and free: 36.9 ns without, 38.0 ns with
+  counting (two uncontended atomic read-modify-writes, about 1.1 ns).
+- `mise run bench-core`: `Automerge::load` and `normalize` of every
+  document within noise (-0.8% to +0.6%; text3mb 2583 → 2563 ms,
+  items20k 157.8 → 158.1 ms); the jsonb walks +0.4% to +2.3%
+  (items20k one-sweep walk 63.2 → 64.6 ms); the allocation-heaviest case,
+  the per-object walk of many small maps, +3.6% (items20k 144.5 →
+  149.7 ms) and +6% (items2k 13.1 → 13.9 ms); `save_nocompress` and the
+  load memory scan unchanged.
+- `mise run bench-sql` (release build installed in the pgrx Postgres,
+  each SQL path timed alone, median of 3; runs with, without and again
+  with the allocator): no measurable cost. The run without it was the
+  slower one, by 2% in the geometric mean over the cases above 5 ms
+  (R1 text3mb 2979 ms without, 2898 and 2902 ms with; W1 items20k 373,
+  361 and 363 ms; W4 text3mb 5689, 5595 and 5564 ms; the largest
+  difference either way within 5%, except `A1` items20k at 9 ms), so the
+  machine's drift between runs exceeds the allocator's cost.
+
+So the allocator was chosen: its cost is at most a few percent on paths
+that allocate per object and within noise elsewhere, and it answers the
+question that matters ("how much memory does this backend's Automerge
+hold, and how much did it take at most") exactly. Bookkeeping is kept
+only where it is exact and nearly free: the live document count (a
+token in each `LoadedDoc` and `merge_agg` document, `stats::Live`) and the
+load count and time (`stats::timed_load` around the one
+`Automerge::load` call site, `load_bytes`), in the core crate
+(`stats`; no unsafe code).
+
+Soundness of the allocator: every method passes its arguments to
+`std::alloc::System` and returns its result unchanged; the counters are
+`AtomicUsize` statics updated with `Relaxed` read-modify-writes (exact
+under any number of threads; a backend has one) that never allocate,
+panic or re-enter the allocator. A failed allocation or reallocation
+changes no counter (the old block stays counted). The peak is raised
+with `fetch_max` only when the new total exceeds it, and read as at least
+the current total.
+
+What the numbers mean:
+
+- Bytes are what Rust asks for (`Layout::size`). `malloc` adds its chunk
+  headers and rounding, and keeps freed memory for reuse (glibc returns
+  it to the system only at the top of the heap or for large blocks it
+  mapped separately), so a backend's RSS can stay high after
+  `allocated_bytes` fell back; the library does not call `malloc_trim`.
+- A `#[global_allocator]` covers the Rust code linked into this library:
+  Automerge, the core, and pgrx's own Rust allocations (16 to 123 bytes
+  between statements in the tests). Another Rust extension in the same
+  backend has its own allocator and is not counted, nor is Postgres'
+  `palloc` memory (the jsonb results, detoasted values), which its memory
+  contexts show.
+- With the library in `shared_preload_libraries`, a backend inherits the
+  postmaster's counters along with its memory (a copy of what `_PG_init`
+  allocated, if anything; a fresh backend reports 16 bytes).
+- In a `FROM` clause that does not depend on the outer row the function
+  scan runs once and is rescanned from its stored result, so to watch the
+  counters change per row call it in the target list (the pg_tests do).
+
+### Cluster-wide view: not provided
+
+A view over every backend would need shared memory: a slot per backend
+reserved at startup (`shmem_request_hook`), which works only with the
+library in `shared_preload_libraries`. The Docker image and ordinary
+installs load it on first use, so the view would be empty exactly where
+it is not configured, and each allocation would have to publish to shared
+memory (or each backend at the end of each statement). The alternative of
+showing the heap as a memory context (so that `pg_backend_memory_contexts`
+and `pg_log_backend_memory_contexts(pid)` report it) is not possible:
+since PostgreSQL 16 a context's methods come from the fixed
+`mcxt_methods[]` table, indexed by the 4-bit method ID in every chunk
+header (`MemoryContextMethodID`, `utils/memutils_internal.h`), so an
+extension cannot define a context type whose statistics it reports. What to do instead (README,
+[Monitoring](README.md#monitoring)): sample `automerge_memory_usage()`
+from the application's own connections (a pooled backend is reached only
+through its connection), and from outside, a backend's RSS, which
+includes this heap.
+
+### Tests
+
+- Core (`tests/stats.rs`, and a unit test in `stats.rs`): the live count
+  follows `LoadedDoc`s and a `merge_agg` accumulator's document (and its
+  finished copy), reads count a load and keep nothing, failed and
+  panicking loads are counted, `reset()` zeroes only the cumulative
+  counters.
+- pg_tests (`src/tests/memory.rs`), reading the SQL function: one row,
+  labels `VOLATILE`/`PARALLEL RESTRICTED`, reset; a read of a
+  200,000-character document counts one load and time, its peak shows the
+  loaded document, and nothing stays; a PL/pgSQL variable holding a merge
+  result is one live document of more than the document's size while it
+  lives; a window `merge_agg` holds its state's document and the frame
+  result's while it runs, nothing after; a target-list
+  `automerge_changes` behind a cursor that fetched one row holds its
+  2,000 rows until `CLOSE`, and one stopped by `LIMIT` frees them; after
+  errors in the middle of operations (a reused actor id inside `merge`
+  and inside `merge_agg` with its state loaded, the jsonb nesting limit
+  part way through a walk, a division by zero while a set-returning
+  function holds its rows, malformed input, the forced failure of the
+  deferred check while flattening an expanded value in an `UPDATE`), three
+  times over, no document and no byte (within 64 kB of slack) stays;
+  and 200 rounds of in-place merges, jsonb conversion, history rows,
+  `merge_agg`, updates, a `LIMIT`ed set-returning function and caught
+  errors leave the allocation where it was (within 8 kB). That test was
+  checked against a deliberate leak: a 512-byte `mem::forget` per jsonb
+  conversion made it fail with exactly 102,400 bytes over the 200 rounds;
+  without it the drift is 0 bytes.
+- `tests/memory.sh` (`mise run memory`, part of `mise run test`, and run
+  against the Docker image by `mise run docker-test`): one session runs
+  100 rounds (after 3 of warm-up) of top-level statements: an upsert with
+  `merge`, incremental changes, a newer save through the cast, jsonb
+  reads and containment, heads, `merge_agg`, history rows, a `LIMIT`ed
+  target-list set-returning function, a cursor left open until `COMMIT`,
+  a rolled back update, PL/pgSQL in-place merges; and errors part way:
+  malformed input, changes with missing dependencies, an exception raised
+  while a PL/pgSQL variable holds a merge result, and `statement_timeout`
+  cancelling a `merge_agg` whose state holds a merged document. Every
+  expected error happens in every round and no other; afterwards the
+  allocation is where it was (measured: 123 → 123 bytes), no document is
+  alive, and at least 10 loads per round were counted. Then the reset,
+  and a new session's counters starting at zero.
+- `tests/upgrade.sh` and `tests/docker_upgrade.sh`: the functions after
+  `ALTER EXTENSION .. UPDATE` from every earlier version, relocated too,
+  and an update over a user's `automerge_memory_usage()` in the
+  extension's schema failing.
+
 ## Error codes
 
 Every error the extension raises, by SQLSTATE. The core crate's `Error`
@@ -2094,6 +2274,12 @@ Building the jsonb value from the walk's events adds about 30 ms on the
 877 kB list document (see [the appendix](#jsonb-built-in-rust-memory-2026-09-29));
 a `serde_json::Value`, for comparison, takes 89 ms and 8 ms in total with
 the walk on the two list documents.
+
+Since 0.3.0 every Rust allocation is counted (for
+`automerge_memory_usage()`): about 1 ns per allocation, within noise on
+loads and at most a few percent on the allocation-heavy per-object walk
+(see [Memory observability](#memory-observability)); the numbers above
+were measured before.
 
 What costs a load, per call:
 
@@ -2271,10 +2457,12 @@ What costs a load, per call:
   assertions make large documents quadratic, and its overflow checks turned a
   counter past i64::MAX into a panic on read in dev builds only.
 - Test instrumentation (a counter of in-place merges, the list of sent
-  notifications, the core's counts of live loaded documents and of
-  `Automerge::load` calls, the forced failure of the save-and-load check
-  and an override of `pg_automerge.verify_writes`, behind the
-  `test-hooks` feature) is compiled only into test builds.
+  notifications, the core's per-thread count of `Automerge::load` calls,
+  the forced failure of the save-and-load check and an override of
+  `pg_automerge.verify_writes`, behind the `test-hooks` feature) is
+  compiled only into test builds. The count of live documents
+  (`loaded::live_count`, which the pg_tests use for leak checks) is the
+  always-on counter of `stats` since 0.3.0.
 - `pg_automerge.verify_writes` is defined in `_PG_init` and registered with
   the core (`set_verification_check`), which asks it whenever it would run
   the save-and-load check (`verification_enabled`).
@@ -2312,6 +2500,7 @@ payload). Each area and the invariant it relies on:
 | `notify.rs`: `json_categorize_type`, `datum_to_json`, `Async_Notify` | Hand-declared C functions | Signatures match PG 18.6's `utils/jsonfuncs.h` (the enum passed as `c_int`); called inside `pg_guard_ffi_boundary`. Channel and payload are NUL-free `CString`s within `NAMEDATALEN` and the 8000-byte payload limit. |
 | `io.rs`: `automerge_recv` | Reading the `StringInfo` | Postgres passes a valid buffer; the rest of it is consumed and copied before it is used. |
 | `lib.rs`: `_PG_init` | `MarkGUCPrefixReserved` | A NUL-terminated literal, copied by Postgres. |
+| `alloc.rs`: the global allocator | `GlobalAlloc` for the counting allocator | Every method passes its arguments to `System` and returns its result unchanged; the counters are atomics, which never allocate, panic or re-enter the allocator (see [Memory observability](#memory-observability)). |
 
 What `unsafe` cannot protect against, by design: a Rust stack overflow or
 a failed Rust allocation aborts the backend, and Postgres then restarts
@@ -2343,19 +2532,27 @@ whenever the pinned pgrx version changes.
   [Resource limits](#resource-limits)), `blocks.rs` and
   `deep_structures.rs` (the block check, and every entry point on
   documents nested 20,000 levels deep on a 1 MB stack, see
-  [Deep blocks](#deep-blocks)). `common/` holds the
+  [Deep blocks](#deep-blocks)), `stats.rs` (the live document and load
+  counters, see [Memory observability](#memory-observability)). `common/`
+  holds the
   random-history generator and stored-bytes wrappers around the
   `Input`-based API.
 - `#[pg_test]`s (`cargo pgrx test pg18`) for SQL behaviour, in
-  `src/tests/{io,merge,history,notify,expanded,hardening,loads,spans,blocks}.rs`
+  `src/tests/{io,merge,history,notify,expanded,hardening,loads,spans,blocks,memory}.rs`
   (`loads.rs` counts the `Automerge::load` calls of each write path and of
   `automerge_contains`, and
   covers the release of the cast's expanded values and the
   `pg_automerge.verify_writes` setting; `limits.rs` the load memory limit,
-  see [Resource limits](#resource-limits)). They are `include!`d
+  see [Resource limits](#resource-limits); `memory.rs`
+  `automerge_memory_usage()`, see
+  [Memory observability](#memory-observability)). They are `include!`d
   into the `#[pg_schema] mod tests` in `lib.rs` rather than declared as
   submodules, because pgrx runs each test as a function of the `tests`
-  schema and only items of that exact module go there. Test documents are
+  schema and only items of that exact module go there. `cargo pgrx test`
+  installs its `pg_test` build into pgrx's Postgres, so a server started
+  afterwards (or a new backend of a running one) runs that build until the
+  next `cargo pgrx install`; `mise run test` installs a plain build after
+  the pg_tests for the scripts. Test documents are
   built in Rust with `automerge::AutoCommit` and passed in as `bytea`.
 - `tests/pg_regress` (`mise run regress`): user-facing examples. Its
   fixtures are generated by `crates/pg_automerge_core/examples/gen_regress.rs`,
@@ -2409,6 +2606,9 @@ whenever the pinned pgrx version changes.
   container mode (`LIMITS_CONTAINER`, used by `tests/docker.sh`) the
   capped server is a container of the Docker image started with
   `--memory` (see [Docker image](#docker-image)).
+- `tests/memory.sh` (`mise run memory`, part of `mise run test`):
+  `automerge_memory_usage()` across top-level statements, transactions
+  and errors, see [Memory observability](#memory-observability).
 - `tests/replication.sh` (`mise run replication`, not part of `mise run
   test`: it runs its own scratch cluster with `wal_level = logical`):
   logical replication in text and binary mode (see the README's
@@ -2475,7 +2675,7 @@ whenever the pinned pgrx version changes.
   invariants (see [Docker image in CI](#docker-image-in-ci)).
 - `mise run docker-test` (`tests/docker.sh`, not part of `mise run test`)
   builds the Docker image and tests it and `compose.yaml` against
-  throwaway containers, including the regress examples, four of the
+  throwaway containers, including the regress examples, five of the
   multi-session scripts and `limits.sh` (see [Docker image](#docker-image));
   CI's `docker` job runs it on every push and pull request (see [Docker
   image in CI](#docker-image-in-ci)).
@@ -2487,8 +2687,8 @@ whenever the pinned pgrx version changes.
   `pg_restore` taken from there (the client tools are `PG_CONFIG`'s: pgrx's
   pg18 build by default, PGDG's `postgresql-client-18` in CI's docker job).
   `concurrency.sh`, `notify.sh`, `dump.sh`, `extension.sh` (its plain role
-  gets a password, for servers that do not trust TCP connections) and
-  `bench_sql.sh` work in both modes; `upgrade.sh` (it copies SQL scripts
+  gets a password, for servers that do not trust TCP connections),
+  `memory.sh` and `bench_sql.sh` work in both modes; `upgrade.sh` (it copies SQL scripts
   into the server's extension directory) and `replication.sh` (its own
   scratch cluster) refuse external mode rather than test something else.
 - `mise run lint`: `tests/check_ci.sh` (with actionlint and shellcheck, pinned in `mise.toml`), rustfmt, clippy with `-D warnings` for the default, the
@@ -2645,7 +2845,7 @@ The rest of the review found nothing that would stop it:
 
 The extension version is the crate version (`default_version =
 '@CARGO_VERSION@'` in `pg_automerge.control`; both crates carry it),
-currently 0.2.0; pgrx generates the install script
+currently 0.3.0; pgrx generates the install script
 `pg_automerge--X.Y.Z.sql` for the build, and the Docker image's version
 label and tag come from it (`scripts/versions.sh`). Released: 0.1.0 and
 0.2.0 (see `CHANGELOG.md`).
@@ -2703,6 +2903,22 @@ as `sql/snapshots/variants/pg_automerge--0.1.0+spans.sql` (the script of
 555110e; ee574e1, the one commit after it before the bump, changed only
 the library), a variant of 0.1.0 that the tests update with 0.1.0's
 upgrade scripts like the release.
+
+### 0.2.0 to 0.3.0
+
+The install scripts differ only by `automerge_memory_usage()`,
+`automerge_memory_reset()` and their comments (see
+[Memory observability](#memory-observability)); no 0.2.0 object's
+definition, labels, symbol or comment changed, and the library's other
+changes (the altered-change-types check, the reserved settings prefix,
+the virtual key column refusal, detoasting in place) return the same
+results, so `sql/pg_automerge--0.2.0--0.3.0.sql` creates the two
+functions and nothing else. Plain `CREATE FUNCTION`: no 0.2.0 catalog
+(nor 0.1.0 or its variant) has them, and a function of the same
+signature that someone put into the extension's schema makes the update
+fail ("already exists") rather than being replaced; `tests/upgrade.sh`
+checks that for every older snapshot. From 0.1.0, `ALTER EXTENSION ..
+UPDATE` runs 0.1.0 → 0.2.0 → 0.3.0 in one transaction.
 
 ### 0.1.0 to 0.2.0
 
@@ -2951,8 +3167,8 @@ README's Docker section. Packaging decisions:
     `pg-automerge-initdb`;
   - the regress examples through `pg_regress --use-existing` (the same
     expected output as `mise run regress`), and `concurrency.sh`,
-    `notify.sh`, `dump.sh` and `extension.sh` in `tests/lib.sh`'s external
-    mode, against one container;
+    `notify.sh`, `dump.sh`, `extension.sh` and `memory.sh` in
+    `tests/lib.sh`'s external mode, against one container;
   - `limits.sh` in container mode, against a container started with
     `--memory=1g --memory-swap=1g` (`DOCKER_TEST_MEMORY`) and the default
     limit: without the limit, six of the seven crafted inputs get the

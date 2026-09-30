@@ -214,13 +214,17 @@ SQL definitions, which it keeps supporting (see
 each version, and whether an update needs more than this (a `REINDEX`,
 say), is in [CHANGELOG.md](CHANGELOG.md).
 
-**From 0.1.0 to 0.2.0 with compose** (an app whose `compose.yaml` runs
-this image as a service, called `postgres` below, on a named volume;
-skjera's `postgres` service is one). 0.2.0 fixes a crash (a document
-with deeply nested blocks restarted the whole server when read as jsonb,
-e.g. through a generated `doc::jsonb` column) and adds
-`automerge_spans`. No index rebuild and no data rewrite are needed: every
-0.1.0 result stays the same.
+**From 0.2.0 (or 0.1.0) to 0.3.0 with compose** (an app whose
+`compose.yaml` runs this image as a service, called `postgres` below, on
+a named volume; skjera's `postgres` service is one). 0.3.0 adds
+`automerge_memory_usage()` and `automerge_memory_reset()` (see
+[Monitoring](#monitoring)) and fixes a server crash that needed the
+owner to alter the history types (see [CHANGELOG.md](CHANGELOG.md));
+from 0.1.0 it also brings 0.2.0's fix of a crash (a document with deeply
+nested blocks restarted the whole server when read as jsonb, e.g.
+through a generated `doc::jsonb` column) and `automerge_spans`. No index
+rebuild and no data rewrite are needed: every earlier result stays the
+same.
 
 Below, `<user>` is the service's `POSTGRES_USER`, the superuser the
 image created on first start (`skjera` for skjera, `postgres` for this
@@ -229,39 +233,41 @@ was its `POSTGRES_USER`), and `<db>` a database with the extension (the
 service's `POSTGRES_DB`, `skjera` for skjera, and any other you created
 it in).
 
-1. Optionally, keep a dump: `docker compose exec -T postgres pg_dump -U <user> -Fc <db> >before-0.2.0.dump`.
+1. Optionally, keep a dump: `docker compose exec -T postgres pg_dump -U <user> -Fc <db> >before-0.3.0.dump`.
 2. Build the new image in this repository: `mise run docker-build`
-   (tags `pg-automerge:0.2.0` and `pg-automerge:dev`), or `docker pull`
+   (tags `pg-automerge:0.3.0` and `pg-automerge:dev`), or `docker pull`
    it from your registry if you publish one.
-3. Point the app's service at it: `image: pg-automerge:0.2.0` in its
+3. Point the app's service at it: `image: pg-automerge:0.3.0` in its
    `compose.yaml` (pin the version tag: the images are local, and a
    rebuilt image moves `:dev`). If the service also has a `build:`
    section (skjera's builds the image from a checkout of this
-   repository), set its `args: PG_AUTOMERGE_VERSION:` to `0.2.0` too, or
+   repository), set its `args: PG_AUTOMERGE_VERSION:` to `0.3.0` too, or
    remove the section: compose builds when the tag is missing or with
    `--build`, and the Dockerfile refuses a version other than
-   Cargo.toml's (`versions: PG_AUTOMERGE_VERSION=0.1.0 != 0.2.0
+   Cargo.toml's (`versions: PG_AUTOMERGE_VERSION=0.2.0 != 0.3.0
    (Cargo.toml)`).
 4. `docker compose up -d`: compose recreates the container from the new
    image on the same volume (the data stays; the init script does not
-   run again). From here on the fixed library serves every query, even
+   run again). From here on the new library serves every query, even
    before the next step.
 5. In every database with the extension:
 
    ```sh
    docker compose exec postgres psql -U <user> -d <db> -c 'ALTER EXTENSION pg_automerge UPDATE'
-   docker compose exec postgres psql -U <user> -d <db> -Atc "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'"   # 0.2.0
+   docker compose exec postgres psql -U <user> -d <db> -Atc "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'"   # 0.3.0
    ```
 
-   This adds `automerge_spans`; nothing else in the catalog changes, and
-   tables, indexes, generated columns, views and `automerge_notify()`
-   triggers are untouched. It works on both kinds of 0.1.0 database:
-   the released one, and one created by an image built from this
-   repository after `automerge_spans` was added but before the version
-   bump (still labelled 0.1.0, with `automerge_spans` already there).
+   This adds the two memory functions (and, from 0.1.0,
+   `automerge_spans`); nothing else in the catalog changes, and tables,
+   indexes, generated columns, views and `automerge_notify()` triggers
+   are untouched. From 0.1.0 it runs both upgrade scripts in one step,
+   on both kinds of 0.1.0 database: the released one, and one created by
+   an image built from this repository after `automerge_spans` was added
+   but before the 0.2.0 bump (still labelled 0.1.0, with
+   `automerge_spans` already there).
 
 There is no downgrade script: to go back, restore the dump into the old
-image. `mise run docker-upgrade-test` rehearses these steps against
+image. `mise run docker-upgrade-test` rehearses these steps from 0.1.0 against
 throwaway containers (the old image from `PG_AUTOMERGE_OLD_IMAGE`, or
 built from the 0.1.0 source), with a `POSTGRES_USER` other than
 `postgres` as skjera has: it runs the commands of steps 1 and 5 as
@@ -294,8 +300,8 @@ own `psql` (casts, merges, jsonb operators with a GIN expression index
 and a generated column, the history functions, a real `LISTEN` session
 for `automerge_notify()`, the settings and their privileges),
 `pg_dump -Fc` in one container restored into a second, a restart on the
-same volume, the regress examples and the concurrency, notify, dump and
-extension suites, the load memory limit against a container started with
+same volume, the regress examples and the concurrency, notify, dump,
+extension and memory suites, the load memory limit against a container started with
 `--memory=1g`, and that no server log shows an assertion failure, panic
 or crashed backend. The suites need Postgres 18 client tools and cargo:
 those of the pgrx Postgres by default (`mise run pgrx-init`), or PGDG's
@@ -305,14 +311,15 @@ those of the pgrx Postgres by default (`mise run pgrx-init`), or PGDG's
 `scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
 
 `mise run docker-upgrade-test` (not part of `docker-test`) upgrades a
-0.1.0 deployment the way the [Updating](#updating) section describes: a
+0.1.0 deployment to the current version the way the [Updating](#updating)
+section describes: a
 container of the 0.1.0 image (`PG_AUTOMERGE_OLD_IMAGE=<tag or image ID>`,
 or by default built from the 0.1.0 source in the git history) with
 tables, a generated `doc::jsonb` column, GIN and B-tree expression
 indexes, a view, an `automerge_notify()` trigger and documents; then the
 new image on the same volume, `ALTER EXTENSION pg_automerge UPDATE`, and
-checks of the data, indexes, trigger, `automerge_spans` and the catalog
-against a fresh install.
+checks of the data, indexes, trigger, `automerge_spans`, the memory
+counters and the catalog against a fresh install.
 
 The multi-session suites run against any server of yours, too (it needs
 the extension available, a superuser, and room for scratch databases):
@@ -320,7 +327,7 @@ the extension available, a superuser, and room for scratch databases):
 ```sh
 PG_AUTOMERGE_TEST_HOST=127.0.0.1 PG_AUTOMERGE_TEST_PORT=5432 \
 PG_AUTOMERGE_TEST_USER=postgres PG_AUTOMERGE_TEST_PASSWORD=... \
-  bash tests/concurrency.sh   # or notify.sh, dump.sh, extension.sh, bench_sql.sh
+  bash tests/concurrency.sh   # or notify.sh, dump.sh, extension.sh, memory.sh, bench_sql.sh
 ```
 
 `mise run docker-bench-sql` times the everyday SQL paths against the
@@ -532,6 +539,8 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `automerge_change_count(doc) → bigint` | I S P | Number of changes, read from the stored bytes without loading the document. |
 | `automerge_to_jsonb(doc, heads text[]) → jsonb` | I S P | The state as of `heads` (`'{}'`: before any change). |
 | `automerge_spans(doc, path text[] [, heads text[]]) → jsonb` | I S P | The structure of the text object at `path` (as for `#>`: `'{notes,0,body}'`): an array of `{"type":"text","value":…,"marks":{…}}` runs and `{"type":"block","value":{…}}` blocks, the shape of Automerge's JavaScript `spans()`; as of `heads` with the third argument. NULL if nothing is at `path`; 22023 if it is not a text object. See [Rich text](#rich-text). |
+| `automerge_memory_usage()` | volatile, parallel restricted | One row: the memory pg_automerge holds in this backend outside Postgres' memory contexts (`allocated_bytes`, `peak_allocated_bytes`), loaded documents alive (`live_documents`), and Automerge loads so far (`loads`, `load_time` in ms). See [Monitoring](#monitoring). |
+| `automerge_memory_reset()` | volatile, parallel restricted | Restart this backend's peak from the current allocation, and its `loads` and `load_time` from zero. |
 
 Every object has a `COMMENT` (`\df+`, `\dT+`). Error codes are listed in
 [DESIGN.md](docs/DESIGN.md#error-codes).
@@ -642,6 +651,66 @@ a result's bytes, so functions stay `IMMUTABLE` and dumps are unaffected.
 Details in
 [DESIGN.md](docs/DESIGN.md#the-pg_automergeverify_writes-setting).
 
+## Monitoring
+
+Automerge documents live in the Rust heap of the backend that loaded
+them, which Postgres does not see: not in `pg_backend_memory_contexts`,
+not in `work_mem`. `automerge_memory_usage()` shows it for the current
+session:
+
+```sql
+-- A new session, after reading one value of a 3 MB text document and of
+-- an 877 kB document of 20,000 list items (doc->>'status'):
+SELECT * FROM automerge_memory_usage();
+--  allocated_bytes | peak_allocated_bytes | live_documents | loads |  load_time
+-- -----------------+----------------------+----------------+-------+-------------
+--               16 |            273014612 |              0 |     2 | 2812.470245
+```
+
+The 3 MB document took 273 MB while it was loaded, and nothing stays
+afterwards.
+
+- `allocated_bytes`: bytes pg_automerge's Rust code holds now: loaded
+  documents, the buffers around them, set-returning functions' rows,
+  `merge_agg` states. Between statements it should be near zero (a few
+  hundred bytes); anything that stays is a leak worth reporting.
+- `peak_allocated_bytes`: the most it held since the session started (or
+  the last `automerge_memory_reset()`), including the documents a read
+  loads and drops within one call. This is the number to compare with
+  `pg_automerge.max_load_memory` and with the memory of the server.
+- `live_documents`: loaded documents alive now: in-memory values (PL/pgSQL
+  variables holding a `merge` result, the `bytea` cast's), and `merge_agg`
+  states. 0 between statements.
+- `loads`, `load_time`: how many times Automerge loaded a document (every
+  read that converts a document, every write's validation, the
+  verification loads), and the total time in milliseconds.
+
+The counts are exact (a counting allocator; its cost is about 1 ns per
+allocation, not measurable in `mise run bench-sql`), in the bytes Rust
+asks for: the process uses somewhat more (`malloc`'s own overhead), and after a
+large document is freed `malloc` may keep the memory for reuse, so the
+backend's RSS can stay high while `allocated_bytes` is back at zero.
+
+To measure one statement, reset first:
+
+```sql
+SELECT automerge_memory_reset();
+SELECT doc->>'title' FROM docs WHERE id = $1;
+SELECT peak_allocated_bytes, loads, load_time FROM automerge_memory_usage();
+```
+
+The counters are per backend (per connection); nothing is shared between
+sessions, so there is no cluster-wide view. To watch a pooled backend,
+sample it from its own connections: have the app run
+`SELECT * FROM automerge_memory_usage()` on each connection now and then
+(or after large operations) and export the numbers as metrics. From
+outside, a backend's RSS (`ps -o rss -p <pid>`, with the pids from
+`pg_stat_activity`) includes this memory. Inside a query, call it in the
+target list (`SELECT (automerge_memory_usage()).live_documents FROM ...`)
+to see it per row: in a `FROM` clause that does not depend on the outer
+row, Postgres calls it once. Details in
+[DESIGN.md](docs/DESIGN.md#memory-observability).
+
 ## Limitations and gotchas
 
 - **Each jsonb access is a load.** `SELECT doc->>'a', doc->>'b', doc->>'c'`
@@ -688,6 +757,8 @@ Details in
   for a grouped `merge_agg` over many large documents check `EXPLAIN` and
   use `SET enable_hashagg = off` if needed. In-memory merge results (the
   PL/pgSQL example above) are likewise not counted.
+  `automerge_memory_usage()` shows this memory per session (see
+  [Monitoring](#monitoring)).
 - **Small input, large load.** Automerge input is compressed and
   run-length encoded: a 4 kB save of a 4,000,000-character text takes
   4.3 s and 390 MB to load, and memory grows linearly with what the input
@@ -809,7 +880,7 @@ Tooling runs through [mise](https://mise.jdx.dev):
 
 ```sh
 mise run pgrx-init   # once: build the Postgres pgrx develops against
-mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump, upgrade, extension and limits scripts
+mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump, upgrade, extension, limits and memory scripts
 mise run regress     # pg_regress examples in tests/pg_regress (checks their fixtures first)
 mise run lint        # CI/packaging checks (actionlint, shellcheck, workflow invariants), rustfmt, clippy -D warnings (all build configurations), rustdoc
 mise run ci          # lint + test + regress: what CI's ci job runs (its docker job: docker-test)
@@ -819,6 +890,7 @@ mise run dump        # only: pg_dump/pg_restore and COPY round trips of every ob
 mise run upgrade     # only: ALTER EXTENSION UPDATE from every released version
 mise run extension   # only: relocation (SCHEMA, SET SCHEMA, dump), install and setting privileges
 mise run limits      # only: the load memory limit against real crashes in a memory-capped scratch cluster
+mise run memory      # only: automerge_memory_usage() over many statements, transactions and errors (no leaks)
 mise run replication # logical replication in a scratch cluster (not part of test)
 mise run fuzz        # a long mutation-fuzzing session of the core (not part of test)
 mise run bench-sql   # median timings of the everyday SQL paths on a release build (minutes)
