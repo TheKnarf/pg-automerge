@@ -220,9 +220,17 @@ fn check_normalize(name: &str, input: &[u8], loads: bool) -> u64 {
     );
     // The document it normalizes to may be priced higher (preds become
     // successors): allow for that, as normalize checks it.
+    // (For input whose normalized save does not load again, the save of
+    // what it loads to: normalize prices that before it checks the save.)
     set_limit(Some(None));
     let stored_estimate = normalize(input)
         .ok()
+        .or_else(|| {
+            // Unguarded: Automerge panics on some crafted input.
+            std::panic::catch_unwind(|| Automerge::load(input).map(|d| d.save_nocompress()))
+                .ok()?
+                .ok()
+        })
         .map_or(0, |s| doc_estimate(&scan_doc_exact(&s)));
     let limit = estimate.max(stored_estimate);
 
@@ -428,6 +436,41 @@ fn repeated_messages_are_priced() {
         ),
     ] {
         check_normalize(name, &input, false);
+        check_apply(name, &input);
+    }
+}
+
+/// Keys and mark names repeated by a run: applying a change makes an
+/// owned string of every op's key and mark name, the document holds a key
+/// literally where other keys come between its rows, and every rebuilt
+/// change of a document holds its ops' keys.
+#[test]
+fn repeated_keys_and_mark_names_are_priced() {
+    for (name, input, loads) in [
+        (
+            "change 2000 ops, one 100 kB key",
+            craft::repeated_keys(2_000, 100_000),
+            true,
+        ),
+        // Loads, but its save does not load again (Automerge's own
+        // mark-order check): refused by the verification of the result.
+        (
+            "change 2000 marks, one 100 kB name",
+            craft::repeated_mark_names(2_000, 100_000),
+            false,
+        ),
+        (
+            "change 500 maps, one 50 kB key interleaved",
+            craft::interleaved_keys(500, 50_000),
+            false,
+        ),
+        (
+            "doc 2000 changes, one 100 kB key",
+            craft::repeated_doc_keys(2_000, 100_000),
+            false,
+        ),
+    ] {
+        check_normalize(name, &input, loads);
         check_apply(name, &input);
     }
 }

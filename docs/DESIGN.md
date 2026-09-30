@@ -1294,12 +1294,20 @@ without expanding them: a repeat run of `n` strings of `len` bytes
 expands to `(n - 1) × len` bytes beyond the input's own (literal values
 are input bytes, already charged 10 each).
 
-- Rebuilt bytes of a document chunk: its change messages (every rebuilt
-  change holds its message twice, in its bytes and as a `String`, and a
-  load whose heads do not match clones every rebuilt change into its
-  error: 4.0 bytes per byte measured, charged 5).
-- Repeated bytes of changes: those of a document chunk turned into
-  changes (its rebuilt bytes, which applying copies again).
+- Rebuilt bytes of a document chunk: its change messages, and its ops'
+  keys and mark names (every rebuilt change holds its message twice, in
+  its bytes and as a `String`, and its ops' keys and mark names in its
+  bytes, and a load whose heads do not match clones every rebuilt change
+  into its error: 4.0 bytes per byte measured for messages, 2.0 for keys,
+  charged 5).
+- Repeated bytes of changes: the keys and mark names of change chunks
+  (importing a change's ops makes an owned `String` of every op's key and
+  mark name, and the document holds a key literally wherever other keys
+  come between its rows: 1.0 bytes per byte measured for one key, 2.0 for
+  mark names, 4.0 for a key the document then holds literally, 5.9 with
+  the save of the result that `normalize` makes; charged 8), and those
+  of a document chunk turned into changes (its rebuilt bytes, which
+  applying copies again).
 
 A load of input on its own is the first document chunk as a document plus
 everything after it as changes applied to it (Automerge turns a later

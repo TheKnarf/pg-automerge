@@ -18,6 +18,9 @@
 //!   (under 1 kB): Automerge rebuilds every change with its own copy of
 //!   the message, held twice, and clones them all into the error when the
 //!   heads do not match (about 2.4 GB).
+//! - `keys.bin`: a change chunk of 16,000 puts of one 100 kB key (a
+//!   repeat run, about 100 kB): applying it makes an owned copy of the key
+//!   per op (about 1.6 GB).
 //! - `small.bin`: an ordinary small document.
 
 use std::path::PathBuf;
@@ -58,6 +61,8 @@ fn main() {
         craft::repeated_messages(6_000, 100_000, true),
     )
     .unwrap();
+
+    std::fs::write(dir.join("keys.bin"), craft::repeated_keys(16_000, 100_000)).unwrap();
 
     let mut small = AutoCommit::new().with_actor(ActorId::from([2u8; 16]));
     small.put(ROOT, "status", "small").unwrap();

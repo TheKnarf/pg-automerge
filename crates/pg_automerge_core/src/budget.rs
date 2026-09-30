@@ -105,6 +105,8 @@ const KEY_STR: u64 = 0x15;
 const INSERT: u64 = 0x34;
 /// The change message column of a document chunk.
 const MESSAGE: u64 = 0x35;
+/// The mark name column (document and change chunks).
+const MARK_NAME: u64 = 0xa5;
 
 /// Bytes charged per inflated input byte (values and strings are copied
 /// into the document, 5-7 bytes each measured).
@@ -119,12 +121,18 @@ const PER_OTHER_ACTOR: u128 = 100;
 /// Bytes charged per byte that a document's rebuilt changes hold beyond
 /// the chunk's own bytes ([`DocCounts::rebuilt`]): Automerge rebuilds
 /// every change of a document with its own copy of the message, held
-/// twice (in the change's bytes and as a `String`), and a load whose
-/// heads do not match clones every rebuilt change into its error.
-/// Measured 4.0 per byte.
+/// twice (in the change's bytes and as a `String`), and of the keys and
+/// mark names of its ops (in its bytes), and a load whose heads do not
+/// match clones every rebuilt change into its error. Measured 4.0 per
+/// byte (messages), 2.0 (keys).
 const PER_REBUILT: u128 = 5;
 /// Bytes charged per byte that applying changes copies beyond the
-/// chunks' own bytes ([`ChangeCounts::repeated`]).
+/// chunks' own bytes ([`ChangeCounts::repeated`]): Automerge makes an
+/// owned `String` of every op's key and mark name when it imports a
+/// change's ops, and the document holds a key literally where other keys
+/// come between its rows. Measured 1.0 per byte (one key), 2.0 (mark
+/// names), 4.0 (a key held literally by the document; 5.9 with the save
+/// of the result that `normalize` makes).
 const PER_REPEATED: u128 = 8;
 /// Bytes charged for any load or apply, whatever it holds: Automerge's
 /// fixed structures, which the per-unit costs do not cover for tiny
@@ -187,9 +195,9 @@ pub struct DocCounts {
     /// Bytes of the chunk with its columns inflated.
     pub inflated: u64,
     /// Bytes that rebuilding the document's changes copies beyond the
-    /// chunk's own bytes: a string column's repeat run of `n` values of
-    /// `len` bytes is `(n - 1) * len` (every change holds its own copy).
-    /// Computed from the run headers, never expanded.
+    /// chunk's own bytes: a repeat run of `n` change messages, op keys or
+    /// mark names of `len` bytes is `(n - 1) * len` (every change holds
+    /// its own copy). Computed from the run headers, never expanded.
     pub rebuilt: u64,
 }
 
@@ -213,8 +221,9 @@ pub struct ChangeCounts {
     /// Bytes of the chunks' data, inflated.
     pub inflated: u64,
     /// Bytes that applying the changes copies beyond the chunks' own
-    /// bytes (for changes turned from a document chunk, its
-    /// [`DocCounts::rebuilt`]).
+    /// bytes: a repeat run of `n` keys or mark names of `len` bytes is
+    /// `(n - 1) * len` (every op gets its own copy); for changes turned
+    /// from a document chunk, its [`DocCounts::rebuilt`].
     pub repeated: u64,
 }
 
@@ -1452,9 +1461,15 @@ impl Scanner {
             &[DEPS_MEMBER],
             &[MESSAGE],
         );
-        let (ops, succ, _) =
-            self.rows_and_group(&op_cols, &DOC_OP_SPECS, SUCC_GROUP, &SUCC_MEMBERS, &[]);
-        counts.rebuilt = messages;
+        // And its ops' keys and mark names (in its bytes).
+        let (ops, succ, strings) = self.rows_and_group(
+            &op_cols,
+            &DOC_OP_SPECS,
+            SUCC_GROUP,
+            &SUCC_MEMBERS,
+            &[KEY_STR, MARK_NAME],
+        );
+        counts.rebuilt = messages.saturating_add(strings);
         counts.changes = changes;
         counts.deps = deps;
         counts.ops = ops;
@@ -1524,8 +1539,15 @@ impl Scanner {
         }
         let meta = Self::metadata(&mut r).ok_or_else(malformed)?;
         let cols = self.columns(&mut r, &meta, false)?;
-        let (ops, preds, _) =
-            self.rows_and_group(&cols, &CHANGE_OP_SPECS, PRED_GROUP, &PRED_MEMBERS, &[]);
+        // Applying the change copies every op's key and mark name.
+        let (ops, preds, strings) = self.rows_and_group(
+            &cols,
+            &CHANGE_OP_SPECS,
+            PRED_GROUP,
+            &PRED_MEMBERS,
+            &[KEY_STR, MARK_NAME],
+        );
+        counts.repeated = counts.repeated.saturating_add(strings);
         counts.ops = counts.ops.saturating_add(ops);
         counts.preds = counts.preds.saturating_add(preds);
         counts.changes = counts.changes.saturating_add(1);
