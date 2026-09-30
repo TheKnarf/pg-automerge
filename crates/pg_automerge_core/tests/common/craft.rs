@@ -601,19 +601,19 @@ pub fn interleaved_keys(m: u64, len: usize) -> Vec<u8> {
     ])
 }
 
-/// A document chunk making a list of 3 nulls with `n` empty column
+/// A document chunk making a list of 4 nulls with `n` empty column
 /// metadata entries before its op columns.
 pub fn doc_columns(n: u64) -> Vec<u8> {
-    document_with(&[actor(0)], 1, one_change(4), list_ops(3), n)
+    document_with(&[actor(0)], 1, one_change(5), list_ops(4), n)
 }
 
-/// A change chunk making a list of 3 nulls with `n` empty column metadata
+/// A change chunk making a list of 4 nulls with `n` empty column metadata
 /// entries before its columns.
 pub fn change_columns(n: u64) -> Vec<u8> {
-    chunk(1, &change_data_with(&list_change_ops(3), n))
+    chunk(1, &change_data_with(&list_change_ops(4), n))
 }
 
 /// [`change_columns`] as a compressed change chunk.
 pub fn compressed_change_columns(n: u64) -> Vec<u8> {
-    compress(&change_data_with(&list_change_ops(3), n))
+    compress(&change_data_with(&list_change_ops(4), n))
 }

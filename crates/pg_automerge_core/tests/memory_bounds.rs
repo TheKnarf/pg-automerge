@@ -500,6 +500,70 @@ fn long_actor_ids_are_priced() {
     }
 }
 
+/// Column metadata entries: Automerge keeps every entry of a metadata
+/// block (and copies the list as it validates the layout), while an
+/// empty column takes two input bytes. Counts just past a power of two,
+/// where a doubling vector overshoots most. (None loads: the document
+/// lists no heads, and Automerge reads a change's object actors from one
+/// of the empty columns, so its save does not load again.)
+#[test]
+fn column_metadata_entries_are_priced() {
+    for n in [2_100_000u64, 4_200_000] {
+        for (name, input, loads) in [
+            (
+                format!("doc {n} empty columns"),
+                craft::doc_columns(n),
+                false,
+            ),
+            (
+                format!("change {n} empty columns"),
+                craft::change_columns(n),
+                false,
+            ),
+            (
+                format!("change {n} empty columns, compressed"),
+                craft::compressed_change_columns(n),
+                false,
+            ),
+        ] {
+            check_normalize(&name, &input, loads);
+            check_apply(&name, &input);
+        }
+    }
+}
+
+/// 12,000,000 empty column metadata entries in a 24 kB compressed change
+/// chunk: 2.4 GB at 200 bytes per entry, over the default limit. The scan
+/// stops at the declared count, after the inflation (24 MB), without
+/// stepping through the entries; the uncompressed chunk (24 MB) and a
+/// document chunk too.
+#[test]
+fn column_metadata_bombs_are_rejected_before_they_are_walked() {
+    set_limit(Some(Some(budget::DEFAULT_LIMIT)));
+    for (name, input) in [
+        ("compressed", craft::compressed_change_columns(12_000_000)),
+        ("plain", craft::change_columns(12_000_000)),
+        ("document", craft::doc_columns(12_000_000)),
+    ] {
+        let start = std::time::Instant::now();
+        let (result, peak) = peak_of(|| normalize(&input));
+        let err = limit_error(result).unwrap_or_else(|| panic!("{name}: not rejected"));
+        assert!(err.at_least, "{name}: the scan stopped early");
+        assert!(peak < 3 * (24 << 20), "{name}: peak {peak}");
+        assert!(
+            start.elapsed().as_secs() < 2,
+            "{name}: took {:?}",
+            start.elapsed()
+        );
+        let base = Automerge::new().save_nocompress();
+        let (result, peak) = peak_of(|| loaded::merge_changes(Input::Stored(&base), &input));
+        assert!(limit_error(result).is_some(), "{name}: merge_changes");
+        assert!(peak < 3 * (24 << 20), "{name}: merge_changes peak {peak}");
+    }
+    assert!(craft::compressed_change_columns(12_000_000).len() < 30_000);
+    set_limit(None);
+}
+
 #[test]
 fn rle_bombs_are_rejected_with_a_tiny_peak() {
     // Tiny inputs describing hundreds of millions of rows: with the

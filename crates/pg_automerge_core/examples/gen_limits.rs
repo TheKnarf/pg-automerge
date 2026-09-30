@@ -24,6 +24,9 @@
 //! - `actors.bin`: a document chunk of 6,000 empty changes by one actor
 //!   whose id is 100 kB long (about 100 kB): every rebuilt change holds
 //!   the id twice, cloned again into the error (about 2.4 GB).
+//! - `columns.bin`: a compressed change chunk of about 24 kB whose column
+//!   metadata lists 12,000,000 empty columns: Automerge's parse keeps
+//!   every entry in doubling vectors (about 2 GB).
 //! - `small.bin`: an ordinary small document.
 
 use std::path::PathBuf;
@@ -70,6 +73,12 @@ fn main() {
     std::fs::write(
         dir.join("actors.bin"),
         craft::long_actor_changes(6_000, 100_000),
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.join("columns.bin"),
+        craft::compressed_change_columns(12_000_000),
     )
     .unwrap();
 

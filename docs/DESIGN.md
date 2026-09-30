@@ -1274,13 +1274,14 @@ In bytes, saturating, from counts read from the chunks:
   be saved as): 450 per op + 30 per successor entry + 600 × Gmax + 1600 per
   change + min(130 × (ops + successors), 1600 × changes) + 200 per
   dependency entry + 200 per actor + 0.3 × changes × actors + 3 × min(changes,
-  (ops + successors) / 16) × actors + 5 per *rebuilt* byte (below).
+  (ops + successors) / 16) × actors + 5 per *rebuilt* byte (below) + 200
+  per *extra* column metadata entry (below).
 - **Change chunks, or changes about to be applied** to a document with
   *base* changes and actors: 1000 per op + 80 per pred entry + 2500 per
   change + 200 per dependency + 200 per distinct actor + 100 per entry of
   a change's list of other actors (duplicates included) + 0.3 × (changes ×
   (base actors + new actors) + base changes × new actors) + 8 per
-  *repeated* byte (below).
+  *repeated* byte (below) + 200 per *extra* column metadata entry.
 - **Plus** 10 per byte of the chunks with their columns inflated, and 64 kB
   (Automerge's fixed structures, which the per-unit costs do not cover for
   tiny documents).
@@ -1324,6 +1325,19 @@ document chunk into changes: it is charged both as a document and as its
 changes). Loading after a document (`a ++ changes`) or applying chunks to
 it charges every chunk of the input as changes, with the document as the
 base.
+
+**Extra column metadata entries.** A chunk lists its columns in
+metadata blocks, an entry (spec, length) per column, and Automerge's
+parse keeps every entry in vectors that double as they fill (and copies
+the list as it checks the layout), while the entry of an empty column
+takes two input bytes: 5,000,000 of them made a 10 MB document chunk
+peak at 498 MB (it loaded) and a 9.7 kB compressed change chunk at
+716 MB. Every entry beyond one per column Automerge writes (9 + 16 for
+a document chunk, 14 for a change chunk, which the per-op and per-change
+costs include) is charged 200: measured up to 120 per entry for a
+document chunk, 168 for a change chunk and 174 for a compressed one, at
+counts just past a power of two (4,200,000), where a doubling vector
+overshoots most.
 
 For a merge result, the rebuilt bytes of the bound (see [Merge
 results](#merge-results)) add the bytes and the repeated bytes of the
@@ -1399,12 +1413,18 @@ chunk:
   row-by-row definition. Documents far below the limit never pay for it
   (on the 877 kB list document the exact pass costs about as much as the
   rest of the scan).
+- Column metadata is validated in place and read again entry by entry
+  with the columns' data: nothing is allocated per entry. Only the
+  columns the exact Gmax pass merges are held (the first of each spec;
+  one listed twice makes Gmax its bound).
 - The loops run the interrupt check (a cancel stops a scan), per run of
-  a column and per entry of an actor list.
+  a column and per entry of an actor list or a column metadata block.
 - A change whose list of other actors is longer than the limit pays for
   (110 per entry, its byte and the 100) stops the scan before its entries
   are read, like a deflate bomb ("at least"): 20,000,000 empty actors
-  deflate to 19 kB, and stepping through them would take seconds.
+  deflate to 19 kB, and stepping through them would take seconds. So
+  does a column metadata block whose extra entries alone exceed the
+  limit (200 each): 12,000,000 empty columns deflate to 24 kB.
 - It never fails. Framing it cannot parse (bad magic, lengths, column
   metadata, a column that does not inflate, an unknown chunk type) stops
   it with the counts of what came before, which is all Automerge can

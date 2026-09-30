@@ -140,6 +140,14 @@ const PER_REBUILT: u128 = 5;
 /// names), 4.0 (a key held literally by the document; 5.9 with the save
 /// of the result that `normalize` makes).
 const PER_REPEATED: u128 = 8;
+/// Bytes charged per column metadata entry beyond one per column
+/// Automerge writes ([`DocCounts::extra_columns`]): its parse keeps every
+/// entry of a block in vectors that double as they fill (and copies the
+/// list as it checks the layout), while an entry of an empty column takes
+/// two input bytes. Measured up to 120 per entry for a document chunk,
+/// 168 for a change chunk and 174 for a compressed one, at counts just
+/// past a power of two.
+const PER_EXTRA_COLUMN: u128 = 200;
 /// Bytes charged for any load or apply, whatever it holds: Automerge's
 /// fixed structures, which the per-unit costs do not cover for tiny
 /// documents.
@@ -207,6 +215,10 @@ pub struct DocCounts {
     /// change holds (its own, and the others its ops refer to). Computed
     /// from the run headers, never expanded.
     pub rebuilt: u64,
+    /// Column metadata entries beyond one per column Automerge writes (an
+    /// empty column's entry takes two input bytes; Automerge keeps every
+    /// entry while it parses the chunk).
+    pub extra_columns: u64,
 }
 
 /// What change chunks describe (or changes about to be applied).
@@ -233,6 +245,9 @@ pub struct ChangeCounts {
     /// `(n - 1) * len` (every op gets its own copy); for changes turned
     /// from a document chunk, its [`DocCounts::rebuilt`].
     pub repeated: u64,
+    /// Column metadata entries beyond one per column Automerge writes, as
+    /// [`DocCounts::extra_columns`].
+    pub extra_columns: u64,
 }
 
 impl DocCounts {
@@ -246,6 +261,7 @@ impl DocCounts {
         self.actors = self.actors.saturating_add(other.actors);
         self.inflated = self.inflated.saturating_add(other.inflated);
         self.rebuilt = self.rebuilt.saturating_add(other.rebuilt);
+        self.extra_columns = self.extra_columns.saturating_add(other.extra_columns);
     }
 
     /// An upper bound of the counts of a document with these counts after
@@ -288,6 +304,9 @@ impl DocCounts {
             // (a bound: keys and mark names are copied per op when
             // applied; messages and actors at most once more).
             repeated: self.rebuilt,
+            // Its metadata is priced with the chunk; the changes Automerge
+            // rebuilds list only the columns it writes.
+            extra_columns: 0,
         }
     }
 }
@@ -306,6 +325,7 @@ impl ChangeCounts {
             .saturating_add(other.other_actor_entries);
         self.inflated = self.inflated.saturating_add(other.inflated);
         self.repeated = self.repeated.saturating_add(other.repeated);
+        self.extra_columns = self.extra_columns.saturating_add(other.extra_columns);
     }
 }
 
@@ -342,7 +362,8 @@ fn sat(value: u128) -> u64 {
 /// actor, 0.3 per change × actor (Automerge caches a clock every 16
 /// changes), 3 per actor for each change with more than about 16 ops, 10
 /// per inflated byte, 5 per byte the rebuilt changes copy beyond the
-/// chunk's own bytes, and 64 kB whatever the document holds.
+/// chunk's own bytes, 200 per column metadata entry beyond one per column
+/// Automerge writes, and 64 kB whatever the document holds.
 pub fn doc_estimate(d: &DocCounts) -> u64 {
     let (ops, succ, gmax, changes, deps, actors, inflated) = (
         u128::from(d.ops),
@@ -365,7 +386,8 @@ pub fn doc_estimate(d: &DocCounts) -> u64 {
         + 3 * changes * actors / 10
         + 3 * changes.min(rows / 16) * actors
         + u128::from(PER_BYTE) * inflated
-        + PER_REBUILT * u128::from(d.rebuilt))
+        + PER_REBUILT * u128::from(d.rebuilt)
+        + PER_EXTRA_COLUMN * u128::from(d.extra_columns))
 }
 
 /// Estimated peak bytes of parsing and applying changes with these counts
@@ -373,7 +395,9 @@ pub fn doc_estimate(d: &DocCounts) -> u64 {
 /// pred, 2500 per change, 200 per dependency and per actor, 100 per entry
 /// of a change's list of other actors (duplicates included), 0.3 per
 /// change × actor of the result's clock cache, 10 per inflated byte, 8
-/// per byte applying them copies beyond the chunks' own bytes, and 64 kB.
+/// per byte applying them copies beyond the chunks' own bytes, 200 per
+/// column metadata entry beyond one per column Automerge writes, and
+/// 64 kB.
 pub fn changes_estimate(c: &ChangeCounts, base: Base) -> u64 {
     let (ops, preds, changes, deps, actors, inflated) = (
         u128::from(c.ops),
@@ -393,7 +417,8 @@ pub fn changes_estimate(c: &ChangeCounts, base: Base) -> u64 {
         + PER_OTHER_ACTOR * u128::from(c.other_actor_entries)
         + 3 * (changes * (base_actors + actors) + base_changes * actors) / 10
         + u128::from(PER_BYTE) * inflated
-        + PER_REPEATED * u128::from(c.repeated))
+        + PER_REPEATED * u128::from(c.repeated)
+        + PER_EXTRA_COLUMN * u128::from(c.extra_columns))
 }
 
 /// What a scan of external input found (see [`scan_input`]).
@@ -413,7 +438,9 @@ pub struct InputCounts {
     /// a tenth of the limit (each such byte is charged 10 bytes, so the
     /// input exceeds the limit whatever else it describes), or because a
     /// change lists more other actors than the limit pays for (each entry
-    /// is charged 110 bytes); the counts are only a lower bound.
+    /// is charged 110 bytes), or a column metadata block more entries
+    /// (each beyond one per column Automerge writes is charged 200 bytes);
+    /// the counts are only a lower bound.
     pub truncated: bool,
     /// The input does not parse (framing, lengths, column metadata, a
     /// deflated column that does not inflate); the counts cover what comes
@@ -1343,35 +1370,65 @@ impl Scanner {
         self.inflated = self.inflated.saturating_add(n);
     }
 
-    /// A column metadata block: (spec, length) pairs.
-    fn metadata(r: &mut Reader<'_>) -> Option<Vec<(u64, usize)>> {
-        let count = r.usize_c()?;
+    /// A column metadata block, validated in place (nothing is allocated
+    /// per entry: a block can list millions of empty columns). Stops the
+    /// scan when its entries beyond `known`'s alone exceed the limit (each
+    /// is charged [`PER_EXTRA_COLUMN`]), before they are read.
+    fn metadata<'a>(&mut self, r: &mut Reader<'a>, known: &[u64]) -> Result<Meta<'a>, Stop> {
+        let count = r.usize_c().ok_or(Stop::Malformed)?;
         // Each entry takes at least two bytes.
         if count > r.bytes.len() / 2 {
-            return None;
+            return Err(Stop::Malformed);
         }
-        let mut cols = Vec::with_capacity(count);
+        let extra = extra_entries(count, known);
+        if self
+            .limit
+            .is_some_and(|l| u128::from(extra) * PER_EXTRA_COLUMN > u128::from(l))
+        {
+            return Err(Stop::Truncated);
+        }
+        let start = r.pos;
+        let mut layout = Layout::new(known);
         for _ in 0..count {
-            let spec = r.uleb_c()?;
+            self.ticker.tick();
+            let spec = r.uleb_c().ok_or(Stop::Malformed)?;
             if spec > u64::from(u32::MAX) {
-                return None;
+                return Err(Stop::Malformed);
             }
-            cols.push((spec, r.usize_c()?));
+            r.usize_c().ok_or(Stop::Malformed)?;
+            layout.step(spec & !DEFLATE_BIT);
         }
-        Some(cols)
+        Ok(Meta {
+            entries: &r.bytes[start..r.pos],
+            count,
+            extra,
+            layout: layout.ok,
+        })
     }
 
-    /// The data of the columns listed in `meta`, inflated. `deflate`: the
-    /// deflate bit is allowed (document chunks), otherwise it makes the
-    /// chunk malformed (change chunks).
+    /// Read the data of the columns listed in `meta` from `r`, in order,
+    /// inflating deflated ones (`deflate`: the deflate bit is allowed,
+    /// document chunks; otherwise it makes the chunk malformed, change
+    /// chunks), and hand each to `visit` with its spec (deflate bit clear).
+    /// Returns the first column of each spec in `hold` (for the passes
+    /// that merge columns) and whether one of those specs is listed again.
+    /// With [`Scanner::keep`], every inflated column is kept, in order.
     fn columns<'a>(
         &mut self,
         r: &mut Reader<'a>,
-        meta: &[(u64, usize)],
+        meta: &Meta<'_>,
         deflate: bool,
-    ) -> Result<Vec<Column<'a>>, Stop> {
-        let mut cols = Vec::with_capacity(meta.len());
-        for &(spec, len) in meta {
+        hold: &[u64],
+        mut visit: impl FnMut(&mut Self, u64, &[u8]),
+    ) -> Result<(Vec<Column<'a>>, bool), Stop> {
+        let (mut held, mut repeated) = (Vec::<Column<'a>>::new(), false);
+        let mut entries = Reader::new(meta.entries);
+        for _ in 0..meta.count {
+            self.ticker.tick();
+            // Validated by `metadata`.
+            let (Some(spec), Some(len)) = (entries.uleb(), entries.usize_c()) else {
+                return Err(Stop::Malformed);
+            };
             let raw = r.take(len).ok_or(Stop::Malformed)?;
             let data = if spec & DEFLATE_BIT != 0 {
                 if !deflate {
@@ -1384,46 +1441,48 @@ impl Scanner {
             } else {
                 Cow::Borrowed(raw)
             };
-            cols.push(Column {
-                spec: spec & !DEFLATE_BIT,
-                data,
-            });
+            let spec = spec & !DEFLATE_BIT;
+            visit(self, spec, &data);
+            let first = hold.contains(&spec) && !held.iter().any(|c| c.spec == spec);
+            repeated |= hold.contains(&spec) && !first;
+            match data {
+                Cow::Owned(mut data) if self.keep => {
+                    // Held through the load: no spare capacity (what is
+                    // held is exactly the inflated bytes, each charged).
+                    data.shrink_to_fit();
+                    if first {
+                        self.kept.push(data.clone());
+                        held.push(Column {
+                            spec,
+                            data: Cow::Owned(data),
+                        });
+                    } else {
+                        self.kept.push(data);
+                    }
+                }
+                data if first => held.push(Column { spec, data }),
+                _ => {}
+            }
         }
-        Ok(cols)
+        Ok((held, repeated))
     }
 
-    /// Rows of the known non-member, non-value columns (the largest), for
-    /// the group `group` the larger of its sum and its members' rows, and
-    /// what the repeat runs of the string columns `strings` expand to
-    /// (summed).
-    fn rows_and_group(
-        &mut self,
-        cols: &[Column<'_>],
-        known: &[u64],
-        group: u64,
-        members: &[u64],
-        strings: &[u64],
-    ) -> (u64, u64, u64) {
-        let (mut rows, mut entries, mut excess) = (0u64, 0u64, 0u64);
-        for col in cols.iter().filter(|c| known.contains(&c.spec)) {
-            let ty = col.spec & 7;
-            if ty == VALUE {
-                continue;
-            }
-            let stats = column_stats(ty, &col.data, &mut self.ticker);
-            if col.spec == group {
-                entries = entries.max(stats.sum);
-            }
-            if members.contains(&col.spec) {
-                entries = entries.max(stats.rows);
-            } else {
-                rows = rows.max(stats.rows);
-            }
-            if strings.contains(&col.spec) {
-                excess = excess.saturating_add(stats.excess);
+    /// The bytes of long actor ids (`long`: index and length of every
+    /// actor longer than [`INLINE_ACTOR`], by index) that the runs of an
+    /// actor column refer to: each run's length, at most `cap`, times the
+    /// actor's length.
+    fn long_actor_bytes(&mut self, long: &[(u64, u64)], data: &[u8], cap: u64) -> u64 {
+        let mut sum = 0u64;
+        let mut runs = Runs::new(1, data);
+        while let Some(seg) = runs.next_seg() {
+            self.ticker.tick();
+            if let Val::U(idx) = seg.first
+                && let Ok(at) = long.binary_search_by_key(&idx, |&(i, _)| i)
+            {
+                sum = sum.saturating_add(seg.len.min(cap).saturating_mul(long[at].1));
             }
         }
-        (rows, entries, excess)
+        sum
     }
 
     /// Scan a document chunk's data. Returns its counts and whether it
@@ -1450,12 +1509,32 @@ impl Scanner {
         let heads = r.usize_c().ok_or_else(malformed)?;
         r.take(heads.checked_mul(32).ok_or_else(malformed)?)
             .ok_or_else(malformed)?;
-        let change_meta = Self::metadata(&mut r).ok_or_else(malformed)?;
-        let op_meta = Self::metadata(&mut r).ok_or_else(malformed)?;
-        let layout =
-            layout_ok(&change_meta, &DOC_CHANGE_SPECS) && layout_ok(&op_meta, &DOC_OP_SPECS);
-        let change_cols = self.columns(&mut r, &change_meta, true)?;
-        let op_cols = self.columns(&mut r, &op_meta, true)?;
+        let change_meta = self.metadata(&mut r, &DOC_CHANGE_SPECS)?;
+        let op_meta = self.metadata(&mut r, &DOC_OP_SPECS)?;
+        let layout = change_meta.layout && op_meta.layout;
+        // The rows, groups and repeat runs of the columns, and the long
+        // actors they refer to: each change's own (the change actor
+        // column), and the other actors its ops refer to (the object and
+        // key actor columns, each at most once per change).
+        let (mut change_tally, mut op_tally) = (Tally::default(), Tally::default());
+        let (mut own, mut referred) = (0u64, 0u64);
+        self.columns(&mut r, &change_meta, true, &[], |s, spec, data| {
+            change_tally.add(&DOC_CHANGE_BLOCK, spec, data, &mut s.ticker);
+            if spec == CHANGE_ACTOR && !long.is_empty() {
+                own = own.saturating_add(s.long_actor_bytes(&long, data, u64::MAX));
+            }
+        })?;
+        let changes = change_tally.rows;
+        let hold: &[u64] = if self.exact_gmax { &GMAX_SPECS } else { &[] };
+        let (op_cols, repeated) = self.columns(&mut r, &op_meta, true, hold, |s, spec, data| {
+            op_tally.add(&DOC_OP_BLOCK, spec, data, &mut s.ticker);
+            if (spec == OBJ_ACTOR || spec == KEY_ACTOR) && !long.is_empty() {
+                let bytes = s.long_actor_bytes(&long, data, changes);
+                referred = referred.saturating_add(bytes);
+            }
+        })?;
+        // Only the first chunk's columns are kept.
+        self.keep = false;
         // The head indices: absent (older JS saves), or one per head, then
         // the end of the chunk (Automerge rejects leftover data).
         if !r.done() {
@@ -1466,108 +1545,42 @@ impl Scanner {
                 return Err(Stop::Malformed);
             }
         }
-        // Every rebuilt change holds its own message.
-        let (changes, deps, messages) = self.rows_and_group(
-            &change_cols,
-            &DOC_CHANGE_SPECS,
-            DEPS_GROUP,
-            &[DEPS_MEMBER],
-            &[MESSAGE],
-        );
-        // And its ops' keys and mark names (in its bytes).
-        let (ops, succ, strings) = self.rows_and_group(
-            &op_cols,
-            &DOC_OP_SPECS,
-            SUCC_GROUP,
-            &SUCC_MEMBERS,
-            &[KEY_STR, MARK_NAME],
-        );
-        let actor_copies = if long.is_empty() {
-            0
-        } else {
-            self.actor_copies(&long, &change_cols, &op_cols, changes, succ)
-        };
-        counts.rebuilt = messages
-            .saturating_add(strings)
-            .saturating_add(actor_copies);
-        counts.changes = changes;
-        counts.deps = deps;
-        counts.ops = ops;
-        counts.succ = succ;
-        counts.gmax = if succ == 0 {
-            0
-        } else if self.exact_gmax {
-            gmax(&op_cols, ops, &mut self.ticker)
-        } else {
-            self.gmax_bounded = true;
-            succ
-        };
-        if std::mem::take(&mut self.keep) {
-            self.kept = change_cols
-                .into_iter()
-                .chain(op_cols)
-                .filter_map(|c| match c.data {
-                    // Held through the load: no spare capacity (what is
-                    // held is exactly the inflated bytes, each charged).
-                    Cow::Owned(mut data) => {
-                        data.shrink_to_fit();
-                        Some(data)
-                    }
-                    Cow::Borrowed(_) => None,
-                })
-                .collect();
-        }
-        Ok(layout && r.canonical)
-    }
-
-    /// The bytes of long actor ids (`long`: index and length of every
-    /// actor longer than [`INLINE_ACTOR`]) that a document's rebuilt
-    /// changes hold: each change holds its own actor and the other actors
-    /// its ops refer to, in its bytes and as `ActorId`s. Run by run: the
-    /// change actor column's runs times the actor's length (its own), and
-    /// for the other actors the object and key actor columns' runs, each
-    /// at most once per change (`changes`), plus for every successor entry
-    /// (`succ`) three references (a rebuilt op's pred, or a delete Automerge
-    /// rebuilds from it: its object, key and pred) of the longest actor;
-    /// at most every change referring to every long actor.
-    fn actor_copies(
-        &mut self,
-        long: &[(u64, u64)],
-        change_cols: &[Column<'_>],
-        op_cols: &[Column<'_>],
-        changes: u64,
-        succ: u64,
-    ) -> u64 {
-        let len_of = |idx: u64| {
-            long.binary_search_by_key(&idx, |&(i, _)| i)
-                .map_or(0, |at| long[at].1)
-        };
-        let mut sum_runs = |cols: &[Column<'_>], spec: u64, cap: u64| -> u64 {
-            let mut sum = 0u64;
-            for col in cols.iter().filter(|c| c.spec == spec) {
-                let mut runs = Runs::new(spec & 7, &col.data);
-                while let Some(seg) = runs.next_seg() {
-                    self.ticker.tick();
-                    if let Val::U(idx) = seg.first {
-                        let copies = seg.len.min(cap);
-                        sum = sum.saturating_add(copies.saturating_mul(len_of(idx)));
-                    }
-                }
-            }
-            sum
-        };
-        let own = sum_runs(change_cols, CHANGE_ACTOR, u64::MAX);
-        let referred = sum_runs(op_cols, OBJ_ACTOR, changes)
-            .saturating_add(sum_runs(op_cols, KEY_ACTOR, changes));
+        let (ops, succ) = (op_tally.rows, op_tally.entries);
+        // A change refers to another actor for each successor entry, at
+        // most three times (a rebuilt op's pred, or a delete Automerge
+        // rebuilds from it: its object, key and pred); and at most to
+        // every long actor.
         let longest = long.iter().map(|&(_, len)| len).max().unwrap_or(0);
-        let all: u64 = long
+        let all = long
             .iter()
             .map(|&(_, len)| len)
             .fold(0, u64::saturating_add);
         let others = referred
             .saturating_add(succ.saturating_mul(3).saturating_mul(longest))
             .min(changes.saturating_mul(all));
-        own.saturating_add(others)
+        // Every rebuilt change holds its own message, its ops' keys and
+        // mark names (in its bytes), and its actors.
+        counts.rebuilt = change_tally
+            .excess
+            .saturating_add(op_tally.excess)
+            .saturating_add(own)
+            .saturating_add(others);
+        counts.extra_columns = change_meta.extra.saturating_add(op_meta.extra);
+        counts.changes = changes;
+        counts.deps = change_tally.entries;
+        counts.ops = ops;
+        counts.succ = succ;
+        counts.gmax = if succ == 0 {
+            0
+        } else if self.exact_gmax && !repeated {
+            gmax(&op_cols, ops, &mut self.ticker)
+        } else {
+            // At its bound (also for a column listed twice: which of them
+            // Automerge reads is not modelled, the bound holds for both).
+            self.gmax_bounded |= !self.exact_gmax;
+            succ
+        };
+        Ok(layout && r.canonical)
     }
 
     /// Scan a change chunk's data (inflated if it was compressed).
@@ -1607,39 +1620,134 @@ impl Scanner {
             counts.other_actor_entries = counts.other_actor_entries.saturating_add(1);
             self.actor(id);
         }
-        let meta = Self::metadata(&mut r).ok_or_else(malformed)?;
-        let cols = self.columns(&mut r, &meta, false)?;
+        let meta = self.metadata(&mut r, &CHANGE_OP_SPECS)?;
+        let mut tally = Tally::default();
+        self.columns(&mut r, &meta, false, &[], |s, spec, data| {
+            tally.add(&CHANGE_OP_BLOCK, spec, data, &mut s.ticker);
+        })?;
         // Applying the change copies every op's key and mark name.
-        let (ops, preds, strings) = self.rows_and_group(
-            &cols,
-            &CHANGE_OP_SPECS,
-            PRED_GROUP,
-            &PRED_MEMBERS,
-            &[KEY_STR, MARK_NAME],
-        );
-        counts.repeated = counts.repeated.saturating_add(strings);
-        counts.ops = counts.ops.saturating_add(ops);
-        counts.preds = counts.preds.saturating_add(preds);
+        counts.repeated = counts.repeated.saturating_add(tally.excess);
+        counts.extra_columns = counts.extra_columns.saturating_add(meta.extra);
+        counts.ops = counts.ops.saturating_add(tally.rows);
+        counts.preds = counts.preds.saturating_add(tally.entries);
         counts.changes = counts.changes.saturating_add(1);
         counts.deps = counts.deps.saturating_add(deps as u64);
         Ok(())
     }
 }
 
-/// The layout rule Automerge's column parser enforces, conservatively:
-/// the specs (deflate bit cleared) are a subsequence of the specs
-/// Automerge writes, in that order, and every value column comes right
-/// after its metadata column (see [`crate::header::document_parses`]).
-fn layout_ok(cols: &[(u64, usize)], known: &[u64]) -> bool {
-    let specs: Vec<u64> = cols.iter().map(|&(spec, _)| spec & !DEFLATE_BIT).collect();
-    let mut rest = known.iter();
-    if !specs.iter().all(|s| rest.any(|k| k == s)) {
-        return false;
+/// A column metadata block, validated ([`Scanner::metadata`]).
+struct Meta<'a> {
+    /// Its entries' bytes.
+    entries: &'a [u8],
+    /// How many.
+    count: usize,
+    /// Entries beyond one per column Automerge writes ([`extra_entries`]).
+    extra: u64,
+    /// The specs follow [`Layout`]'s rule.
+    layout: bool,
+}
+
+/// The entries of a metadata block of `count` beyond one per column of
+/// `known` (the columns Automerge writes, whose entries the per-op and
+/// per-change costs include).
+fn extra_entries(count: usize, known: &[u64]) -> u64 {
+    count.saturating_sub(known.len()) as u64
+}
+
+/// The layout rule Automerge's column parser enforces, conservatively,
+/// checked spec by spec: the specs (deflate bit cleared) are a
+/// subsequence of the specs Automerge writes, in that order, and every
+/// value column comes right after its metadata column (see
+/// [`crate::header::document_parses`]).
+struct Layout<'k> {
+    /// The specs a next one may be (the rest of the known ones).
+    rest: std::slice::Iter<'k, u64>,
+    prev: Option<u64>,
+    ok: bool,
+}
+
+impl<'k> Layout<'k> {
+    fn new(known: &'k [u64]) -> Self {
+        Layout {
+            rest: known.iter(),
+            prev: None,
+            ok: true,
+        }
     }
-    specs
-        .iter()
-        .enumerate()
-        .all(|(i, &s)| s & 0x07 != VALUE || (i > 0 && specs[i - 1] == s - 1))
+
+    fn step(&mut self, spec: u64) {
+        let value_ok = spec & 0x07 != VALUE || self.prev == Some(spec - 1);
+        self.ok = self.ok && value_ok && self.rest.any(|&k| k == spec);
+        self.prev = Some(spec);
+    }
+}
+
+/// Which columns of a metadata block count what (see [`Tally`]).
+struct Block {
+    /// The columns Automerge writes (the others are not counted).
+    known: &'static [u64],
+    /// The group column whose values are summed, and its members.
+    group: u64,
+    members: &'static [u64],
+    /// The string columns whose repeat runs are copied.
+    strings: &'static [u64],
+}
+
+const DOC_CHANGE_BLOCK: Block = Block {
+    known: &DOC_CHANGE_SPECS,
+    group: DEPS_GROUP,
+    members: &[DEPS_MEMBER],
+    strings: &[MESSAGE],
+};
+const DOC_OP_BLOCK: Block = Block {
+    known: &DOC_OP_SPECS,
+    group: SUCC_GROUP,
+    members: &SUCC_MEMBERS,
+    strings: &[KEY_STR, MARK_NAME],
+};
+const CHANGE_OP_BLOCK: Block = Block {
+    known: &CHANGE_OP_SPECS,
+    group: PRED_GROUP,
+    members: &PRED_MEMBERS,
+    strings: &[KEY_STR, MARK_NAME],
+};
+
+/// The columns [`gmax`] merges.
+const GMAX_SPECS: [u64; 7] = [
+    OBJ_ACTOR, OBJ_CTR, KEY_ACTOR, KEY_CTR, KEY_STR, INSERT, SUCC_GROUP,
+];
+
+/// What the columns of a metadata block add up to, column by column.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally {
+    /// Rows of the known non-member, non-value columns (the largest).
+    rows: u64,
+    /// The group's entries: the larger of its sum and its members' rows.
+    entries: u64,
+    /// What the repeat runs of the string columns expand to, summed.
+    excess: u64,
+}
+
+impl Tally {
+    fn add(&mut self, block: &Block, spec: u64, data: &[u8], ticker: &mut Ticker) {
+        let ty = spec & 7;
+        if ty == VALUE || !block.known.contains(&spec) {
+            return;
+        }
+        let stats = column_stats(ty, data, ticker);
+        if spec == block.group {
+            self.entries = self.entries.max(stats.sum);
+        }
+        if block.members.contains(&spec) {
+            self.entries = self.entries.max(stats.rows);
+        } else {
+            self.rows = self.rows.max(stats.rows);
+        }
+        if block.strings.contains(&spec) {
+            self.excess = self.excess.saturating_add(stats.excess);
+        }
+    }
 }
 
 /// A row's object (actor, counter), key (actor, counter, string) and
@@ -1984,13 +2092,19 @@ pub fn gmax_by_rows(bytes: &[u8]) -> Option<u64> {
     }
     let heads = usize::try_from(r.uleb()?).ok()?;
     r.take(heads * 32)?;
-    let change_meta = Scanner::metadata(&mut r)?;
-    let op_meta = Scanner::metadata(&mut r)?;
     let mut scanner = Scanner::new(None, true);
-    scanner.columns(&mut r, &change_meta, true).ok()?;
-    let cols = scanner.columns(&mut r, &op_meta, true).ok()?;
-    let (rows, _, _) = scanner.rows_and_group(&cols, &DOC_OP_SPECS, SUCC_GROUP, &SUCC_MEMBERS, &[]);
-    let rows_usize = usize::try_from(rows).ok()?;
+    let change_meta = scanner.metadata(&mut r, &DOC_CHANGE_SPECS).ok()?;
+    let op_meta = scanner.metadata(&mut r, &DOC_OP_SPECS).ok()?;
+    scanner
+        .columns(&mut r, &change_meta, true, &[], |_, _, _| {})
+        .ok()?;
+    let mut tally = Tally::default();
+    let (cols, _) = scanner
+        .columns(&mut r, &op_meta, true, &GMAX_SPECS, |s, spec, data| {
+            tally.add(&DOC_OP_BLOCK, spec, data, &mut s.ticker);
+        })
+        .ok()?;
+    let rows_usize = usize::try_from(tally.rows).ok()?;
     let expand = |spec: u64| -> Vec<Val<'_>> {
         let mut out = Vec::new();
         if let Some(col) = cols.iter().find(|c| c.spec == spec) {
