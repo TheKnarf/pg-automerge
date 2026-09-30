@@ -26,7 +26,8 @@ major="$("$PG_CONFIG" --version | sed -n 's/^PostgreSQL \([0-9]*\).*/\1/p')"
 
 out=target/release/pg_automerge-pg18
 rm -rf "$out"
-cargo pgrx package --pg-config "$PG_CONFIG"
+# --locked: build exactly the committed Cargo.lock (fail instead of updating it).
+cargo pgrx package --pg-config "$PG_CONFIG" --cargo=--locked
 tar -C "$out" -czf "$out.tar.gz" .
 
 # The tarball must unpack to where that server looks for extensions.
