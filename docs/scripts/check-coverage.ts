@@ -1,8 +1,12 @@
 // Checks that the site still says everything README.md, docs/DESIGN.md and
 // CHANGELOG.md said before they were ported into pages (run after
 // `pnpm build`): every heading, paragraph, list item, table cell and code
-// block of those files, as they were at SOURCE_REV, must appear in the
+// block of those files, as they were before the port, must appear in the
 // text of some built page, after whitespace is normalized.
+//
+// The pre-port documents are frozen in coverage-sources/ (<name>.orig,
+// byte for byte as they were at commit 6996273, the last commit before
+// the port), so the check needs no git history and survives rebases.
 //
 // Intentional differences are listed in coverage-deviations.json: each
 // replaces `from` with `to` in the source blocks that contain it (both
@@ -11,12 +15,8 @@
 // the list stays exact. When a page is edited on purpose, add a deviation
 // (`node scripts/check-coverage.ts --suggest` proposes one per missing
 // block).
-//
-// Needs the git history up to SOURCE_REV (CI checks out with
-// fetch-depth: 0).
-import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Element, Nodes as HastNodes, Root as HastRoot } from "hast";
 import { fromHtml } from "hast-util-from-html";
@@ -28,12 +28,10 @@ import { toString as mdastToString } from "mdast-util-to-string";
 import { gfm } from "micromark-extension-gfm";
 import { visit } from "unist-util-visit";
 
-// The last commit before the documents were ported into the site.
-const SOURCE_REV = "6996273";
+// Named by their pre-port paths (as in coverage-deviations.json).
 const SOURCES = ["README.md", "docs/DESIGN.md", "CHANGELOG.md"];
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const repo = join(root, "..");
 const dist = join(root, "dist");
 const suggest = process.argv.includes("--suggest");
 
@@ -47,20 +45,10 @@ const norm = (s: string) => s.normalize("NFC").replace(/\s+/g, " ").trim();
 
 // ---- The source blocks ----
 function sourceBlocks(path: string): string[] {
-	let md: string;
-	try {
-		md = execFileSync("git", ["show", `${SOURCE_REV}:${path}`], {
-			cwd: repo,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "pipe"],
-			maxBuffer: 64 << 20,
-		});
-	} catch (e) {
-		console.error(
-			`check-coverage: cannot read ${path} at ${SOURCE_REV} (a shallow clone? fetch the history): ${e}`,
-		);
-		process.exit(1);
-	}
+	const md = readFileSync(
+		join(root, "scripts", "coverage-sources", `${basename(path)}.orig`),
+		"utf8",
+	);
 	const tree = fromMarkdown(md, {
 		extensions: [gfm()],
 		mdastExtensions: [gfmFromMarkdown()],
@@ -228,5 +216,5 @@ deviations.forEach((d, i) => {
 });
 if (failed) process.exit(1);
 console.log(
-	`check-coverage: ok, ${total}/${total} blocks of ${SOURCES.join(", ")} at ${SOURCE_REV} (${counts.join(", ")}) found on ${pages.length} pages; ${viaDeviation} through ${deviations.length} listed deviations`,
+	`check-coverage: ok, ${total}/${total} blocks of the pre-port ${SOURCES.join(", ")} (${counts.join(", ")}) found on ${pages.length} pages; ${viaDeviation} through ${deviations.length} listed deviations`,
 );

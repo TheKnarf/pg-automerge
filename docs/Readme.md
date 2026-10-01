@@ -77,7 +77,8 @@ routes on the site.
 
 `scripts/check-coverage.ts` (part of `pnpm check`) proves nothing was
 lost: it reads README.md, docs/DESIGN.md and CHANGELOG.md as they were
-before the port (from git, commit `SOURCE_REV`), and checks that every
+before the port (frozen, byte for byte as at commit 6996273, in
+`scripts/coverage-sources/*.orig`, so no git history is needed), and checks that every
 heading, paragraph, list item, table cell and code block of them appears,
 whitespace-normalized, in the text of some built page. The intentional
 differences (links that were titled "DESIGN.md" now name their page, and
@@ -85,8 +86,7 @@ prose that said "the README" names the page it meant) are listed with
 their reasons in `scripts/coverage-deviations.json`. When you change a
 ported sentence on purpose, add a deviation for it:
 `node scripts/check-coverage.ts --suggest` proposes one per block it no
-longer finds. It needs the git history (CI checks out with
-`fetch-depth: 0`).
+longer finds.
 
 ## How it fits together
 

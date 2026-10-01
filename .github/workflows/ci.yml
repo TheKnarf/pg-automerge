@@ -44,11 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      # Full history: docs-check (in mise run ci) compares the docs pages
-      # with the documents they were ported from, read from git.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install Postgres build dependencies
         run: |
@@ -144,11 +140,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      # Full history: the coverage check reads the documents the pages were
-      # ported from out of git (docs/scripts/check-coverage.ts).
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       # Node and pnpm as pinned in mise.toml; nothing else.
       - uses: jdx/mise-action@v2

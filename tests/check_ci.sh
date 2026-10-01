@@ -173,10 +173,6 @@ echo "check_ci: workflow ok"
 # deploy-docs.yml, and never part of the Docker build context.
 docs_job="$(job docs)"
 has "$docs_job" '^        run: mise run docs-check$' || fail "$wf: the docs job must run mise run docs-check"
-# docs-check's coverage check reads the pre-port documents from git.
-for j in ci docs; do
-  has "$(job "$j")" '^          fetch-depth: 0$' || fail "$wf: the $j job must check out the full history (docs-check)"
-done
 has "$docs_job" '^          install_args: node pnpm$' || fail "$wf: the docs job installs only node and pnpm"
 has "$docs_job" 'MISE_TASK_RUN_AUTO_INSTALL: "false"' \
   || fail "$wf: the docs job must not let mise run install the Rust toolchain"
@@ -187,6 +183,10 @@ done
 for f in package.json pnpm-lock.yaml ssg.tsx ssg-for-vite.tsx src/ssg-main.tsx src/main.tsx src/routes.tsx scripts/check-site.ts \
   scripts/check-coverage.ts scripts/coverage-deviations.json; do
   [ -f "docs/$f" ] || fail "docs/$f missing"
+done
+# The pre-port documents the coverage check compares the pages with.
+for f in README CHANGELOG DESIGN; do
+  [ -s "docs/scripts/coverage-sources/$f.md.orig" ] || fail "docs/scripts/coverage-sources/$f.md.orig missing"
 done
 [ -x docs/ssg.tsx ] || fail "docs/ssg.tsx must be executable (pnpm build runs it)"
 grep -qE '^      - "docs/\*\*"$' "$docs_wf" || fail "$docs_wf: must run on changes to docs/**"
@@ -201,11 +201,12 @@ grep -qF '<Include file="../../../CHANGELOG.md" />' docs/src/pages/changelog.mdx
 # The documents live in docs/src/pages now: every page path named anywhere
 # in the repository (code comments, tests, CHANGELOG.md, README.md) exists,
 # and nothing points at the removed design document (only the coverage
-# check, which reads it from git, and docs/Readme.md, which says so, name it).
+# check and its frozen pre-port copies, and docs/Readme.md, which says so,
+# name it).
 while read -r ref; do
   [ -f "$ref" ] || fail "a reference to $ref, which does not exist: $(git grep -lF "$ref" | tr '\n' ' ')"
 done < <(git grep -ohE 'docs/src/pages/[A-Za-z0-9_./-]+\.mdx' | sort -u)
-stale="$(git grep -lE '(docs/)?DESIGN\.md' -- ':!docs/scripts/check-coverage.ts' ':!docs/scripts/coverage-deviations.json' ':!docs/Readme.md' || true)"
+stale="$(git grep -lE '(docs/)?DESIGN\.md' -- ':!docs/scripts/check-coverage.ts' ':!docs/scripts/coverage-deviations.json' ':!docs/scripts/coverage-sources' ':!docs/Readme.md' || true)"
 [ -z "$stale" ] || fail "references to the removed design document (now docs/src/pages): $stale"
 # tests/docker_upgrade.sh runs the compose commands of the Updating page.
 grep -qxF 'UPDATING_PAGE=docs/src/pages/guide/updating.mdx' tests/docker_upgrade.sh \
