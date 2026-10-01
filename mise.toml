@@ -6,6 +6,9 @@ rust = { version = "1.98.1", components = "rustfmt,clippy" }
 # binaries. actionlint runs shellcheck on the workflow's run: scripts.
 actionlint = "1.7.12"
 shellcheck = "0.11.0"
+# The documentation site in docs/ (Vite + React + MDX; pnpm package).
+node = "26"
+pnpm = "9.15.4"
 
 [settings]
 # Build cargo tools from source with --locked for reproducibility.
@@ -115,9 +118,10 @@ run = [
 ]
 
 [tasks.ci]
-description = "Everything CI runs: lint, test (all suites), regress"
+description = "Everything CI runs: lint, docs-check, test (all suites), regress"
 run = [
   "mise run lint",
+  "mise run docs-check",
   "mise run test",
   "mise run regress",
 ]
@@ -158,3 +162,27 @@ run = "docker compose up -d --wait"
 [tasks.docker-down]
 description = "Stop the compose.yaml development Postgres (keeps the data volume; docker compose down -v removes it)"
 run = "docker compose down"
+
+# The documentation site (docs/, a standalone pnpm package; docs/Readme.md).
+[tasks.docs-install]
+description = "Install the docs site's dependencies (pnpm, from docs/pnpm-lock.yaml)"
+dir = "{{config_root}}/docs"
+run = "pnpm install --frozen-lockfile --prefer-offline"
+
+[tasks.docs-dev]
+description = "Docs site dev server with hot reload (Vite)"
+depends = ["docs-install"]
+dir = "{{config_root}}/docs"
+run = "pnpm dev"
+
+[tasks.docs-build]
+description = "Build the static docs site into docs/dist (DOCS_BASE: the path it is served under, default /)"
+depends = ["docs-install"]
+dir = "{{config_root}}/docs"
+run = "pnpm build"
+
+[tasks.docs-check]
+description = "Docs site: typecheck, biome, the static build under /pg-automerge/ (or DOCS_BASE), and check-site (every page emitted, every internal link and anchor resolves)"
+depends = ["docs-install"]
+dir = "{{config_root}}/docs"
+run = "DOCS_BASE=\"${DOCS_BASE:-/pg-automerge/}\" pnpm check"

@@ -1,0 +1,32 @@
+---
+title: Introduction
+section: Guide
+order: 0
+description: pg_automerge stores Automerge documents in Postgres 18, queries them as jsonb and merges concurrent writes.
+---
+
+A Postgres 18 extension that stores [Automerge](https://automerge.org)
+documents in an `automerge` column, lets you query them with every `jsonb`
+operator, function and index, and merges concurrent writes so that two
+backends never overwrite each other's changes. It also exposes a
+document's history (changes, and the state as of earlier heads) and the
+structure of its rich text (marks and blocks, as Automerge's `spans()`),
+and notifies listening backends when a document changes.
+
+The extension does not edit documents and never creates changes. Your
+backend syncs with its frontends, owns the actor IDs, and persists
+Automerge saves; Postgres stores them, merges them and makes them
+queryable.
+
+## Where to start
+
+| If you want to                       | Read                                            |
+| ------------------------------------ | ----------------------------------------------- |
+| Store and query your first documents | [Quick start](/guide/quick-start)               |
+| Index documents for read-heavy loads | [Indexing reads](/guide/quick-start#indexing-reads) |
+
+<Callout type="note" title="Work in progress">
+  This site is being assembled from the repository's README.md,
+  docs/DESIGN.md and CHANGELOG.md; until then those files remain the
+  complete reference.
+</Callout>

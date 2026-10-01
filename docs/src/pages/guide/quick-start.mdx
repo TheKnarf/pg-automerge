@@ -1,0 +1,58 @@
+---
+title: Quick start
+section: Guide
+order: 10
+description: Create a table with an automerge column, persist Automerge saves, and query them as jsonb.
+---
+
+## Persist and read documents
+
+```sql
+CREATE TABLE docs (id uuid PRIMARY KEY, doc automerge NOT NULL);
+
+-- Persist: $2 is the output of Automerge save() (or save + incremental saves),
+-- bound as bytea. Concurrent writers merge instead of overwriting.
+INSERT INTO docs (id, doc) VALUES ($1, $2)
+ON CONFLICT (id) DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc);
+
+-- Or persist incrementally: $2 is only the new changes (save_incremental()
+-- or save_after(heads)), bound as bytea, applied on top of the stored row.
+-- A full save works here too, and when the row exists this costs one load
+-- of the save against the upsert's two.
+UPDATE docs SET doc = merge(doc, $2) WHERE id = $1;
+
+-- Read: automerge casts implicitly to jsonb.
+SELECT doc->>'title' FROM docs WHERE doc @> '{"status": "open"}';
+SELECT jsonb_path_query(doc, '$.items[*] ? (@.done == false)') FROM docs;
+
+-- Load it back in the backend.
+SELECT doc::bytea FROM docs WHERE id = $1;
+
+-- Or only what a replica at heads $2 (text[]) is missing, as change chunks
+-- for loadIncremental / applyChanges (Automerge's save_after).
+SELECT automerge_changes_bytes(doc, $2) FROM docs WHERE id = $1;
+
+-- History: who changed what, and the state as of any change.
+SELECT seq, actor, time, message FROM docs, automerge_changes_meta(doc) WHERE id = $1;
+SELECT automerge_to_jsonb(doc, ARRAY[$2]) FROM docs WHERE id = $1;
+```
+
+## Indexing reads
+
+Every read through `jsonb` loads the document. For read-heavy tables, keep
+a jsonb copy and index it (the cast is IMMUTABLE):
+
+```sql
+ALTER TABLE docs ADD COLUMN data jsonb GENERATED ALWAYS AS (doc::jsonb) STORED;
+CREATE INDEX ON docs USING gin (data jsonb_path_ops) WITH (fastupdate = off);
+-- or an expression index on the document itself:
+CREATE INDEX ON docs USING gin ((doc::jsonb)) WITH (fastupdate = off);
+```
+
+<Callout type="tip">
+  For large documents, generate only the fields you query
+  (`GENERATED ALWAYS AS (doc->>'status') STORED`) rather than a full jsonb
+  copy, which doubles what every write stores.
+</Callout>
+
+Back to the [introduction](/), or up to [persisting documents](#persist-and-read-documents).
