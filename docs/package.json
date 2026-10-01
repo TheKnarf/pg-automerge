@@ -8,8 +8,7 @@
 		"typecheck": "tsc --noEmit",
 		"lint": "biome check --error-on-warnings",
 		"check-site": "node scripts/check-site.ts",
-		"check-coverage": "node scripts/check-coverage.ts",
-		"check": "pnpm run lint && pnpm run build && pnpm run check-site && pnpm run check-coverage",
+		"check": "pnpm run lint && pnpm run build && pnpm run check-site",
 		"preview": "vite preview"
 	},
 	"dependencies": {
@@ -30,13 +29,10 @@
 		"@types/stream-buffers": "^3.0.8",
 		"@vitejs/plugin-react": "^6.0.3",
 		"github-slugger": "^2",
-		"hast-util-from-html": "^2",
 		"hast-util-heading-rank": "^3.0.0",
 		"hast-util-to-string": "^3.0.1",
-		"hast-util-to-text": "^4",
 		"mdast-util-from-markdown": "^2",
 		"mdast-util-gfm": "^3",
-		"mdast-util-to-string": "^4",
 		"micromark-extension-gfm": "^3",
 		"rehype-autolink-headings": "^7.1.0",
 		"rehype-slug": "^6.0.0",

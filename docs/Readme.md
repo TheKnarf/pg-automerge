@@ -14,12 +14,12 @@ From the repository root:
 mise run docs-install   # pnpm install --frozen-lockfile
 mise run docs-dev       # dev server with hot reload (client-rendered)
 mise run docs-build     # static site into docs/dist
-mise run docs-check     # typecheck, biome, build, check-site, check-coverage
+mise run docs-check     # typecheck, biome, build, check-site
 ```
 
 or, in `docs/`, `pnpm install` then `pnpm dev`, `pnpm build`,
 `pnpm check`, `pnpm preview` (serves `dist/`; give it the `DOCS_BASE` the
-build had), `pnpm check-site`, `pnpm check-coverage`.
+build had), `pnpm check-site`.
 
 `DOCS_BASE` sets the path the site is served under (default `/`; GitHub
 Pages serves a project site under `/<repo>/`, and `mise run docs-check`
@@ -75,20 +75,10 @@ spliced into the changelog page at build time
 (`<Include file="../../../CHANGELOG.md" />`, see below), so it is edited
 in one place. Its links point at page sources
 (`docs/src/pages/guide/updating.mdx`), which work on GitHub and become
-routes on the site.
-
-`scripts/check-coverage.ts` (part of `pnpm check`) proves nothing was
-lost: it reads README.md, docs/DESIGN.md and CHANGELOG.md as they were
-before the port (frozen, byte for byte as at commit 6996273, in
-`scripts/coverage-sources/*.orig`, so no git history is needed), and checks that every
-heading, paragraph, list item, table cell and code block of them appears,
-whitespace-normalized, in the text of some built page. The intentional
-differences (links that were titled "DESIGN.md" now name their page, and
-prose that said "the README" names the page it meant) are listed with
-their reasons in `scripts/coverage-deviations.json`. When you change a
-ported sentence on purpose, add a deviation for it:
-`node scripts/check-coverage.ts --suggest` proposes one per block it no
-longer finds.
+routes on the site. A one-off check during the port confirmed that every
+block of the old documents appears on some page; the check and its frozen
+copies of the old documents were removed afterwards (they are in git
+history).
 
 ## How it fits together
 
@@ -112,7 +102,7 @@ longer finds.
   compute each page's table of contents.
 - `scripts/copy-404.ts`: `dist/404.html` for GitHub Pages;
   `scripts/check-site.ts`: every page emitted, every internal link and
-  anchor resolves; `scripts/check-coverage.ts`: see above.
+  anchor resolves.
 
 `ssg.tsx`, `ssg-for-vite.tsx`, `src/ssg-main.tsx` and `src/main.tsx` are
 copied unchanged from

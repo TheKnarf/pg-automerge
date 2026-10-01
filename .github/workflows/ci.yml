@@ -132,7 +132,7 @@ jobs:
           path: target/release/pg_automerge-pg18.tar.gz
 
   # The documentation site (docs/): typecheck, biome, the static build
-  # under /pg-automerge/, the link/route check and the coverage check, as
+  # under /pg-automerge/ and the link/route check, as
   # `mise run docs-check` (also part of `mise run ci`). A job of its own so
   # docs feedback does not wait for pgrx; deploy-docs.yml publishes the
   # site from main.

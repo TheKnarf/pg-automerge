@@ -182,7 +182,7 @@ dir = "{{config_root}}/docs"
 run = "pnpm build"
 
 [tasks.docs-check]
-description = "Docs site: typecheck, biome, the static build under /pg-automerge/ (or DOCS_BASE), check-site (every page emitted, every internal link and anchor resolves) and check-coverage (every block of the pre-port README.md, design document and CHANGELOG.md is on a page)"
+description = "Docs site: typecheck, biome, the static build under /pg-automerge/ (or DOCS_BASE), check-site (every page emitted, every internal link and anchor resolves)"
 depends = ["docs-install"]
 dir = "{{config_root}}/docs"
 run = "DOCS_BASE=\"${DOCS_BASE:-/pg-automerge/}\" pnpm check"
