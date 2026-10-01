@@ -1560,7 +1560,9 @@ times, see below); the tests' 3,000,000-character document estimates at
 1.38 GB, so a 1 GB default would refuse it. Time follows the estimate at
 up to about 8 s per GB on the test machine (release build; the core test
 asserts it for every input of its battery when run with `--release`), so
-at the default an uncancellable load takes at most about 16 s. A dev
+at the default an uncancellable load takes at most about 16 s, except
+for many marks applied as changes, whose time grows with the square of
+their number (see [What the limit cannot do](#what-the-limit-cannot-do)). A dev
 build (`cargo pgrx install` without `--release`) does not optimize the
 extension's own crates, and its scan is about ten times slower. Every session can use up to
 the limit at once (plus the stored documents a merge loads, which are not
@@ -1642,7 +1644,10 @@ are input bytes, already charged 10 each).
 - Rebuilt bytes of a document chunk: its change messages (every rebuilt
   change holds its message twice, in its bytes and as a `String`, and a
   load whose heads do not match clones every rebuilt change into its
-  error: 4.0 bytes per byte measured, charged 5), and the actor ids
+  error: 4.0 bytes per byte measured, charged 5), its ops' mark names
+  (3.0 bytes per byte measured, charged 5; priced with the keys at 3
+  until the neighbouring shapes were measured, see [The estimate's
+  neighbourhood](#the-estimates-neighbourhood-2026-10-01)), and the actor ids
   longer than the 16 bytes Automerge's `ActorId` holds inline (every
   rebuilt change holds its own actor and the other actors its ops refer
   to, in its bytes and as `ActorId`s: 4.0 bytes per byte measured,
@@ -1654,8 +1659,8 @@ are input bytes, already charged 10 each).
   it: its object, key and pred); a change holds every actor once at
   most, so its own and the others together are at most changes × the
   long actors' total length.
-- Rebuilt key bytes of a document chunk: its ops' keys and mark names,
-  which a rebuilt change holds once, in its bytes (2.0 bytes per byte
+- Rebuilt key bytes of a document chunk: its ops' keys, which a rebuilt
+  change holds once, in its bytes (2.0 bytes per byte
   measured with the error's clone, 1.6-1.7 for saves written by
   Automerge whose keys are overwritten many times; charged 3).
 - Repeated bytes of changes: the keys and mark names of change chunks
@@ -1733,6 +1738,23 @@ its measurements: upgrading Automerge means re-running
 `crates/pg_automerge_core/tests/memory_bounds.rs` and the fuzz harness
 (below), which check it.
 
+So that an upgrade cannot skip that step, `budget::MEASURED_AUTOMERGE`
+(`0.12.0`) and `budget::MEASURED_HEXANE` (`1.0.0-alpha.5`) name the
+versions the constants were measured with, and a core test
+(`the_cost_model_was_measured_for_this_automerge` in
+`tests/memory_bounds.rs`, part of `cargo test -p pg_automerge_core` and
+so of `mise run ci`) reads `Cargo.lock` and fails on any other version
+with a message that says to re-measure the cost model and how. Hexane is
+Automerge's column store, where most of a load's memory goes; Automerge
+0.12.0 requires `^1.0.0-alpha.5`, so a `cargo update` can move it while
+Automerge (pinned with `=0.12.0` in `Cargo.toml`) stays. To upgrade:
+change the pin, run `cargo test --release -p pg_automerge_core --test
+memory_bounds -- --nocapture` (peaks and ratios are printed per input;
+under `ulimit -v`, so that an estimate too low shows as a failed
+allocation rather than swapping) and `mise run fuzz`, raise the constants
+whose ratios are over the estimate or near it, update the tables here,
+then the two constants.
+
 ### What the estimate covers
 
 Where a load or apply allocates in proportion to something the input
@@ -1747,10 +1769,11 @@ inputs of `tests/memory_bounds.rs` (release build):
 | Actors, the clock cache | 200 per actor, 0.3 per change × actor, 3 per large change × actor | 0.39 (1,000 conflicting forks) |
 | Parsing and applying change chunks | 1,000 per op, 80 per pred, 2,500 per change | 0.67 (marks, as change chunks) |
 | A change header's list of other actors | 100 per entry, duplicates included | 0.64 (2,200,000 empty actors) |
-| Bytes, inflated (values, strings, the chunk buffers) | 10 per byte | 0.71 (1 MB of bytes, compressed save) |
-| Change messages repeated by a run, copied into every rebuilt change (document chunk) | 5 per rebuilt byte | 0.80 (2,000 changes, one 100 kB message) |
-| Keys and mark names repeated by a run, copied into every rebuilt change (document chunk) | 3 per rebuilt key byte | 0.67 (2,000 changes, one 100 kB key) |
-| Actor ids over 16 bytes, copied into every rebuilt change that refers to them (document chunk) | 5 per rebuilt byte | 0.80 (2,000 changes by, or referring to, a 100 kB actor) |
+| Bytes, inflated (values, strings stored literally: different messages, keys, mark names, values and extra bytes; actor ids in actor tables and change headers; the chunk buffers) | 10 per byte | 0.79 (2,000 different 2 kB messages, deflated document chunk; 0.77 for 2,000 different 2 kB mark names in a change chunk) |
+| Change messages repeated by a run, copied into every rebuilt change (document chunk) | 5 per rebuilt byte | 0.80 (2,000 changes, one 100 kB message; also runs of nine interleaved with different messages) |
+| Mark names repeated by a run, copied into every rebuilt change (document chunk) | 5 per rebuilt byte | 0.60 (2,000 changes, one 100 kB mark name; 1.00 when they were priced as keys, at 3) |
+| Keys repeated by a run, copied into every rebuilt change (document chunk) | 3 per rebuilt key byte | 0.67 (2,000 changes, one 100 kB key) |
+| Actor ids over 16 bytes, copied into every rebuilt change that refers to them (document chunk) | 5 per rebuilt byte | 0.80 (2,000 changes referring to a 100 kB actor from any actor column: the change's, an op id's, an object's, a key's, a pred's or a successor's) |
 | Keys and mark names repeated by a run, one owned copy per op when applied, and held literally by the document where other keys come between (change chunks) | 8 per repeated byte | 0.59 (500 maps, one 50 kB key interleaved) |
 | Column metadata entries beyond one per column Automerge writes | 200 per entry | 0.79 (4,200,000 empty columns, compressed change chunk) |
 | Merging inserts scattered over a large list (column slabs split as they are inserted into) | not priced beyond the per-op costs | open: under review |
@@ -1803,6 +1826,11 @@ chunk:
   deflate to 19 kB, and stepping through them would take seconds. So
   does a column metadata block whose extra entries alone exceed the
   limit (200 each): 12,000,000 empty columns deflate to 24 kB.
+- It keeps every distinct actor id of change chunks (and of document
+  chunks after the first) once, to count them by name: at most the
+  input's bytes (each charged 10), so refusing input with many long
+  actor ids costs up to its size (1 MB for 1,000 actor ids of 1 kB in a
+  change chunk), still a small fraction of its estimate.
 - It never fails. Framing it cannot parse (bad magic, lengths, column
   metadata, a column that does not inflate, an unknown chunk type) stops
   it with the counts of what came before, which is all Automerge can
@@ -1897,6 +1925,32 @@ again as new input, which is what a restore does:
   applies.
 - Make a load cancellable; it bounds its length (about 8 s per GB of the
   estimate).
+- Bound the time of applying many marks (open, found by the
+  neighbouring-shapes round, see [The estimate's
+  neighbourhood](#the-estimates-neighbourhood-2026-10-01)). Applying
+  changes whose mark ops overlap (marks of one text that are open at the
+  same point, such as marks that all start after the same character)
+  takes time quadratic in their number, and with different names also
+  in proportion to the names' length: Automerge's `MarkStateMachine`
+  (`marks.rs`) keeps the open marks in a vector it searches by name for
+  every mark op, and clones the current mark set (`Arc::make_mut`)
+  while it is shared. A 122-byte change chunk of 32,000 marks with one
+  8-byte name takes 3.1 s (estimate 33 MB: 96 s per GB); 8,000 marks
+  with different 2 kB names (16 MB) take 16.5 s (estimate 161 MB);
+  1,000,000 marks, about 1 GB of estimate and within the default limit,
+  would take about 50 minutes, uncancellable. The memory stays within
+  the estimate (0.77 at most). Every path that applies changes is
+  affected (`merge(doc, changes)`, `||`, merges of two documents and
+  `merge_agg` that apply such changes, a later document chunk in the
+  input); loading a save is not (4,000 overlapping marks with different
+  names: 21 ms as a save, 222 ms as change chunks). Not priced because
+  the cheap bound, the number of mark ops squared, would refuse
+  ordinary rich text: a document with 100,000 marks that never overlap
+  applies in linear time, and could then no longer be merged or sent as
+  changes. The options are a quadratic term all the same (about 0.4 bytes
+  per pair of mark ops in one apply refuses more than about 70,000 at
+  the default limit), a cap on the mark ops of one apply, or a fix in
+  Automerge.
 
 ### Tests
 
@@ -1932,12 +1986,35 @@ again as new input, which is what a restore does:
   counts against Automerge's
   `stats()` and its own change parser, Gmax against the row-by-row
   definition on random histories, merge results outgrowing the limit, the
-  guarantees under a lowered limit, bundles, and the messages.
+  guarantees under a lowered limit, bundles, and the messages. The
+  neighbouring shapes of the string and actor terms (see [The estimate's
+  neighbourhood](#the-estimates-neighbourhood-2026-10-01)), with the same
+  checks: every string-valued column (document change messages, keys,
+  mark names, string values and extra bytes; change-chunk keys, mark
+  names, values, messages and extra bytes) as one repeat run, as
+  different strings and as runs interleaved with literals, plain and
+  deflated or compressed, as a document chunk, a change chunk and after
+  another save (a crafted document chunk also with a made-up head);
+  actor ids of 17 bytes, 1 kB and 100 kB from every actor column of a
+  document chunk (change, op id, object, key, pred, successor, an actor
+  table no op refers to) and of a change chunk (its own actor; another
+  one its ops refer to by object, key or pred, after the long actor's
+  document; many others no op refers to); each through `merge_changes`
+  onto a stored document too; and the same columns and actor ids in
+  documents written by Automerge, as saves, compressed saves and change
+  chunks, on their own and after another save. Inputs with many marks
+  are exempt from the time bound only (see [What the limit cannot
+  do](#what-the-limit-cannot-do)). And a guard that fails when
+  `Cargo.lock` has another Automerge or hexane than the cost model was
+  measured with.
 - The fuzz harness (`tests/fuzz.rs`): input Automerge loads is never
   marked unparseable by the scan, `normalize`'s measured peak stays below
   the estimate whether Automerge accepts the input or refuses it, and it
   refuses input only when the estimate is over. Its seeds include change
-  chunks with repeated header list entries.
+  chunks with repeated header list entries, and small versions of the
+  neighbouring shapes (strings interleaved with runs in document and
+  change columns, extra bytes, a chain of change chunks with messages,
+  long actor ids referred to by key and by pred).
 - `src/tests/limits.rs` (pg_tests): the setting's default, unit and
   privileges; `53400` with its message, DETAIL and HINT on every SQL path
   (text input, `COPY` text and binary, the `bytea` cast, `merge` and `||`
@@ -4360,3 +4437,92 @@ What they show:
   3.01-3.02 MB, backend RSS high-water growth 11.1 MB, container
   anonymous memory 1.48-1.63 GB at the median per window and 2.34 GB at
   most, `read_gin` median 1.0 → 2.3 ms, 1,305 kB of WAL per write.
+
+### The estimate's neighbourhood (2026-10-01)
+
+The terms of [Rebuilt copies and column
+metadata](#rebuilt-copies-and-column-metadata-2026-09-30) were measured on
+the shapes that found them (one repeat run of a message, key or mark
+name; a long actor id as the change's actor or the object's). This round
+measured the shapes next to them, 592 new measurements in
+`tests/memory_bounds.rs` (release build, the counting allocator, the
+battery run under `ulimit -v 32 GB`; worst peak / estimate per shape,
+over its plain and deflated or compressed forms, on its own, after
+another save and through `merge_changes`; "refused" means Automerge
+refused the input after allocating for it, as the crafted document
+chunks without heads are):
+
+| Input | Worst ratio | Peak (MB) | Estimate (MB) |
+|---|---|---|---|
+| Document chunk, 2,000 changes, messages: one 100 kB run / 2 kB each, different / runs of nine of 20 kB between different ones | 0.80 / 0.79 / 0.80 | 766 / 33 / 186 | 958 / 42 / 233 |
+| Document chunk, keys, the same three shapes | 0.67 / 0.60 / 0.63 | 385 / 26 / 110 | 578 / 43 / 173 |
+| Document chunk, mark names, the same three shapes | 0.60 (**1.00** before) / 0.69 / 0.63 (0.86 before) | 575 / 30 / 148 | 959 / 43 / 234 |
+| Document chunk, 2,000 string values or extra bytes of 2 kB (all three shapes: the raw column holds every value) | 0.60 / 0.61 | 26 / 25 | 43 / 42 |
+| Change chunk, 2,000 keys / mark names / string values, the three shapes | 0.67 / 0.77 / 0.67 | 27 / 31 / 27 | 40 / 40 / 40 |
+| Change chunk, one 30 MB message / 30 MB of extra bytes | 0.60 / 0.50 | 172 / 143 | 286 / 286 |
+| 2,000 change chunks with messages or extra bytes of 2 kB each (the three shapes), on their own and after a save | 0.45 / 0.37 | 22 / 18 | 47 / 47 |
+| Document chunk, a 17-byte / 1 kB / 100 kB actor id as the change actor (20,000 / 20,000 / 2,000 changes) | 0.70 / 0.77 / 0.80 | 25 / 100 / 766 | 36 / 130 / 958 |
+| The same as the op id actor, object actor, key actor | 0.58-0.63 / 0.73-0.74 / 0.80 | | |
+| The same as the pred of every rebuilt change (the successor column holds the short actor), and as the successor actor | 0.50 / 0.68 / 0.80 | 33 / 108 / 767 | 66 / 159 / 962 |
+| Document chunk, an actor table of 1,000 / 1,000 / 200 actors of 17 bytes / 1 kB / 100 kB no op refers to | 0.28 / 0.20 / 0.20 | 0.2 / 2 / 38 | 0.6 / 10 / 191 |
+| Change chunk by a 17-byte / 1 kB / 100 kB actor (20,000 / 20,000 / 2,000 ops) | 0.73 / 0.73 / 0.56 | 14 / 14 / 2 | 19 / 19 / 3 |
+| Change chunk of a 16-byte actor whose 20,000 ops refer to another, long actor (17 bytes or 1 kB) by object / key / pred, after the long actor's document and through `merge_changes` into it (2,000 ops for a 100 kB actor: 0.26 / 0.34 / 0.28) | 0.48 / 0.64 / 0.45 | 9 / 12 / 9 | 19 / 19 / 21 |
+| Change chunk listing 1,000 / 200 other actors of 1 kB / 100 kB that no op refers to (Automerge panics applying it: refused as malformed) | 0.39 / 0.46 | 4 / 89 | 10 / 193 |
+| Written by Automerge, 2,000 commits each adding a key / string value / message / mark name, the three shapes (save, compressed, change chunks; on their own, after a save, through `merge_changes`) | 0.49 / 0.52 / 0.56 / 0.70 | | |
+| Written by Automerge, two actors with 17-byte / 1 kB / 100 kB ids taking turns (5,000 / 5,000 / 1,000 commits) overwriting each other's keys and inserting after and deleting each other's characters | 0.47 / 0.37 / 0.40 | 21 / 26 / 384 | 44 / 68 / 961 |
+
+One term was too low: mark names repeated by a run in a document chunk
+cost 3.0 bytes per expanded byte (a rebuilt change holds a mark name
+about as a message, where a key costs 2.0), and were charged 3, with
+the keys: 2,000 changes sharing one 100 kB mark name peaked at 603 MB
+against an estimate of 606 MB (0.996; plain and deflated), and runs of
+nine interleaved with different names at 0.86. Below the estimate, but
+with none of the margin every other measured shape keeps (0.80 at
+most), so the next shape over could have exceeded it. Mark names are
+now rebuilt bytes, charged 5 like messages: 0.60 and 0.63. The scan is
+unchanged otherwise (the mark name column's excess was already computed
+separately per column; it is now added to the other sum). The estimates
+of all 129 measurements that existed before are byte for byte the same
+(none of their documents repeats a mark name by a run), so their worst
+ratio is still 0.80.
+
+Found besides, and not fixed: applying many overlapping marks takes
+time quadratic in their number (see [What the limit cannot
+do](#what-the-limit-cannot-do)). `normalize`, release, the limit off:
+
+| Change chunk | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 | 32,000 |
+|---|---|---|---|---|---|---|
+| marks after one character, one 8-byte name (122 bytes) | | 0.017 s | 0.053 s | 0.18 s | 0.67 s | 3.07 s (96 s per GB of estimate) |
+| marks after one character, different 8-byte names | 0.012 s | 0.036 s | 0.12 s | 0.44 s | | |
+| marks after one character, different 2 kB names | 0.22 s | 1.05 s | 4.1 s | 16.5 s (98 s per GB) | | |
+| Automerge-written marks over the whole text, different names, as change chunks | | 0.066 s | 0.22 s | | | |
+| Automerge-written marks one per character (40 names), as change chunks | | 0.031 s | 0.065 s | 0.14 s | | |
+| list inserts after one element (for comparison) | | 0.006 s | 0.011 s | 0.021 s | | |
+
+The memory of every one of them stayed within the estimate (0.77 at
+most). The battery's inputs with many marks are exempt from its time
+bound, which every other input still meets.
+
+Also: the scan holds the distinct actor ids of change chunks (by name,
+to count them), so refusing a change listing 1,000 actor ids of 1 kB
+peaks at 1 MB, the input's size. The rejection check of the battery
+allowed only the inflated bytes; it allows the input's size now
+(estimate / 10 at most, as each byte costs 10).
+
+Cost: the scan adds one comparison per string column. `bench-core`,
+the commit before and this one alternating, five pairs, median of the
+per-run medians (ms; release):
+
+| document | normalize stored, before | after | compressed, before | after | scan, compressed |
+|---|---|---|---|---|---|
+| 3 MB text | 2504.8 | 2505.2 | 2547.6 | 2538.4 | 21.3 → 21.3 |
+| 877 kB list | 163.1 | 161.5 | 165.3 | 166.9 | 2.5 → 2.5 |
+| 83 kB list | 15.9 | 15.9 | 16.4 | 16.3 | 0.3 → 0.3 |
+| 5,000 typed characters | 22.3 | 22.6 | 22.2 | 22.5 | 0.0 → 0.0 |
+| 20,000 rich-text spans | 388.2 | 385.9 | 391.4 | 389.4 | 6.7 → 6.7 |
+
+All within −1.0% to +1.4%, the noise: `Automerge::load`, whose code did
+not change, moved −0.4% to +2.8%. A 200,000-input release fuzz session
+(`mise run fuzz`, with the new seeds) found no violation. The battery
+takes 156 s in a release build (37 s before) and 240 s in the dev build
+of `mise run test`.

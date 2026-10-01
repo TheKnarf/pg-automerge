@@ -25,7 +25,11 @@
 //! columns through that load, and the bundle chunk is refused.
 //!
 //! This is the test that has to be re-run when Automerge is upgraded:
-//! the estimate's constants are measured costs of Automerge 0.12.
+//! the estimate's constants are measured costs of Automerge 0.12, and
+//! `the_cost_model_was_measured_for_this_automerge` fails on another
+//! Automerge (or hexane) until they have been re-measured. Run it in a
+//! release build with `--nocapture` (under `ulimit -v`) to see every
+//! input's peak and estimate.
 
 use automerge::marks::{ExpandMark, Mark};
 use automerge::transaction::{CommitOptions, Transactable};
@@ -249,6 +253,13 @@ fn limit_error(result: Result<impl Sized, Error>) -> Option<budget::LimitError> 
 /// rejects it before loading, with a peak that is a small fraction of
 /// the estimate. Returns the estimate.
 fn check_normalize(name: &str, input: &[u8], loads: bool) -> u64 {
+    check_normalize_as(name, input, Some(loads)).0
+}
+
+/// [`check_normalize`], with whether Automerge accepts the input asserted
+/// only when `loads` says. Returns the estimate and the peak's ratio to
+/// the limit the input was accepted at.
+fn check_normalize_as(name: &str, input: &[u8], loads: Option<bool>) -> (u64, f64) {
     let scanned = scan_input_exact(input, None);
     assert!(!scanned.malformed, "{name}: scan says malformed");
     let estimate = scanned.load_estimate();
@@ -281,7 +292,7 @@ fn check_normalize(name: &str, input: &[u8], loads: bool) -> u64 {
     // most); only meaningful in a release build (`cargo test --release`),
     // the dev build does not optimize this crate.
     let per_gb = elapsed / (limit as f64 / f64::from(1u32 << 30));
-    if !cfg!(debug_assertions) {
+    if !cfg!(debug_assertions) && !NO_TIME_BOUND.with(std::cell::Cell::get) {
         assert!(
             elapsed <= 8.0 * limit as f64 / f64::from(1u32 << 30) + 0.25,
             "{name}: {elapsed:.2} s for an estimate of {limit} ({per_gb:.1} s per GB)"
@@ -291,16 +302,23 @@ fn check_normalize(name: &str, input: &[u8], loads: bool) -> u64 {
         limit_error(result.clone()).is_none(),
         "{name}: rejected at its own estimate: {result:?}"
     );
-    assert_eq!(result.is_ok(), loads, "{name}: {result:?}");
+    if let Some(loads) = loads {
+        assert_eq!(result.is_ok(), loads, "{name}: {result:?}");
+    }
+    let ratio = peak as f64 / limit as f64;
     assert!(
         peak <= limit,
         "{name}: normalize peak {peak} above the estimate {limit} ({:.2})",
         peak as f64 / limit as f64
     );
     eprintln!(
-        "{name}: {} bytes, estimate {limit}, peak {peak} ({:.2}), {elapsed:.3} s ({per_gb:.2} s per GB)",
+        "{name}: {} bytes, estimate {limit}, peak {peak} ({ratio:.2}), {}, {elapsed:.3} s ({per_gb:.2} s per GB)",
         input.len(),
-        peak as f64 / limit as f64
+        if result.is_ok() {
+            "loads"
+        } else {
+            "refused by Automerge"
+        }
     );
 
     // At the input's own estimate, when the document it normalizes to is
@@ -326,18 +344,40 @@ fn check_normalize(name: &str, input: &[u8], loads: bool) -> u64 {
         limit_error(result).unwrap_or_else(|| panic!("{name}: not rejected below its estimate"));
     assert_eq!(err.kind, LimitKind::Input);
     assert!(
-        peak <= small(&scanned, estimate),
+        peak <= small(&scanned, estimate, input.len()),
         "{name}: rejected, but with a peak of {peak} (estimate {estimate})"
     );
     set_limit(None);
-    estimate
+    (estimate, ratio)
 }
 
 /// What a rejection may cost: the scan's own inflation (with slack for
-/// vector growth) and a little more, never close to the estimate.
-fn small(scanned: &InputCounts, estimate: u64) -> u64 {
+/// vector growth), the distinct actor ids of change chunks it keeps (at
+/// most the input's bytes, each charged 10 in the estimate) and a little
+/// more, never close to the estimate.
+fn small(scanned: &InputCounts, estimate: u64, input_len: usize) -> u64 {
     let inflated = scanned.parse_estimate();
-    (3 * inflated + (256 << 10)).min(estimate / 3).max(64 << 10)
+    (3 * inflated + input_len as u64 + (256 << 10))
+        .min(estimate / 3)
+        .max(64 << 10)
+}
+
+thread_local! {
+    /// [`check_normalize`] does not hold this thread's loads to the time
+    /// bound ([`without_time_bound`]).
+    static NO_TIME_BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with its loads exempt from the time bound of
+/// [`check_normalize`] (still measured and printed): for the inputs whose
+/// time is known not to follow the estimate (docs/DESIGN.md, "What the
+/// limit cannot do": overlapping marks applied as changes take time
+/// quadratic in their number).
+fn without_time_bound<T>(f: impl FnOnce() -> T) -> T {
+    NO_TIME_BOUND.with(|c| c.set(true));
+    let result = f();
+    NO_TIME_BOUND.with(|c| c.set(false));
+    result
 }
 
 #[test]
@@ -430,14 +470,19 @@ fn crafted_inputs_are_priced_before_they_load() {
 fn check_apply(name: &str, input: &[u8]) -> f64 {
     // Another actor's document (the crafted changes are actor 0's).
     let (base, _) = concurrent("text", 100, 9);
-    let doc_a = doc_estimate(&scan_doc_exact(&base));
+    check_apply_onto(name, &base, input)
+}
+
+/// [`check_apply`] onto the stored document `base`.
+fn check_apply_onto(name: &str, base: &[u8], input: &[u8]) -> f64 {
+    let doc_a = doc_estimate(&scan_doc_exact(base));
     let scanned = scan_input_exact(input, None);
     let input_estimate = scanned
         .load_estimate()
-        .max(scanned.apply_estimate(Base::from(&scan_doc(&base))));
+        .max(scanned.apply_estimate(Base::from(&scan_doc(base))));
     let limit = doc_a + input_estimate;
     set_limit(Some(Some(limit)));
-    let (result, peak) = peak_of(|| loaded::merge_changes(Input::Stored(&base), input));
+    let (result, peak) = peak_of(|| loaded::merge_changes(Input::Stored(base), input));
     set_limit(None);
     assert!(
         limit_error(result.as_ref().map(|_| ()).map_err(Clone::clone))
@@ -469,12 +514,18 @@ fn after_save(input: &[u8]) -> Vec<u8> {
 /// `merge_changes`, where Automerge rebuilds its changes and applies them
 /// (the made-up head is not checked: they load).
 fn check_rebuilt(name: &str, crafted: &[u8]) {
+    check_rebuilt_as(name, crafted, Some(true));
+}
+
+/// [`check_rebuilt`], with whether the load after another save succeeds
+/// asserted only when `loads` says.
+fn check_rebuilt_as(name: &str, crafted: &[u8], loads: Option<bool>) {
     let input = craft::with_head(crafted);
     check_apply(&format!("{name}, one head"), &input);
-    check_normalize(
+    check_normalize_as(
         &format!("save + {name}, one head"),
         &after_save(&input),
-        true,
+        loads,
     );
 }
 
@@ -1235,4 +1286,411 @@ fn a_lowered_limit_leaves_stored_values_and_no_op_writes_alone() {
     // New input is refused.
     assert!(limit_error(normalize(&stored)).is_some());
     set_limit(None);
+}
+
+// ---------------------------------------------------------------------------
+// Neighbouring shapes of the string and actor terms (docs/DESIGN.md, "The
+// estimate's neighbourhood"): every string-valued column as one repeat run,
+// many distinct strings and runs interleaved with literals, plain and
+// compressed, as a document chunk, a change chunk and after another save;
+// long actor ids from every actor column; each also through
+// `merge_changes` onto a stored document.
+// ---------------------------------------------------------------------------
+
+use craft::Strings;
+
+/// How many strings, and how long, for a shape of a string column that
+/// is run-length encoded (messages, keys, mark names): a repeat run is
+/// priced by what it expands to, so it can be long; distinct strings are
+/// input bytes; interleaved ones are both.
+fn rle_size(shape: Strings) -> (u64, usize) {
+    match shape {
+        Strings::Run => (2_000, 100_000),
+        Strings::Distinct => (2_000, 2_000),
+        Strings::Interleaved => (2_000, 20_000),
+    }
+}
+
+/// The same for a raw column (values, extra bytes), which holds every
+/// value's bytes whatever its metadata's runs say.
+const RAW_SIZE: (u64, usize) = (2_000, 2_000);
+
+/// A crafted document chunk (no heads: Automerge refuses it after
+/// rebuilding its changes) on its own, through `merge_changes`, and with a
+/// made-up head after another save and through `merge_changes`.
+fn check_doc_chunk(name: &str, input: &[u8]) {
+    check_normalize_as(name, input, Some(false));
+    check_apply(name, input);
+    check_rebuilt_as(name, input, None);
+}
+
+/// A change chunk (or chunks) on its own, through `merge_changes`, and
+/// after another save (a save and its trailing changes), also through
+/// `merge_changes`.
+fn check_change_chunks(name: &str, input: &[u8]) {
+    check_normalize_as(name, input, None);
+    check_apply(name, input);
+    let trailing = after_save(input);
+    check_normalize_as(&format!("save + {name}"), &trailing, None);
+    check_apply(&format!("save + {name}"), &trailing);
+}
+
+/// A document chunk of every string-valued column, in every shape, plain
+/// and with its columns deflated.
+fn doc_strings(column: &str) {
+    for shape in Strings::ALL {
+        for deflate in [false, true] {
+            let (n, len) = match column {
+                "values" | "extra bytes" => RAW_SIZE,
+                _ => rle_size(shape),
+            };
+            let input = match column {
+                "messages" => craft::doc_messages(shape, n, len, deflate),
+                "keys" => craft::doc_keys(shape, n, len, deflate),
+                "mark names" => craft::doc_mark_names(shape, n, len, deflate),
+                "values" => craft::doc_values(shape, n, len, deflate),
+                "extra bytes" => craft::doc_extra(shape, n, len, deflate),
+                other => panic!("{other}"),
+            };
+            let name = format!(
+                "doc {column} {shape:?} {n} x {len}{}",
+                if deflate { ", deflated" } else { "" }
+            );
+            if column == "mark names" {
+                without_time_bound(|| check_doc_chunk(&name, &input));
+            } else {
+                check_doc_chunk(&name, &input);
+            }
+        }
+    }
+}
+
+#[test]
+fn doc_chunk_messages_in_every_shape_are_priced() {
+    doc_strings("messages");
+}
+
+#[test]
+fn doc_chunk_keys_in_every_shape_are_priced() {
+    doc_strings("keys");
+}
+
+#[test]
+fn doc_chunk_mark_names_in_every_shape_are_priced() {
+    doc_strings("mark names");
+}
+
+/// A document chunk's repeated mark names are rebuilt bytes, priced like
+/// messages (3.0 bytes per byte measured: at the 3 of keys, 2,000 changes
+/// sharing one 100 kB name peaked at 0.996 of the estimate); repeated keys
+/// stay rebuilt key bytes.
+#[test]
+fn repeated_mark_names_are_rebuilt_bytes_and_keys_rebuilt_key_bytes() {
+    for deflate in [false, true] {
+        let marks = scan_doc(&craft::doc_mark_names(Strings::Run, 10, 100, deflate));
+        assert_eq!((marks.rebuilt, marks.rebuilt_keys), (9 * 100, 0));
+        let keys = scan_doc(&craft::doc_keys(Strings::Run, 10, 100, deflate));
+        assert_eq!((keys.rebuilt, keys.rebuilt_keys), (0, 9 * 100));
+        let messages = scan_doc(&craft::doc_messages(Strings::Run, 10, 100, deflate));
+        assert_eq!((messages.rebuilt, messages.rebuilt_keys), (9 * 100, 0));
+        // Interleaved: runs of nine (eight copies beyond the one held).
+        let marks = scan_doc(&craft::doc_mark_names(
+            Strings::Interleaved,
+            20,
+            100,
+            deflate,
+        ));
+        assert_eq!((marks.rebuilt, marks.rebuilt_keys), (2 * 8 * 100, 0));
+    }
+}
+
+#[test]
+fn doc_chunk_values_and_extra_bytes_in_every_shape_are_priced() {
+    doc_strings("values");
+    doc_strings("extra bytes");
+}
+
+/// A change chunk of every string-valued op column, in every shape,
+/// plain and compressed.
+#[test]
+fn change_chunk_strings_in_every_shape_are_priced() {
+    for shape in Strings::ALL {
+        for compressed in [false, true] {
+            for column in ["keys", "mark names", "values"] {
+                let (n, len) = if column == "values" {
+                    RAW_SIZE
+                } else {
+                    rle_size(shape)
+                };
+                let cols = match column {
+                    "keys" => craft::change_key_ops(shape, n, len),
+                    "mark names" => craft::change_mark_ops(shape, n, len),
+                    _ => craft::change_value_ops(shape, n, len),
+                };
+                let name = format!(
+                    "change {column} {shape:?} {n} x {len}{}",
+                    if compressed { ", compressed" } else { "" }
+                );
+                let input = craft::change_of(&cols, compressed);
+                if column == "mark names" {
+                    without_time_bound(|| check_change_chunks(&name, &input));
+                } else {
+                    check_change_chunks(&name, &input);
+                }
+            }
+        }
+    }
+}
+
+/// Change messages and extra bytes of change chunks, which each chunk
+/// holds literally: one large, and a chain of 2,000 chunks with the same,
+/// different or interleaved strings.
+#[test]
+fn change_chunk_messages_and_extra_bytes_are_priced() {
+    for compressed in [false, true] {
+        let suffix = if compressed { ", compressed" } else { "" };
+        let big = "m".repeat(30_000_000);
+        check_change_chunks(
+            &format!("change one 30 MB message{suffix}"),
+            &craft::change_chain(1, |_| big.clone(), |_| Vec::new(), compressed),
+        );
+        check_change_chunks(
+            &format!("change 30 MB of extra bytes{suffix}"),
+            &craft::change_chain(1, |_| String::new(), |_| vec![7; 30_000_000], compressed),
+        );
+        for shape in Strings::ALL {
+            let (n, len) = RAW_SIZE;
+            let strings = craft::string_values(shape, n, len);
+            check_change_chunks(
+                &format!("{n} changes, messages {shape:?} x {len}{suffix}"),
+                &craft::change_chain(
+                    n,
+                    |i| strings[i as usize].clone(),
+                    |_| Vec::new(),
+                    compressed,
+                ),
+            );
+            check_change_chunks(
+                &format!("{n} changes, extra bytes {shape:?} x {len}{suffix}"),
+                &craft::change_chain(
+                    n,
+                    |_| String::new(),
+                    |i| strings[i as usize].clone().into_bytes(),
+                    compressed,
+                ),
+            );
+        }
+    }
+}
+
+/// The lengths of the long actor ids: just over what an `ActorId` holds
+/// inline, 1 kB and 100 kB; and how many changes or ops refer to them.
+const ACTOR_LENS: [(usize, u64); 3] = [(17, 20_000), (1_000, 20_000), (100_000, 2_000)];
+
+/// Document chunks with a long actor id in every actor column: the change
+/// actor, the op id actor, the object and key actors, the pred a rebuilt
+/// op holds (the successor column holding the short actor) and the
+/// successor actor, and the actor table alone.
+#[test]
+fn long_actor_ids_in_every_doc_column_are_priced() {
+    for (len, n) in ACTOR_LENS {
+        let m = (20_000_000 / len as u64).min(1_000);
+        for (column, input) in [
+            ("change actor", craft::long_actor_changes(n, len)),
+            ("op id actor", craft::long_actor_ops(n, len)),
+            ("obj actor", craft::long_actor_refs(n, len)),
+            ("key actor", craft::long_actor_keys(n, len)),
+            (
+                "pred (succ by a short actor)",
+                craft::long_actor_succ(n, len, true),
+            ),
+            ("succ actor", craft::long_actor_succ(n, len, false)),
+            ("actor table only", craft::long_actor_table(m, len)),
+        ] {
+            let name = format!("doc {len}-byte actor, {column}, {n}");
+            check_doc_chunk(&name, &input);
+        }
+    }
+}
+
+/// Change chunks with a long actor id as the change's actor (on their
+/// own, after another save and through `merge_changes`), and as an other
+/// actor their ops refer to by object, key or pred, or that nothing
+/// refers to (many of them): after the long actor's document, and
+/// through `merge_changes` into it.
+#[test]
+fn long_actor_ids_in_every_change_column_are_priced() {
+    for (len, n) in ACTOR_LENS {
+        let m = (20_000_000 / len as u64).min(1_000);
+        for compressed in [false, true] {
+            let suffix = if compressed { ", compressed" } else { "" };
+            check_change_chunks(
+                &format!("change {len}-byte actor, change actor, {n}{suffix}"),
+                &craft::long_actor_change(n, len, compressed),
+            );
+            for (column, count) in [("obj", n), ("key", n), ("pred", n), ("others", m)] {
+                let name = format!("change {len}-byte other actor, {column}, {count}{suffix}");
+                let (base, change) = craft::long_other_actor(column, count, len, compressed);
+                let input = [base.as_slice(), &change].concat();
+                // Other actors that no op refers to make Automerge panic as
+                // it applies the change (refused as malformed).
+                let loads = column != "others";
+                check_normalize_as(&format!("save + {name}"), &input, Some(loads));
+                check_apply_onto(&name, &base, &change);
+            }
+        }
+    }
+}
+
+/// A document written by Automerge where 2,000 commits each add one
+/// string to a column: the root key they put (`"key"`), the string value
+/// they put at root key "k" (`"value"`), their message (`"message"`), or
+/// the name of a mark on a 2,000-character text (`"mark"`); the strings
+/// as `shape` lays them out (Automerge writes runs where they repeat).
+fn written_strings(column: &str, shape: Strings, len: usize) -> AutoCommit {
+    let n = 2_000;
+    let strings = craft::string_values(shape, n, len);
+    let mut doc = AutoCommit::new().with_actor(actor(3));
+    let text = (column == "mark").then(|| {
+        let t = doc.put_object(ROOT, "t", ObjType::Text).unwrap();
+        doc.splice_text(&t, 0, 0, &letters(n as usize, 13)).unwrap();
+        doc.commit();
+        t
+    });
+    for (i, s) in strings.iter().enumerate() {
+        match column {
+            "key" => doc.put(ROOT, s.as_str(), i as i64).unwrap(),
+            "value" => doc.put(ROOT, "k", s.as_str()).unwrap(),
+            "message" => doc.put(ROOT, "k", i as i64).unwrap(),
+            "mark" => {
+                let t = text.as_ref().unwrap();
+                doc.mark(
+                    t,
+                    Mark::new(s.clone(), i as i64, i, i + 1),
+                    ExpandMark::None,
+                )
+                .unwrap();
+            }
+            other => panic!("{other}"),
+        }
+        let mut options = CommitOptions::default();
+        if column == "message" {
+            options.set_message(s.clone());
+        }
+        doc.commit_with(options);
+    }
+    doc
+}
+
+/// A written document as a save (plain and compressed), as change chunks
+/// (`save_after`), and after another save, through `normalize` and
+/// `merge_changes`.
+fn check_written_doc(name: &str, doc: &mut AutoCommit) {
+    let plain = doc.document().save_nocompress();
+    let compressed = doc.save();
+    let chunks = doc.document().save_after(&[]);
+    for (form, input) in [
+        ("save", plain),
+        ("compressed", compressed),
+        ("chunks", chunks),
+    ] {
+        let name = format!("written: {name}, {form}");
+        check_normalize_as(&name, &input, Some(true));
+        check_apply(&name, &input);
+        let trailing = after_save(&input);
+        check_normalize_as(&format!("save + {name}"), &trailing, Some(true));
+        check_apply(&format!("save + {name}"), &trailing);
+    }
+}
+
+/// Documents written by Automerge with every string-valued column in
+/// every shape.
+#[test]
+fn written_strings_in_every_shape_are_priced() {
+    for shape in Strings::ALL {
+        for column in ["key", "value", "message", "mark"] {
+            let (_, len) = if column == "value" {
+                RAW_SIZE
+            } else {
+                rle_size(shape)
+            };
+            let mut doc = written_strings(column, shape, len);
+            check_written_doc(&format!("{column} {shape:?} x {len}"), &mut doc);
+        }
+    }
+}
+
+/// A document written by Automerge by two actors with `len`-byte ids
+/// taking turns, `rounds` commits: the first makes a map and a text, then
+/// each commit overwrites a key of the map the other one put last (pred
+/// and successor actors), and inserts into the text after the other's
+/// characters while deleting one of them (key and successor actors); the
+/// objects are the first actor's (object actor).
+fn written_actors(len: usize, rounds: usize) -> AutoCommit {
+    let id = |b: u8| {
+        let mut v = vec![b; len];
+        v[0] = b;
+        ActorId::from(v)
+    };
+    let (a, b) = (id(0xa0), id(0xb0));
+    let mut doc = AutoCommit::new().with_actor(a.clone());
+    let m = doc.put_object(ROOT, "m", ObjType::Map).unwrap();
+    let t = doc.put_object(ROOT, "t", ObjType::Text).unwrap();
+    doc.splice_text(&t, 0, 0, "abcdef").unwrap();
+    doc.commit();
+    for i in 0..rounds {
+        doc.set_actor(if i % 2 == 0 { b.clone() } else { a.clone() });
+        doc.put(&m, format!("k{}", i % 10), i as i64).unwrap();
+        let len = doc.length(&t);
+        let at = (i * 7) % (len - 1);
+        doc.splice_text(&t, at, 1, "xy").unwrap();
+        doc.commit();
+    }
+    doc
+}
+
+/// Documents written by Automerge whose actors have long ids, in every
+/// role.
+#[test]
+fn written_long_actor_ids_are_priced() {
+    for (len, rounds) in [(17, 5_000), (1_000, 5_000), (100_000, 1_000)] {
+        let mut doc = written_actors(len, rounds);
+        check_written_doc(&format!("{len}-byte actors, {rounds} commits"), &mut doc);
+    }
+}
+
+/// The cost model's constants are measured costs of this Automerge (and
+/// of hexane, its column store, which Automerge's requirement does not
+/// pin): another version can allocate more for the same input, and an
+/// allocation beyond the estimate aborts the backend. Fails on any other
+/// version, until the model has been re-measured and
+/// `budget::MEASURED_AUTOMERGE` / `MEASURED_HEXANE` updated.
+#[test]
+fn the_cost_model_was_measured_for_this_automerge() {
+    let lock = include_str!("../../../Cargo.lock");
+    let version = |name: &str| {
+        let header = format!("name = \"{name}\"\nversion = \"");
+        let at = lock
+            .find(&header)
+            .unwrap_or_else(|| panic!("{name} is not in Cargo.lock"))
+            + header.len();
+        lock[at..].split('"').next().unwrap().to_string()
+    };
+    for (name, measured) in [
+        ("automerge", budget::MEASURED_AUTOMERGE),
+        ("hexane", budget::MEASURED_HEXANE),
+    ] {
+        let locked = version(name);
+        assert_eq!(
+            locked,
+            measured,
+            "{name} is {locked}, but the load memory cost model \
+             (pg_automerge_core::budget) was measured for {name} {measured}: \
+             re-measure the cost model (cargo test --release -p pg_automerge_core \
+             --test memory_bounds -- --nocapture, and mise run fuzz; revisit the \
+             constants in budget.rs and docs/DESIGN.md, \"The estimate\"), then set \
+             budget::MEASURED_{} to {locked}",
+            name.to_uppercase()
+        );
+    }
 }

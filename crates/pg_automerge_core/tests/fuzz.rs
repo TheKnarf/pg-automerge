@@ -173,8 +173,10 @@ fn mutate(input: &[u8], other: &[u8], rng: &mut Rng) -> Vec<u8> {
 }
 
 /// Seed inputs: saves (plain and compressed), incremental change chunks,
-/// and concatenations of those, from random histories; and change chunks
-/// whose header lists repeat dependencies and empty other actors.
+/// and concatenations of those, from random histories; change chunks
+/// whose header lists repeat dependencies and empty other actors; and
+/// small crafted chunks of the shapes `tests/memory_bounds.rs` measures
+/// (strings interleaved with runs, long actor ids by key and pred).
 fn seeds() -> Vec<Vec<u8>> {
     let mut seeds = Vec::new();
     for seed in 0..8 {
@@ -203,6 +205,49 @@ fn seeds() -> Vec<Vec<u8>> {
     seeds.push(doc.save());
     seeds.push(craft::listing(3, 200, 0));
     seeds.push(craft::compressed_listing(2, 300, 1));
+    // The neighbouring shapes of the string and actor terms, small:
+    // strings interleaved with runs in document and change columns, extra
+    // bytes, a chain of change chunks with messages, long actor ids
+    // referred to by key and by pred.
+    use craft::Strings;
+    seeds.push(craft::with_head(&craft::doc_mark_names(
+        Strings::Interleaved,
+        20,
+        24,
+        false,
+    )));
+    seeds.push(craft::with_head(&craft::doc_messages(
+        Strings::Interleaved,
+        20,
+        24,
+        true,
+    )));
+    seeds.push(craft::with_head(&craft::doc_keys(
+        Strings::Interleaved,
+        20,
+        24,
+        false,
+    )));
+    seeds.push(craft::with_head(&craft::doc_extra(
+        Strings::Distinct,
+        10,
+        16,
+        false,
+    )));
+    seeds.push(craft::with_head(&craft::long_actor_keys(10, 40)));
+    seeds.push(craft::with_head(&craft::long_actor_succ(10, 40, true)));
+    seeds.push(craft::change_of(
+        &craft::change_mark_ops(Strings::Interleaved, 20, 16),
+        true,
+    ));
+    seeds.push(craft::change_chain(
+        5,
+        |i| format!("m{i}"),
+        |i| vec![i as u8; 3],
+        false,
+    ));
+    let (base, change) = craft::long_other_actor("pred", 10, 40, false);
+    seeds.push([base.as_slice(), &change].concat());
     seeds
 }
 

@@ -907,7 +907,16 @@ can.
   rows), but a single Automerge load, merge or save runs to the end
   before a cancel or `statement_timeout` takes effect: 2.5 s for a 3 MB
   document, longer for documents of tens of MB (at most about 16 s for
-  input within the default `pg_automerge.max_load_memory`).
+  input within the default `pg_automerge.max_load_memory`). One known
+  exception: changes carrying many rich-text marks that overlap (open at
+  the same point of a text) take time that grows with the square of
+  their number when they are applied (`merge(doc, $changes)`, `||`, and
+  merges of documents with such histories); 32,000 of them in a
+  122-byte change take 3 s, a million would take most of an hour, and
+  the memory limit does not catch it (the memory stays small). If
+  clients' change bytes reach the database, consider refusing changes
+  with an implausible number of marks in the application. Saves are not
+  affected. See docs/DESIGN.md, "What the limit cannot do".
 - **Every writer needs its own actor id.** Two writers (or two copies of
   a document) that commit with the same actor id produce different changes
   with the same sequence number, and Automerge cannot merge them. Every

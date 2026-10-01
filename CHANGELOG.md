@@ -75,8 +75,35 @@ Fixed:
   so the key used to be reported as `null`. STORED generated columns work
   as before.
 
+- **Load memory estimate: repeated mark names.** A document chunk whose
+  ops share one mark name through a run of its column (2,000 changes
+  with one 100 kB name) peaked at 0.996 of its estimate: below it, but
+  without the margin of every other measured input (0.80 at most). Mark
+  names are now priced like change messages (5 bytes per byte each
+  rebuilt change copies, not 3 like keys): 0.60. Documents that do not
+  repeat a mark name by a run are priced exactly as before; one that
+  does, near `pg_automerge.max_load_memory`, can now be refused
+  (`53400`) where it was accepted.
+
+Known issue:
+
+- Changes with many overlapping rich-text marks take time quadratic in
+  their number to apply (Automerge's mark bookkeeping), so a small
+  crafted change can keep a backend busy and uncancellable for minutes
+  while staying far below `pg_automerge.max_load_memory` (32,000 marks
+  in 122 bytes: 3 s; a million: about 50 minutes, extrapolated). Saves
+  are not affected. Not priced yet: the cheap bound would refuse
+  ordinary rich text (see docs/DESIGN.md, "What the limit cannot do").
+
 Changed:
 
+- The core tests measure the load memory estimate on the shapes next to
+  the ones it was fitted to (every string-valued column as a run,
+  different strings and runs between literals; actor ids of 17 bytes to
+  100 kB from every actor column; documents written by Automerge), 592
+  more measurements, worst 0.80 of the estimate; and a test fails when
+  the lock file has another Automerge (or hexane, its column store) than
+  the estimate was measured with, so an upgrade re-measures it first.
 - A flat (stored) `automerge` argument is detoasted once and read in
   place, and the detoasted copy is freed as soon as the function is done
   with it. It used to be copied again into Rust memory, with the first
