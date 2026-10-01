@@ -2087,17 +2087,39 @@ Two designs were compared:
   loads the whole document), the rows of a set-returning function, the
   jsonb builder's tree, merge intermediates.
 - **A counting `#[global_allocator]`** (`src/alloc.rs`): the system
-  allocator plus two atomic counters. Exact, and covers everything the
-  library's Rust code allocates, at a cost on every allocation.
+  allocator plus three atomic counters (the allocation, its peak, and
+  since 0.3.0 its high point since the last trim, see
+  [Returning freed memory](#returning-freed-memory-pg_automergetrim_threshold)).
+  Exact, and covers everything the library's Rust code allocates, at a
+  cost on every allocation.
 
-Measured cost of the allocator (release builds, one CPU pinned, median of
-7 runs, minimum of 2 runs per variant, 2026-10-01; bench-core's documents,
+Measured cost of the allocator (release builds, one CPU pinned,
+2026-10-01, on an Intel Atom C3758R at 2.4 GHz; bench-core's documents,
 see [Performance](#performance)):
 
-- A 16 to 80-byte allocation and free: 36.9 ns without, 38.0 ns with
-  counting (two uncontended atomic read-modify-writes, about 1.1 ns).
-- `mise run bench-core`: `Automerge::load` and `normalize` of every
-  document within noise (-0.8% to +0.6%; text3mb 2583 → 2563 ms,
+- Per allocation, `mise run bench-alloc` (the core crate's `bench_alloc`
+  example, which includes `src/alloc.rs` itself and switches the global
+  allocator between it and `System`; best of 7 rounds, 3 runs): a 16 to
+  79-byte allocation and free 32.1 to 32.6 ns without, 38.6 to 39.1 ns
+  with counting (+6.5 ns: two uncontended atomic read-modify-writes on
+  `ALLOCATED`, relaxed loads of `PEAK` and `HIGH`); an allocation while
+  the allocation only grows (2 million live blocks after a trim, each a
+  new high: a store to `HIGH` and a `fetch_max` on `PEAK` too) 82 to
+  84 ns without, 85 to 90 ns with (+3 to +7 ns, noisy). The first
+  version, with two counters (before the trim), cost +4.5 ns per
+  allocation and free on the same benchmark, so `HIGH` adds about 2 ns. (An earlier figure of
+  1.1 ns came from a different, unpublished loop; this one is the
+  published benchmark.)
+- `mise run bench-core` with the three-counter allocator installed as
+  the global allocator (a temporary edit; best of 2 runs per variant,
+  alternating, each a median of 5; items20k, items2k, text3mb,
+  2026-10-01): the walks within noise (-3.5% to +1.2%; items20k
+  per-object walk 144.2 → 145.7 ms); `Automerge::load` and `normalize`
+  of the small-map documents +0.6% to +1.3%; of text3mb, the largest
+  load (hundreds of MB allocated from a fresh heap, so nearly every
+  allocation a new high), +3.1% to +3.7% (`Automerge::load` 2489 →
+  2580 ms). The first measurement, with two counters:
+  `Automerge::load` and `normalize` of every document within noise (-0.8% to +0.6%; text3mb 2583 → 2563 ms,
   items20k 157.8 → 158.1 ms); the jsonb walks +0.4% to +2.3%
   (items20k one-sweep walk 63.2 → 64.6 ms); the allocation-heaviest case,
   the per-object walk of many small maps, +3.6% (items20k 144.5 →
@@ -2105,7 +2127,7 @@ see [Performance](#performance)):
   load memory scan unchanged.
 - `mise run bench-sql` (release build installed in the pgrx Postgres,
   each SQL path timed alone, median of 3; runs with, without and again
-  with the allocator): no measurable cost. The run without it was the
+  with the two-counter allocator): no measurable cost. The run without it was the
   slower one, by 2% in the geometric mean over the cases above 5 ms
   (R1 text3mb 2979 ms without, 2898 and 2902 ms with; W1 items20k 373,
   361 and 363 ms; W4 text3mb 5689, 5595 and 5564 ms; the largest
@@ -2177,9 +2199,16 @@ abort, prepare; and in parallel workers) in which the library's Rust
 allocation fell by at least `pg_automerge.trim_threshold` from its high
 point since the last trim. `malloc_trim` returns the top of the heap and,
 with `madvise(MADV_DONTNEED)`, every free page inside it. The high point
-is a third counter in the allocator (`alloc::HIGH`, a relaxed load and a
-rare store per allocation, no read-modify-write); it starts over at each
-trim. Inside a transaction nothing is trimmed, so a loop over documents
+is a third counter in the allocator (`alloc::HIGH`, a relaxed load per
+allocation and a plain store, no read-modify-write, on every allocation
+that is a new high since the last trim: rare in a steady state, nearly
+every allocation of a large load after a trim; about 2 ns per
+allocation in all, see [Memory observability](#memory-observability)); it
+starts over at each trim. The threshold is at least one byte: with `0`
+the trim runs at the end of every transaction in which anything was
+freed since the last one, never when nothing was, so transactions that
+freed nothing (those of other applications in the same backend, which
+never call the library) do not pay for it. Inside a transaction nothing is trimmed, so a loop over documents
 in one transaction reuses the memory.
 
 Measured on the pgrx Postgres (dev build, its dependencies optimized; one
@@ -2204,6 +2233,14 @@ zeroed again, and on this host (transparent huge pages `always`) the
 fresh heap is no longer backed by huge pages. Transactions that freed
 less than the threshold pay nothing; with `0` (trim after every
 transaction that freed anything) the medium documents pay 3 to 5%.
+Even a small call frees its temporaries, so with `0` every transaction
+that calls the library pays for a trim: `automerge_heads` of an empty
+document, one per transaction, 0.419-0.431 ms with `64MB` and
+0.468-0.491 ms with `0` (pgbench, one client, the pgrx Postgres; about
+50 µs, -11% transactions per second). Before the one-byte minimum, `0`
+also trimmed after transactions that freed nothing, those that never
+call the library included; now they pay nothing (`SELECT 1`:
+0.164-0.166 ms with either setting).
 
 Default: 64 MB. A backend then keeps at most about that much of freed
 memory between transactions, and only transactions that used more than
@@ -2236,7 +2273,10 @@ Alternatives considered:
 Tests: a pg_test (`trim_returns_freed_heap_memory_once_enough_was_freed`)
 frees 32 MB of heap blocks below a block that stays and checks that RSS
 keeps them, that `trim_if_freed` trims at 16 MB but not at 64 MB nor
-twice, and that RSS drops by the 32 MB; another checks the setting
+twice, and that RSS drops by the 32 MB;
+`trim_threshold_zero_trims_only_after_something_was_freed` that `0`
+trims after a 1 MB block was freed but not when nothing was; another
+checks the setting
 (`kB`, superuser, `-1`). `tests/memory.sh` reads `RssAnon` from
 `/proc/self/status` through `pg_read_file` in a real session (so also
 against the Docker image): after reads of a 400,000-character text (34

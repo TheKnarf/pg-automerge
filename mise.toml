@@ -95,6 +95,10 @@ run = "bash tests/bench_expanded.sh"
 description = "Rust-level timings of load, normalize, save and the JSON walk on the benchmark documents (release build); not part of test"
 run = "cargo run --release -q -p pg_automerge_core --example bench_core"
 
+[tasks.bench-alloc]
+description = "Overhead of the counting global allocator (src/alloc.rs) over the system allocator, per allocation (release build; pin it with taskset for stable numbers); not part of test"
+run = "cargo run --release -q -p pg_automerge_core --example bench_alloc"
+
 [tasks.package]
 description = "Build a release package for the Postgres 18 of $PG_CONFIG (required; not pgrx's own) into target/release/pg_automerge-pg18/ and a tarball of it"
 run = "bash scripts/package.sh"

@@ -10,8 +10,9 @@
 //! this library, so other Rust extensions in the same backend are not
 //! counted.
 //!
-//! Plain Rust with no pgrx dependency, so a benchmark can install the same
-//! allocator (the overhead measurements in docs/DESIGN.md).
+//! Plain Rust with no pgrx dependency, so a benchmark can include it: the
+//! core crate's `bench_alloc` example (`mise run bench-alloc`) measures
+//! its overhead (docs/DESIGN.md, "Memory observability").
 //!
 //! Counts are the sizes Rust asks for (`Layout::size`), not what `malloc`
 //! uses for them (its chunk headers and rounding, and freed memory it
@@ -125,9 +126,10 @@ pub fn reset_peak() {
 
 /// Return the memory `malloc` keeps for reuse to the operating system
 /// (`malloc_trim(0)`) when the allocation has fallen by at least
-/// `threshold` bytes from its high point since the last trim, and start
-/// the high point over from the current allocation. Returns whether it
-/// trimmed. A no-op (returning false) where the C library has no
+/// `threshold` bytes from its high point since the last trim (and by at
+/// least one byte: with `0`, whenever anything was freed, never when
+/// nothing was), and start the high point over from the current
+/// allocation. Returns whether it trimmed. A no-op (returning false) where the C library has no
 /// `malloc_trim` (anything but glibc).
 ///
 /// Call it between operations (the library calls it at the end of each
@@ -136,7 +138,9 @@ pub fn reset_peak() {
 pub fn trim_if_freed(threshold: usize) -> bool {
     let now = allocated();
     let high = HIGH.load(Ordering::Relaxed).max(now);
-    if high - now < threshold {
+    // `max(1)`: a transaction that freed nothing (most of them, in a
+    // backend that also serves other queries) never pays for a trim.
+    if high - now < threshold.max(1) {
         return false;
     }
     HIGH.store(now, Ordering::Relaxed);

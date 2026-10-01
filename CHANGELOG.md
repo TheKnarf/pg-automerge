@@ -28,10 +28,12 @@ Added:
   and the number and total time of Automerge loads. And
   `automerge_memory_reset()`, which restarts the peak and the load
   counters, to measure one statement. Per backend; see the README's
-  [Monitoring](README.md#monitoring). The allocator costs about 1 ns per
-  allocation: not measurable in `mise run bench-sql` (reads, writes,
-  merges, `merge_agg`), and at most a few percent in the Rust-level
-  benchmark of the allocation-heaviest jsonb walk.
+  [Monitoring](README.md#monitoring). The allocator costs a few ns per
+  allocation (`mise run bench-alloc`, new: +6.5 ns per allocation and
+  free on an Atom C3758R): not measurable in `mise run bench-sql`
+  (reads, writes, merges, `merge_agg`), and at most about 4% in the
+  Rust-level benchmarks (the load of a 3 MB text, which allocates
+  hundreds of MB).
 - **`pg_automerge.trim_threshold`** (default `64MB`, superuser-only like
   the other settings): at the end of a transaction in which
   pg_automerge's allocation fell by at least this much, return the memory
@@ -42,7 +44,10 @@ Added:
   connections, busy or idle); with the trim the container's median was
   1.3 to 1.7 GB. It costs the next load of a document that big about
   15% (the memory is faulted in again), and nothing for documents whose
-  loads stay below the threshold; `-1` restores the old behaviour. See
+  loads stay below the threshold; `-1` restores the old behaviour. `0`
+  trims after every transaction in which anything was freed, and never
+  after one that freed nothing (so other applications' transactions in
+  the same backend do not pay about 50 µs each for it). See
   the README's [Configuration](README.md#configuration).
 - **Soak test** (`mise run soak`, `tests/soak.sh`): an hour of
   concurrent writes, reads, history, `merge_agg`, notifications and

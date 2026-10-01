@@ -333,7 +333,7 @@ fn rss_anon() -> i64 {
 
 #[pg_test]
 fn trim_returns_freed_heap_memory_once_enough_was_freed() {
-    // Start the high point over (a trim whatever was freed before).
+    // Start the high point over (a trim if anything was freed before).
     crate::alloc::trim_if_freed(0);
     // 32 MB in blocks of 64 kB (below malloc's mmap threshold, so they
     // come from the heap), then a block that stays above them: once freed,
@@ -376,6 +376,20 @@ fn trim_returns_freed_heap_memory_once_enough_was_freed() {
         mb(freed),
         mb(trimmed)
     );
+}
+
+#[pg_test]
+fn trim_threshold_zero_trims_only_after_something_was_freed() {
+    // `0` means "whatever was freed", not "every transaction": a
+    // transaction that freed nothing (one that never touched the library,
+    // in a backend that has loaded it) must not pay for a malloc_trim
+    // (about 50 us each, measured with pgbench).
+    crate::alloc::trim_if_freed(0);
+    assert!(!crate::alloc::trim_if_freed(0), "nothing freed since the last trim");
+    assert!(!crate::alloc::trim_if_freed(0), "still nothing");
+    drop(std::hint::black_box(vec![1u8; 1 << 20]));
+    assert!(crate::alloc::trim_if_freed(0), "1 MB freed");
+    assert!(!crate::alloc::trim_if_freed(0), "the high point started over");
 }
 
 #[pg_test]

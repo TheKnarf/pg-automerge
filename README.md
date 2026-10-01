@@ -608,7 +608,7 @@ blocks). Details in [DESIGN.md](docs/DESIGN.md#rich-text-spans) and
 |---|---|---|---|
 | `pg_automerge.max_load_memory` | `2GB` | superusers, or roles granted `SET` on it; also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Refuse client input and merge results whose estimated load exceeds this (kB, like `work_mem`; `-1`: no limit) |
 | `pg_automerge.verify_writes` | `on` | superusers, or roles granted `SET` on it (`GRANT SET ON PARAMETER pg_automerge.verify_writes TO writer`); also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Load back the normalized save of every value built from client bytes (text input, binary receive, the `bytea` cast, `merge(automerge, bytea)` results) before it is stored or sent |
-| `pg_automerge.trim_threshold` | `64MB` | superusers, or roles granted `SET` on it; also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | At the end of a transaction, return the memory `malloc` keeps for reuse to the operating system (`malloc_trim`) when pg_automerge's allocation fell by at least this much since the last time (kB; `0`: after every transaction; `-1`: never) |
+| `pg_automerge.trim_threshold` | `64MB` | superusers, or roles granted `SET` on it; also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | At the end of a transaction, return the memory `malloc` keeps for reuse to the operating system (`malloc_trim`) when pg_automerge's allocation fell by at least this much since the last time (kB; `0`: after every transaction in which it fell at all, never after one that freed nothing; `-1`: never) |
 
 The `pg_automerge` prefix is reserved: once the library is loaded, a
 misspelled name (`SET pg_automerge.max_load_memroy = ...`) is an error, and
@@ -710,8 +710,9 @@ afterwards.
   read that converts a document, every write's validation, the
   verification loads), and the total time in milliseconds.
 
-The counts are exact (a counting allocator; its cost is about 1 ns per
-allocation, not measurable in `mise run bench-sql`), in the bytes Rust
+The counts are exact (a counting allocator; its cost is a few ns per
+allocation, `mise run bench-alloc`: a few percent at most in the Rust
+benchmarks, not measurable in `mise run bench-sql`), in the bytes Rust
 asks for: the process uses somewhat more (`malloc`'s own overhead), and
 after a large document is freed `malloc` keeps the memory for reuse until
 the end of the transaction (see `pg_automerge.trim_threshold` in
@@ -1035,6 +1036,7 @@ mise run fuzz        # a long mutation-fuzzing session of the core (not part of 
 mise run bench-sql   # median timings of the everyday SQL paths on a release build (minutes)
 mise run bench-expanded  # SQL timings of merge chains and PL/pgSQL loops on a release build (minutes)
 mise run bench-core  # Rust timings of load, normalize and the jsonb walk
+mise run bench-alloc # cost per allocation of the counting allocator (pin it: taskset -c 2 mise run bench-alloc)
 mise run package     # release package for the Postgres of $PG_CONFIG (required)
 mise run docker-build   # the Docker image (see Docker)
 mise run docker-test    # build it, then test it against containers: SQL, dump/restore, suites, memory limit, a soak smoke run, compose.yaml (not part of test)

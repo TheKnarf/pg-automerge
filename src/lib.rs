@@ -112,7 +112,7 @@ pub extern "C-unwind" fn _PG_init() {
           so after one large document a backend would hold that much for the rest of its life. \
           At the end of a transaction in which pg_automerge's allocation fell by at least this \
           much from its high point, malloc_trim(0) returns the free memory to the operating \
-          system. -1 never trims. Superuser-only.",
+          system (0: whenever anything was freed). -1 never trims. Superuser-only.",
         &TRIM_THRESHOLD,
         -1,
         i32::MAX,
