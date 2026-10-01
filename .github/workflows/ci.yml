@@ -1,7 +1,9 @@
-# Two jobs on every push and pull request, in parallel:
-#   - ci: what `mise run ci` runs locally (lint, all test suites and the
-#     regress tests, against the pgrx-managed Postgres 18); on tags also the
-#     release tarball.
+# Three jobs on every push and pull request, in parallel:
+#   - ci: what `mise run ci` runs locally (lint, the docs site check, all
+#     test suites and the regress tests, against the pgrx-managed Postgres
+#     18); on tags also the release tarball.
+#   - docs: only the docs site check (`mise run docs-check`), for quick
+#     feedback.
 #   - docker: builds the Docker image (BuildKit, layers cached in the GitHub
 #     Actions cache) and runs tests/docker.sh against it, including the
 #     container variants of the multi-session suites. On tags it runs on an
@@ -76,7 +78,7 @@ jobs:
         run: |
           if [ ! -f "$PGRX_HOME/config.toml" ]; then mise run pgrx-init; fi
 
-      - name: Lint, test, regress
+      - name: Lint, docs check, test, regress
         run: mise run ci
 
       - name: Benchmarks (nightly only)
@@ -128,6 +130,29 @@ jobs:
         with:
           name: pg_automerge-pg18
           path: target/release/pg_automerge-pg18.tar.gz
+
+  # The documentation site (docs/): typecheck, biome, the static build
+  # under /pg-automerge/ and the link/route check, as `mise run docs-check`
+  # (also part of `mise run ci`). A job of its own so docs feedback does not
+  # wait for pgrx; deploy-docs.yml publishes the site from main.
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node and pnpm as pinned in mise.toml; nothing else.
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: node pnpm
+          cache: true
+
+      # mise run would otherwise install every tool in mise.toml first
+      # (Rust, building cargo-pgrx from source).
+      - name: Docs check
+        env:
+          MISE_TASK_RUN_AUTO_INSTALL: "false"
+        run: mise run docs-check
 
   # The Docker image (official postgres:18 + the extension built against
   # its PGDG Postgres, docker/Dockerfile), tested with tests/docker.sh.

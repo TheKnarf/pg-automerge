@@ -1,0 +1,73 @@
+# Builds the documentation site (docs/, see docs/Readme.md) and publishes
+# it to GitHub Pages, on pushes to main that touch it (or by hand). Needs
+# Pages enabled with "GitHub Actions" as the source (Settings > Pages).
+name: Deploy Docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      # The site shows the crate's version.
+      - Cargo.toml
+      - mise.toml
+      - .github/workflows/deploy-docs.yml
+  workflow_dispatch:
+
+# Allow the workflow to publish to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deploy at a time; let a running deploy finish
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node and pnpm as pinned in mise.toml (not the Rust toolchain).
+      - name: Setup mise
+        uses: jdx/mise-action@v2
+        with:
+          install_args: node pnpm
+
+      - name: Install dependencies
+        run: pnpm --dir docs install --frozen-lockfile
+
+      - name: Build docs (static site)
+        run: pnpm --dir docs build
+        env:
+          # Serve under /<repo>/ so relative asset URLs resolve on Pages
+          DOCS_BASE: /${{ github.event.repository.name }}/
+
+      - name: Check the built site
+        run: pnpm --dir docs check-site
+        env:
+          DOCS_BASE: /${{ github.event.repository.name }}/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

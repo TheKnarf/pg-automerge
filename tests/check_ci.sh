@@ -123,14 +123,15 @@ echo "check_ci: docker ok"
 # runs, and the invariants of the docker and publish jobs.
 command -v actionlint >/dev/null && command -v shellcheck >/dev/null \
   || fail "actionlint and shellcheck are needed (pinned in mise.toml: mise install)"
-actionlint "$wf" || fail "$wf: actionlint"
+docs_wf=.github/workflows/deploy-docs.yml
+actionlint "$wf" "$docs_wf" || fail "$wf, $docs_wf: actionlint"
 shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/docker_upgrade.sh \
   tests/soak.sh tests/soak/proc_sample.sh \
   docker/initdb-pg-automerge.sh || fail "shellcheck"
 
 # job NAME: the lines of that job (from "  NAME:" to the next job).
 job() { awk -v j="  $1:" '$0 == j {p=1; print; next} p && /^  [a-z]/ {exit} p' "$wf"; }
-for j in ci docker publish; do [ -n "$(job "$j")" ] || fail "$wf: no $j job"; done
+for j in ci docs docker publish; do [ -n "$(job "$j")" ] || fail "$wf: no $j job"; done
 docker_job="$(job docker)"; publish_job="$(job publish)"
 has() { grep -qE -- "$2" <<<"$1"; }
 
@@ -165,3 +166,29 @@ if grep -qE 'push: true|packages: write|write-all' "$wf"; then fail "$wf: no pus
 grep -qE '^permissions:$' "$wf" && grep -qE '^  contents: read$' "$wf" || fail "$wf: top-level permissions must be contents: read"
 
 echo "check_ci: workflow ok"
+
+# ---------------------------------------------------------------------------
+# The documentation site (docs/, a pnpm package; docs/Readme.md): checked
+# by the docs job and `mise run ci`, published from main by
+# deploy-docs.yml, and never part of the Docker build context.
+docs_job="$(job docs)"
+has "$docs_job" '^        run: mise run docs-check$' || fail "$wf: the docs job must run mise run docs-check"
+has "$docs_job" '^          install_args: node pnpm$' || fail "$wf: the docs job installs only node and pnpm"
+has "$docs_job" 'MISE_TASK_RUN_AUTO_INSTALL: "false"' \
+  || fail "$wf: the docs job must not let mise run install the Rust toolchain"
+grep -qE '^  "mise run docs-check",$' mise.toml || fail "mise.toml: mise run ci must run docs-check"
+for t in docs-install docs-dev docs-build docs-check; do
+  grep -qxF "[tasks.$t]" mise.toml || fail "mise.toml: no $t task"
+done
+for f in package.json pnpm-lock.yaml ssg.tsx ssg-for-vite.tsx src/ssg-main.tsx src/main.tsx src/routes.tsx scripts/check-site.ts; do
+  [ -f "docs/$f" ] || fail "docs/$f missing"
+done
+[ -x docs/ssg.tsx ] || fail "docs/ssg.tsx must be executable (pnpm build runs it)"
+grep -qE '^      - "docs/\*\*"$' "$docs_wf" || fail "$docs_wf: must run on changes to docs/**"
+grep -qE '^        run: pnpm --dir docs install --frozen-lockfile$' "$docs_wf" || fail "$docs_wf: install with --frozen-lockfile"
+[ "$(grep -cE '^          DOCS_BASE: /\$\{\{ github\.event\.repository\.name \}\}/$' "$docs_wf")" -eq 2 ] \
+  || fail "$docs_wf: build and check-site with DOCS_BASE=/<repo>/"
+grep -qE '^          path: docs/dist$' "$docs_wf" || fail "$docs_wf: upload docs/dist"
+if grep -qE '^!/?docs' .dockerignore; then fail ".dockerignore: keep docs/ out of the Docker build context"; fi
+
+echo "check_ci: docs ok"
