@@ -3303,7 +3303,11 @@ with `psql`.
   version (the Dockerfile's version guard) and builds after step 3's
   edit. Run against the released image
   (b946069dce9a), against an image of the `0.1.0+spans` variant, and with
-  the image built from 0918f56: all pass.
+  the image built from 0918f56: all pass. With
+  `PG_AUTOMERGE_OLD_VERSION=0.2.0` it does the same from a 0.2.0
+  deployment (by default an image built from 356a2f9; its install script
+  must be the 0.2.0 snapshot), the path of an app already on 0.2.0 such
+  as skjera.
 
 Data compatibility:
 

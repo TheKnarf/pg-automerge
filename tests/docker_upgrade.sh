@@ -41,19 +41,28 @@
 # builds, reusing the cache of the image just built).
 #
 # Env: PG_AUTOMERGE_IMAGE (the new image, default
-# pg-automerge:<Cargo.toml version>), PG_AUTOMERGE_OLD_IMAGE (the 0.1.0
-# image, a tag or an image ID; by default built from RELEASE_REV below
+# pg-automerge:<Cargo.toml version>), PG_AUTOMERGE_OLD_VERSION (the
+# version upgraded from: 0.1.0, the default, or 0.2.0; the steps are the
+# same, 0.1.0 is used as the example above), PG_AUTOMERGE_OLD_IMAGE (the
+# old image, a tag or an image ID; by default built from RELEASE_REV below
 # with that revision's own scripts/docker-build.sh, as
-# pg-automerge-test-old-<pid>:0.1.0, removed on exit; needs the git
+# pg-automerge-test-old-<pid>:<old version>, removed on exit; needs the git
 # history).
 
 # shellcheck source=tests/docker_lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/docker_lib.sh"
 
-OLD_VERSION=0.1.0
-# The last commit before automerge_spans: its SQL is 0.1.0's (the same
-# statements as the snapshot; pgrx may order them differently).
-RELEASE_REV=0918f56
+# The version upgraded from (PG_AUTOMERGE_OLD_VERSION, default 0.1.0) and
+# the commit its image is built from when PG_AUTOMERGE_OLD_IMAGE is unset.
+OLD_VERSION="${PG_AUTOMERGE_OLD_VERSION:-0.1.0}"
+case "$OLD_VERSION" in
+    # The last commit before automerge_spans: its SQL is 0.1.0's (the same
+    # statements as the snapshot; pgrx may order them differently).
+    0.1.0) RELEASE_REV=0918f56 ;;
+    # The 0.2.0 release and its upgrade docs (skjera's image).
+    0.2.0) RELEASE_REV=356a2f9 ;;
+    *) fail "PG_AUTOMERGE_OLD_VERSION=$OLD_VERSION: only 0.1.0 and 0.2.0 are known" ;;
+esac
 
 # Not postgres: an app's own POSTGRES_USER (skjera's is skjera).
 PG_USER=appowner

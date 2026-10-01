@@ -268,9 +268,10 @@ it in).
    `automerge_spans` already there).
 
 There is no downgrade script: to go back, restore the dump into the old
-image. `mise run docker-upgrade-test` rehearses these steps from 0.1.0 against
+image. `mise run docker-upgrade-test` rehearses these steps from 0.1.0 (and,
+with `PG_AUTOMERGE_OLD_VERSION=0.2.0`, from 0.2.0) against
 throwaway containers (the old image from `PG_AUTOMERGE_OLD_IMAGE`, or
-built from the 0.1.0 source), with a `POSTGRES_USER` other than
+built from the old version's source), with a `POSTGRES_USER` other than
 `postgres` as skjera has: it runs the commands of steps 1 and 5 as
 written here, and builds a service like step 3's (its `build.args`
 updated, and, to show why, not).

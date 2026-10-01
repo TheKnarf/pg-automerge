@@ -102,6 +102,10 @@ Known issue:
 
 Changed:
 
+- `mise run docker-upgrade-test` also rehearses the upgrade from a 0.2.0
+  deployment (`PG_AUTOMERGE_OLD_VERSION=0.2.0`, with
+  `PG_AUTOMERGE_OLD_IMAGE` or an image built from the 0.2.0 release),
+  the path of an app already on 0.2.0.
 - The core tests measure the load memory estimate on the shapes next to
   the ones it was fitted to (every string-valued column as a run,
   different strings and runs between literals; actor ids of 17 bytes to
