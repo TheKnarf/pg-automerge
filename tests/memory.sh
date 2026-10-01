@@ -17,7 +17,11 @@
 #     start of the rounds (within a few kB), and the loads were counted;
 #   - automerge_memory_reset() zeroes the loads and restarts the peak;
 #   - every backend has its own counters: a new session starts with no
-#     loads, and its reads do not change the first session's.
+#     loads, and its reads do not change the first session's;
+#   - pg_automerge.trim_threshold: after reading a document that takes
+#     tens of MB, the backend's anonymous RSS is back near where it was
+#     at the end of the transaction (malloc_trim), not inside it, and
+#     stays up with -1 (logged).
 #
 # Env: see tests/lib.sh; MEMORY_ROUNDS (default 100).
 
@@ -153,3 +157,42 @@ SQL
 [[ "$out" == $'t\nt|t\n\n0|0|t' ]] || fail "reset: $out"
 out="$(sql -c "SELECT loads, live_documents FROM automerge_memory_usage()")"
 [[ "$out" == "0|0" ]] || fail "a new session's counters: $out"
+
+log "freed memory returned to the system at transaction end (pg_automerge.trim_threshold)"
+# The backend's anonymous resident memory (its private heap), read by the
+# backend itself (pg_read_file: a superuser), in MB.
+RSS="(SELECT (regexp_match(pg_read_file('/proc/self/status'), 'RssAnon:\s+(\d+)'))[1]::bigint / 1024)"
+# (A heredoc, not -v: the literal exceeds the kernel's limit on one argument.)
+sql <<SQL
+CREATE TABLE big AS SELECT '$BIG'::bytea::automerge AS doc;
+SQL
+# Each read in its own transaction; the peak shows how much it took.
+READ_BIG="SELECT length(doc::jsonb->>'text') FROM big \g /dev/null"
+out="$(sql <<SQL
+SET pg_automerge.trim_threshold = -1;
+SELECT $RSS AS r0 \gset
+$READ_BIG
+$READ_BIG
+SELECT $RSS AS r1, peak_allocated_bytes / 1048576 AS peak FROM automerge_memory_usage() \gset
+SET pg_automerge.trim_threshold = '16MB';
+$READ_BIG
+SELECT $RSS AS r2 \gset
+BEGIN;
+$READ_BIG
+SELECT $RSS AS r3 \gset
+COMMIT;
+SELECT $RSS AS r4 \gset
+RESET pg_automerge.trim_threshold;
+$READ_BIG
+SELECT :r0, :r1, :r2, :r3, :r4, $RSS, :peak;
+SQL
+)"
+IFS='|' read -r r0 r1 r2 r3 r4 r5 peak <<<"$out"
+log "RssAnon (MB): $r0 at the start; $r1 after two reads with -1 (each took up to $peak MB); $r2 after one with 16MB; $r3 before and $r4 after the COMMIT of another; $r5 after one with the default (64MB)"
+((peak >= 24)) || fail "the big document's read took only $peak MB"
+# Without trimming, malloc keeps the freed document for reuse (measured:
+# about as much as the read took); with it, the end of each transaction
+# hands it back, and inside one nothing is trimmed.
+((r2 - r0 <= 8)) || fail "not trimmed at the end of the transaction: RssAnon $r0 -> $r2 MB"
+((r3 - r0 >= 16)) || fail "trimmed inside a transaction (or nothing kept): RssAnon $r0 -> $r3 MB"
+((r4 - r0 <= 8)) || fail "not trimmed at COMMIT: RssAnon $r0 -> $r4 MB"

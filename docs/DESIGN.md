@@ -2060,7 +2060,9 @@ What the numbers mean:
   headers and rounding, and keeps freed memory for reuse (glibc returns
   it to the system only at the top of the heap or for large blocks it
   mapped separately), so a backend's RSS can stay high after
-  `allocated_bytes` fell back; the library does not call `malloc_trim`.
+  `allocated_bytes` fell back, until the end of the transaction, where
+  the library returns it once enough was freed (see
+  [Returning freed memory](#returning-freed-memory-pg_automergetrim_threshold)).
 - A `#[global_allocator]` covers the Rust code linked into this library:
   Automerge, the core, and pgrx's own Rust allocations (16 to 123 bytes
   between statements in the tests). Another Rust extension in the same
@@ -2073,6 +2075,97 @@ What the numbers mean:
 - In a `FROM` clause that does not depend on the outer row the function
   scan runs once and is rescanned from its stored result, so to watch the
   counters change per row call it in the target list (the pg_tests do).
+
+### Returning freed memory (`pg_automerge.trim_threshold`)
+
+The [soak test](#soak-test) found it (2026-10-01): with eight long-lived
+connections writing and reading documents of up to 1 MB for 70 minutes,
+every backend's anonymous RSS stayed between 200 and 355 MB for the whole
+run while `automerge_memory_usage()` showed 16 bytes allocated between
+statements. Not a leak (the high-water mark did not grow: 342 MB, the
+peak of loading the largest document, a 1.26 MB rich text), but `malloc`
+keeping the freed document for reuse: glibc gives memory back only from
+the top of the heap (`M_TRIM_THRESHOLD`) or for blocks it mapped
+separately, and it raises its mmap threshold (up to 32 MB) after the first
+large block is freed, so a loaded document ends up as holes in the heap.
+The container's anonymous memory was 2.4 to 2.6 GB of its 4 GB limit
+throughout: each connection holding the most it ever needed, whether
+idle or not. For an application pool that is `connections × the largest
+document's load`, permanently.
+
+Since 0.3.0 a transaction callback (`RegisterXactCallback` in
+`_PG_init`; no `shared_preload_libraries` needed) calls glibc's
+`malloc_trim(0)` at the end of every top-level transaction (commit,
+abort, prepare; and in parallel workers) in which the library's Rust
+allocation fell by at least `pg_automerge.trim_threshold` from its high
+point since the last trim. `malloc_trim` returns the top of the heap and,
+with `madvise(MADV_DONTNEED)`, every free page inside it. The high point
+is a third counter in the allocator (`alloc::HIGH`, a relaxed load and a
+rare store per allocation, no read-modify-write); it starts over at each
+trim. Inside a transaction nothing is trimmed, so a loop over documents
+in one transaction reuses the memory.
+
+Measured on the pgrx Postgres (dev build, its dependencies optimized; one
+backend reading `doc::jsonb` of the soak's templates, each read its own
+transaction, median of 7 after one warm-up):
+
+| Document (load peak) | RssAnon after, `-1` | after, 64MB | Read, `-1` | Read, 64MB | Read, `0` |
+|---|---|---|---|---|---|
+| 1.26 MB rich text (342 MB) | 274 MB | 3 MB | 1695 ms | 1995 ms | 1998 ms |
+| 1.07 MB list of maps (22 MB) | 9 MB | 9 MB | 685 ms | 678 ms | 705 ms |
+| 209 kB list (5 MB) | 9 MB | 9 MB | 135 ms | 135 ms | 141 ms |
+| 4 kB board (< 1 MB) | 2 MB | 2 MB | 3.0 ms | 2.7 ms | 2.9 ms |
+
+(RssAnon of the backend after a second read, from 2 MB before the first;
+glibc returned the list's memory by itself: its large blocks were mapped
+separately.)
+
+The cost is on the transaction after a trim that needs the memory again:
+the trim itself took 30 ms at `COMMIT` (342 MB freed), and the next read
+of the same document 260 ms more (+15%): the pages are faulted in and
+zeroed again, and on this host (transparent huge pages `always`) the
+fresh heap is no longer backed by huge pages. Transactions that freed
+less than the threshold pay nothing; with `0` (trim after every
+transaction that freed anything) the medium documents pay 3 to 5%.
+
+Default: 64 MB. A backend then keeps at most about that much of freed
+memory between transactions, and only transactions that used more than
+64 MB of Rust heap (documents of roughly 200 kB of rich text or 1 MB of
+small maps and more) pay for the trim, about 15% of their load time when
+the next transaction needs the memory again. A backend that keeps
+reloading the same large documents (and has the memory for it) can
+disable it (`-1`) or raise it; the setting is `SUSET` like the others,
+since a session that turns it off holds memory every other session of
+the container competes for.
+
+Alternatives considered:
+
+- glibc tunables (`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=...`, or
+  `mallopt(M_MMAP_THRESHOLD)` in `_PG_init`) fix the mmap threshold, so
+  large blocks are always mapped and unmapped: the same page-fault cost on
+  every large allocation, in every transaction, and no help for the
+  holes left by blocks below the threshold.
+- Trimming after every statement that freed a lot (an `ExecutorEnd`
+  hook): more often than needed inside transactions, and statements
+  outside the executor (utility commands) are missed.
+- Trimming when a backend goes idle: the right moment, but Postgres has
+  no hook there; a timer's signal handler cannot call `malloc_trim`.
+- Only the Rust allocation is watched. `palloc` memory freed by
+  Postgres (a detoasted 1 MB value, the jsonb result) goes back to the
+  same heap and is returned by the same trim, but does not trigger one.
+- Other C libraries: `malloc_trim` is glibc's (the Docker image and the
+  supported distributions); elsewhere the setting does nothing.
+
+Tests: a pg_test (`trim_returns_freed_heap_memory_once_enough_was_freed`)
+frees 32 MB of heap blocks below a block that stays and checks that RSS
+keeps them, that `trim_if_freed` trims at 16 MB but not at 64 MB nor
+twice, and that RSS drops by the 32 MB; another checks the setting
+(`kB`, superuser, `-1`). `tests/memory.sh` reads `RssAnon` from
+`/proc/self/status` through `pg_read_file` in a real session (so also
+against the Docker image): after reads of a 400,000-character text (34
+MB peak) with `-1` the backend keeps 36 MB; with `16MB` it is back within
+a few MB of its start after each transaction, but not inside one. The
+soak test with the trim: see [Soak test](#soak-test-2026-10-01).
 
 ### Cluster-wide view: not provided
 
@@ -2479,7 +2572,7 @@ for the two hand-declared `jsonfuncs.h` functions), so an ERROR inside
 becomes a Rust panic that unwinds through Rust frames (destructors run)
 and is re-raised at the function's `#[pg_guard]` boundary; every callback
 Postgres calls (the expanded-object methods, the memory-context reset
-callback, the trigger entry point) is `#[pg_guard]` or wrapped in
+callback, the trigger entry point, the transaction callback) is `#[pg_guard]` or wrapped in
 `pgrx_extern_c_guard`. Automerge calls run under the core's
 `catch_unwind` guard, which turns Automerge's panics into errors and
 passes pgrx's ERROR panics on untouched (they have a non-`String`
@@ -2499,7 +2592,8 @@ payload). Each area and the invariant it relies on:
 | `notify.rs`: trigger | `TriggerData`, the relation's `TupleDesc`, `heap_getattr`, raw datum comparisons | `PgTrigger::from_fcinfo` checks `CALLED_AS_TRIGGER`; the relation is open and locked for the call; dropped columns are skipped; raw comparisons are only between non-null values of the same attribute (by value, fixed length, or varlena bytes / TOAST pointer). Virtual generated columns are not stored and are refused as keys. |
 | `notify.rs`: `json_categorize_type`, `datum_to_json`, `Async_Notify` | Hand-declared C functions | Signatures match PG 18.6's `utils/jsonfuncs.h` (the enum passed as `c_int`); called inside `pg_guard_ffi_boundary`. Channel and payload are NUL-free `CString`s within `NAMEDATALEN` and the 8000-byte payload limit. |
 | `io.rs`: `automerge_recv` | Reading the `StringInfo` | Postgres passes a valid buffer; the rest of it is consumed and copied before it is used. |
-| `lib.rs`: `_PG_init` | `MarkGUCPrefixReserved` | A NUL-terminated literal, copied by Postgres. |
+| `lib.rs`: `_PG_init` | `MarkGUCPrefixReserved`, `RegisterXactCallback` | A NUL-terminated literal, copied by Postgres; a `#[pg_guard]` callback with Postgres' signature, registered once per backend (`_PG_init` runs once), which reads a setting and calls `alloc::trim_if_freed`, nothing that can raise an error at commit or abort. |
+| `alloc.rs`: `malloc_trim` | A hand-declared glibc function (`target_env = "gnu"` only) | Takes no pointer; called from the transaction callback, between allocator calls, never inside one, so malloc's lock is not held and nothing re-enters it. |
 | `alloc.rs`: the global allocator | `GlobalAlloc` for the counting allocator | Every method passes its arguments to `System` and returns its result unchanged; the counters are atomics, which never allocate, panic or re-enter the allocator (see [Memory observability](#memory-observability)). |
 
 What `unsafe` cannot protect against, by design: a Rust stack overflow or
@@ -2676,7 +2770,7 @@ whenever the pinned pgrx version changes.
 - `mise run docker-test` (`tests/docker.sh`, not part of `mise run test`)
   builds the Docker image and tests it and `compose.yaml` against
   throwaway containers, including the regress examples, five of the
-  multi-session scripts and `limits.sh` (see [Docker image](#docker-image));
+  multi-session scripts, `limits.sh` and a soak smoke run (see [Docker image](#docker-image));
   CI's `docker` job runs it on every push and pull request (see [Docker
   image in CI](#docker-image-in-ci)).
 - The multi-session shell scripts share `tests/lib.sh`; they start the pgrx-managed
@@ -2693,6 +2787,105 @@ whenever the pinned pgrx version changes.
   scratch cluster) refuse external mode rather than test something else.
 - `mise run lint`: `tests/check_ci.sh` (with actionlint and shellcheck, pinned in `mise.toml`), rustfmt, clippy with `-D warnings` for the default, the
   `pg_test` and the core-only builds, and rustdoc with `-D warnings`.
+- `tests/soak.sh` (`mise run soak`, not part of `mise run test`; a
+  60-second smoke run is part of `mise run docker-test`): a long
+  concurrent load against the Docker image, see [Soak test](#soak-test).
+
+### Soak test
+
+What the other tests cannot show is what builds up over many thousands
+of statements in long-lived connections: memory that grows (in the Rust
+heap, in Postgres' memory contexts, or only in RSS), latency that
+drifts, tables and TOAST that bloat. `tests/soak.sh` runs a realistic
+load for as long as asked and samples all of it.
+
+```sh
+mise run soak                                   # 60 minutes, 8 clients, documents up to 1 MB
+SOAK_DURATION=2h SOAK_CLIENTS=16 mise run soak  # longer, more connections
+SOAK_DOC_SIZE=200 SOAK_DURATION=10m mise run soak
+SOAK_SMOKE=1 bash tests/soak.sh                 # 60 s, 4 clients, 200 kB (docker-test runs this)
+```
+
+Other knobs (`tests/soak.sh` lists them all): `SOAK_ROWS` (rows before
+the run, default 200), `SOAK_LANE_CHANGES` (250), `SOAK_MEMORY` (the
+container's limit, 4g), `SOAK_MAX_LOAD_MEMORY` (512MB),
+`SOAK_SHARED_BUFFERS` (256MB), `SOAK_TRIM_THRESHOLD`,
+`SOAK_SAMPLE_INTERVAL` (30 s), `SOAK_VACUUM_INTERVAL` (600 s),
+`SOAK_WEIGHTS` (`"write=30 spans=0"`), `SOAK_OUT` (default
+`target/soak/<UTC time>`), `SOAK_KEEP=1` (keep the container to look
+around afterwards).
+
+Setup: one container of the image (labelled `pg-automerge-test`) with
+`--memory` and no swap, `default_toast_compression=lz4`,
+`log_autovacuum_min_duration=0`. Fixtures
+(`examples/gen_soak.rs`, deterministic): 20 template documents, from
+1 kB boards (a map with a list of small maps, a counter, a status) and
+2-8 k-character notes (paragraphs, headings, bold and link marks) to
+lists of small maps of a twentieth to a fifth of `SOAK_DOC_SIZE`, a rich
+text of a tenth, and a list and a rich text of about `SOAK_DOC_SIZE`. Row
+`id` of `soak_docs` is a copy of template `id % 20`; each row has three
+writer "lanes", each a chain of single-change edits by its own actor
+(`save_after` of the change, so change `k` depends on change `k - 1`),
+plus the compressed full save every 25 changes. `soak_cursor` holds each
+lane's position, so a write applies exactly the next change and the
+lanes of a row are concurrent writers. The table has a generated
+`data jsonb` column with a GIN (`jsonb_path_ops`) index (`fastupdate =
+off`, see the results) and an `automerge_notify` trigger.
+
+Load: pgbench (the image's own, in a second container sharing the
+server's network namespace, so the host needs only `psql`) with
+long-lived connections and prepared statements (`-M prepared`), a
+weighted mix of one-transaction scripts
+(`tests/soak/*.sql`): incremental writes (`UPDATE .. SET doc = merge(doc,
+changes)`, `write` for the small and medium rows, `write_big` for the big
+ones), the same from every client to the four newest rows
+(`write_hot`: writers of different lanes wait for the row lock and merge
+into the committed version), upserts of full saves (`upsert`), new rows
+(`create`, so the table grows through the run), re-sent changes skipped
+by `WHERE NOT automerge_contains` (`resend`), jsonb operators
+(`read_ops`, `read_big`), the stored bytes (`fetch`), GIN containment
+queries and reads of the generated column (`read_gin`),
+`automerge_spans` (`spans`), the history functions (`history`),
+`merge_agg` over four copies of a template (`merge_agg`), and
+self-sampling (`monitor`: the backend inserts its own
+`automerge_memory_usage()` and `pg_backend_memory_contexts` totals, as
+the README suggests for pooled connections). A `psql` session `LISTEN`s
+throughout; `VACUUM (ANALYZE)` runs every 10 minutes on top of
+autovacuum.
+
+Samples every 30 seconds: every postgres process's RSS (anonymous, file,
+shared; `/proc` in the container), the container's cgroup memory, table
+heap/TOAST/index sizes, live and dead tuples, `pgstattuple_approx` free
+and dead space of the heap and the TOAST table, autovacuum counts, WAL
+bytes, the notification queue, commits, rollbacks and deadlocks, the
+average stored size and change count of each size class, and the
+notifications received. pgbench logs every transaction.
+`tests/soak_report.py` turns it into `report.txt`: latency percentiles
+per script for each sixth of the run (and their drift), transactions per
+second, each backend's anonymous RSS over time (the high of each half,
+slopes), the counters and memory contexts per window and per backend, the
+container's memory, the table, TOAST, bloat and WAL per window.
+
+Checks (the exit status): no failed transaction or aborted client; no
+`ERROR` (but an autovacuum cancelled by the manual `VACUUM`), crash,
+panic or restart in the server log, and no OOM kill; every
+row has exactly the changes its lanes wrote (`automerge_change_count` =
+the template's + the lane positions: no write lost or applied twice under
+concurrency); the generated column equals `doc::jsonb`; at most three
+heads per row; exactly one well-formed notification per write that
+changed a document (none for the re-sends); no live document and at most
+64 kB allocated between statements in every memory sample; no backend's
+memory contexts more than 1 MB higher in the second half of its samples
+than in the first; and, for runs of 20 minutes or more, no backend's
+anonymous RSS reaching a new high in the second half more than 64 MB
+above its high in the first (after a 5-minute warm-up): a leak keeps
+raising the high-water mark, memory `malloc` keeps for reuse moves below
+it (and a sample can catch a load's Rust peak and its `palloc` memory at
+once). Don't query the server while it
+runs (an `ERROR` of your own fails the log check); `SOAK_KEEP=1` keeps it
+for afterwards.
+
+Results: [Soak test (2026-10-01)](#soak-test-2026-10-01).
 
 ## Installation, schema and privileges
 
@@ -3183,6 +3376,9 @@ README's Docker section. Packaging decisions:
     barely touches before rejecting the chunk, which an address-space cap
     (`ulimit -v`, the scratch cluster) refuses and a used-memory cap (the
     cgroup) does not. The limit refuses it first either way.
+  - a 60-second smoke run of `tests/soak.sh` (`SOAK_SMOKE=1`: 4 clients,
+    documents up to 200 kB, 60 rows, its own container with
+    `--memory=2g`), with all its checks (see [Soak test](#soak-test));
   - every container's log (`docker logs`) is free of `TRAP:`, `PANIC:`,
     Rust panics and backends terminated by a signal or a non-zero exit
     (not any process's: the logical replication launcher exits with 1 at
@@ -3199,8 +3395,8 @@ README's Docker section. Packaging decisions:
     refuses a repository without a registry host (Docker would send it to
     Docker Hub), another version's archive and a duplicate architecture.
 
-  The whole run takes about 4 minutes once the image is built (about 2
-  of them the suites, up to 1 the archive).
+  The whole run takes about 6 minutes once the image is built (about 2
+  of them the suites, 1.5 the soak smoke run, up to 1 the archive).
   `mise run docker-bench-sql` (`tests/docker_bench.sh`) runs
   `tests/bench_sql.sh` against a container of the image (see the
   appendix).
@@ -4053,3 +4249,114 @@ text3mb 5196 → 5256 (+1.2%). The added work there is one
 `save_nocompress` (7.3 ms on text3mb, kept for when the value is stored)
 and the check; the rest of the difference on text3mb is of the size and
 sign of the untouched load's above.
+
+### Soak test (2026-10-01)
+
+`mise run soak` as described in [Soak test](#soak-test): 70 minutes, 8
+clients, documents up to 1000 kB (`SOAK_DOC_SIZE`; the largest a 1.26 MB
+rich text of 1.04 million operations and a 1.07 MB list of 23,000
+maps), 200 rows at the start, a 4 GB container, `shared_buffers
+= 256MB`, `max_load_memory = 512MB`, the Docker image on this
+development machine (8 cores, all busy throughout). Three runs: before
+the trim (run 1, image of 453cb9e), with it (run 2), and the final
+configuration (run 3: the trim, the GIN index with `fastupdate = off`,
+the recalibrated checks).
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| transactions (per client) | 122,769 (15,346) | 121,421 (15,178) | 136,994 (17,124) |
+| failed transactions, errors, crashes | 0 | 0 | 0 (one autovacuum cancelled by the manual `VACUUM`) |
+| rows at the end | 2,630 | 2,545 | 2,915 |
+| lane writes, notifications received | 52,414, 54,844 | 51,475, 53,820 | 57,916, 60,631 |
+| rows whose change count is off, generated columns off | 0, 0 | 0, 0 | 0, 0 |
+| `allocated_bytes` between statements (max of ~3,600 samples) | 16 B | 16 B | 16 B |
+| live documents between statements | 0 | 0 | 0 |
+| peak per backend (the 1.26 MB rich text) | 342 MB | 342 MB | 342 MB |
+| memory contexts per backend, first → last (slope) | 2.2-2.8 → 3.01 MB (0.02 MB/h) | 2.2-2.8 → 3.11 MB (0.02 MB/h) | 1.5-2.9 → 3.02 MB (0.02 MB/h) |
+| backend anonymous RSS, sampled (mostly inside statements) | 200-356 MB throughout | 5-397 MB | 9-355 MB |
+| backend RSS high, 2nd half minus 1st (max over backends) | 9.4 MB | 42.7 MB | 20.3 MB |
+| container anonymous memory, median per window | 2,348-2,430 MB | 1,305-1,449 MB | 1,441-1,699 MB |
+| container anonymous memory, max | 2,642 MB | 2,297 MB | 2,474 MB |
+| TOAST size, start of window 1 → end | 191 → 388 MB | 164 → 381 MB | 161 → 458 MB |
+| TOAST dead tuples / free space (pgstattuple_approx) | 6-27% / 19-38% | 5-24% / 16-44% | 5-30% / 17-40% |
+| autovacuums of the TOAST table | 68 | 69 | 68 |
+| WAL (per lane write) | 48.6 GB (950 kB) | 47.7 GB (949 kB) | 75.5 GB (1,336 kB) |
+| `read_gin` p50, first → last window | 85 → 499 ms | 84 → 488 ms | 1.4 → 3.0 ms |
+
+What they show:
+
+- **No leak.** The Rust heap went back to 16 bytes between statements in
+  every sample of every backend for 70 minutes (about 34,000 loads per
+  backend), no document stayed alive, and the memory contexts stayed at
+  3.0 to 3.1 MB per backend (the 0.02 MB/h slope is the first samples
+  after the backend started; flat after the first window). The backends'
+  anonymous RSS did not trend: in run 1 its high was 344-354 MB in the
+  first half and 339-356 MB in the second.
+- **`malloc` kept what the largest document needed, in every backend
+  (fixed).** In run 1 every backend held 200 to 355 MB all the time, for
+  documents that need 342 MB while loaded and 16 bytes afterwards:
+  see [Returning freed memory](#returning-freed-memory-pg_automergetrim_threshold).
+  With the trim (run 2) a backend drops to 5-75 MB after such a
+  transaction, and the container's median anonymous memory fell by
+  about 1 GB (40%); its maximum (2.3 GB) is the documents being loaded at
+  that moment. Throughput was the same (28.9 against 29.2 transactions
+  per second, run to run noise on this machine being about as large).
+- **GIN with a pending list stops being used under write load
+  (documented).** `read_gin`'s median grew with the table, 85 → 499 ms.
+  On run 2's data (2,545 rows, kept with `SOAK_KEEP=1`), idle, the
+  containment query takes 1 ms through the index (80 ms for the big
+  documents' slot: the recheck detoasts their 425 kB jsonb); under the
+  same load (150 s, 8 clients) the planner chose a sequential scan
+  instead (600 to 900 ms: it detoasts every row's jsonb, 25,000 buffers),
+  because the pending list, which every write of a big document fills
+  with thousands of keys, is part of the index's cost. With
+  `ALTER INDEX .. SET (fastupdate = off)`: the bitmap scan again
+  (1.5 ms), `read_gin` 11.6 ms against 466 ms on average, writes 74 ms
+  against 68 ms (big ones 3.45 s against 3.60 s), 31.5 against 25.5
+  transactions per second. The README recommends `fastupdate = off`, and
+  the soak creates its index that way (`SOAK_GIN_FASTUPDATE=on` for
+  Postgres' default). Run 3 confirms it over the whole run: `read_gin`'s
+  median 1.4 → 3.0 ms (its p95, 16 → 83 ms, is the big documents' slot,
+  whose candidates grow with the table and are rechecked against their
+  425 kB jsonb), and 32.6 instead of 28.9 transactions per second. The
+  cost is WAL: 1,336 kB per write instead of 949 kB (+41%), every write
+  inserting its keys into the index tree instead of appending them to the
+  pending list (and 90 "checkpoints are occurring too frequently" against
+  6). The README says both.
+- **WAL and TOAST are the cost of writing whole documents.** 949 kB of
+  WAL per write over the mix: every update writes the new TOAST value in
+  full, twice with the generated jsonb copy (425 kB against 427 kB
+  stored for a big document), plus full-page images after each of the
+  frequent checkpoints (`max_wal_size` 1 GB: six "checkpoints are
+  occurring too frequently" in run 2). Autovacuum's defaults kept the
+  TOAST table's dead tuples under 27% (about one autovacuum a minute),
+  its free space was reused, and the table grew with the rows, not with
+  the writes (the heap's free space after `VACUUM` 26-28%). README:
+  [Operations](README.md#operations).
+- **Latency did not drift**, except `read_gin` above and what the
+  growing table and documents explain: the small writes' median rose
+  from 12 to 16 ms as the rows and their change counts grew (54 → 71
+  changes per small document on average) and the client time `read_gin`
+  took grew (throughput per window fell about 20% over the run for that
+  reason); p95 and p99 of every other script were flat. The big
+  documents' scripts (`write_big`, `read_big`, `upsert`) are bimodal
+  (`read_big` takes about 0.7 s on the list, 3.2 s on the rich text), so
+  their median jumps between the two from window to window.
+- Checks recalibrated after run 1 and 2: run 1's "no ERROR" check failed
+  because of the author's own queries against the server during the run
+  (an `ERROR` from deliberately exceeding `max_load_memory`, now
+  documented: don't); its RSS growth check (a least-squares slope) failed
+  on noise (−121 to +46 MB/h between backends with no trend), replaced
+  by comparing the high-water marks of the two halves, which run 2
+  missed at 32 MB (42.7 MB: one sample of 382 MB, a load's Rust peak
+  plus its `palloc` memory at the same moment), so the limit is 64 MB;
+  the memory contexts got their own check (1 MB). Run 3 passed every
+  check but the log check, on one `ERROR:  canceling autovacuum task`:
+  Postgres cancels an autovacuum that blocks the harness's own manual
+  `VACUUM`, which is expected and now allowed. Run 4 (65 minutes, the
+  final harness, pgbench from the image): every check passed; 124,514
+  transactions (15,564 per client), 55,460 notifications, 16 bytes
+  allocated and no live document between statements, memory contexts
+  3.01-3.02 MB, backend RSS high-water growth 11.1 MB, container
+  anonymous memory 1.48-1.63 GB at the median per window and 2.34 GB at
+  most, `read_gin` median 1.0 → 2.3 ms, 1,305 kB of WAL per write.

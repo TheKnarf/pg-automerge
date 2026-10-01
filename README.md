@@ -100,7 +100,7 @@ registry of your own (CI can do that for tags once you
 
 ```sh
 mise run docker-build        # pg-automerge:0.2.0 and pg-automerge:dev
-mise run docker-test         # builds, then tests the image and compose.yaml (about 4 minutes once built)
+mise run docker-test         # builds, then tests the image and compose.yaml (about 6 minutes once built)
 ```
 
 The image is 3.5 MB larger than `postgres:18`. A first build takes about
@@ -194,7 +194,8 @@ The image changes no Postgres setting. Suggested, as command-line options
   kernel's OOM killer does the same. Each session can use up to the limit
   at once, like `work_mem`, so keep it well below the container's memory
   divided by the sessions you expect to load large documents at once (the
-  default is 2GB; compose uses 1GB). See [Configuration](#configuration).
+  default is 2GB; compose uses 1GB). See [Configuration](#configuration)
+  and [Sizing memory](#sizing-memory).
 
 ### Updating
 
@@ -302,12 +303,14 @@ for `automerge_notify()`, the settings and their privileges),
 `pg_dump -Fc` in one container restored into a second, a restart on the
 same volume, the regress examples and the concurrency, notify, dump,
 extension and memory suites, the load memory limit against a container started with
-`--memory=1g`, and that no server log shows an assertion failure, panic
-or crashed backend. The suites need Postgres 18 client tools and cargo:
+`--memory=1g`, a 60-second smoke run of the soak test (see
+[Operations](#operations); `mise run soak` is the full hour), and that
+no server log shows an assertion failure, panic or crashed backend. The suites need Postgres 18 client tools and cargo:
 those of the pgrx Postgres by default (`mise run pgrx-init`), or PGDG's
 `postgresql-client-18` with
-`PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config` (what CI uses);
-`DOCKER_TEST_SUITES=0` skips them. It also checks the release scripts:
+`PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config` (what CI uses; the soak
+run also needs its `pgbench` and `python3`); `DOCKER_TEST_SUITES=0`
+skips them. It also checks the release scripts:
 `scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
 
 `mise run docker-upgrade-test` (not part of `docker-test`) upgrades a
@@ -433,10 +436,16 @@ a jsonb copy and index it (the cast is IMMUTABLE):
 
 ```sql
 ALTER TABLE docs ADD COLUMN data jsonb GENERATED ALWAYS AS (doc::jsonb) STORED;
-CREATE INDEX ON docs USING gin (data jsonb_path_ops);
+CREATE INDEX ON docs USING gin (data jsonb_path_ops) WITH (fastupdate = off);
 -- or an expression index on the document itself:
-CREATE INDEX ON docs USING gin ((doc::jsonb));
+CREATE INDEX ON docs USING gin ((doc::jsonb)) WITH (fastupdate = off);
 ```
+
+`fastupdate = off` matters for documents that are written often: see
+[GIN indexes](#gin-indexes-on-documents). For large documents, generate
+only the fields you query (`GENERATED ALWAYS AS (doc->>'status') STORED`)
+rather than a full jsonb copy, which doubles what every write stores (see
+[Operations](#operations)).
 
 ## Keeping backends in sync
 
@@ -599,6 +608,7 @@ blocks). Details in [DESIGN.md](docs/DESIGN.md#rich-text-spans) and
 |---|---|---|---|
 | `pg_automerge.max_load_memory` | `2GB` | superusers, or roles granted `SET` on it; also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Refuse client input and merge results whose estimated load exceeds this (kB, like `work_mem`; `-1`: no limit) |
 | `pg_automerge.verify_writes` | `on` | superusers, or roles granted `SET` on it (`GRANT SET ON PARAMETER pg_automerge.verify_writes TO writer`); also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | Load back the normalized save of every value built from client bytes (text input, binary receive, the `bytea` cast, `merge(automerge, bytea)` results) before it is stored or sent |
+| `pg_automerge.trim_threshold` | `64MB` | superusers, or roles granted `SET` on it; also `ALTER ROLE`/`ALTER DATABASE .. SET` by a superuser | At the end of a transaction, return the memory `malloc` keeps for reuse to the operating system (`malloc_trim`) when pg_automerge's allocation fell by at least this much since the last time (kB; `0`: after every transaction; `-1`: never) |
 
 The `pg_automerge` prefix is reserved: once the library is loaded, a
 misspelled name (`SET pg_automerge.max_load_memroy = ...`) is an error, and
@@ -651,6 +661,21 @@ a result's bytes, so functions stay `IMMUTABLE` and dumps are unaffected.
 Details in
 [DESIGN.md](docs/DESIGN.md#the-pg_automergeverify_writes-setting).
 
+`pg_automerge.trim_threshold`: a loaded document lives in the backend's
+`malloc` heap, which keeps freed memory for reuse, so without it every
+connection would hold on to the most it ever needed: in the
+[soak test](#operations), eight connections reading and writing
+documents of up to 1 MB each held 200 to 355 MB for the whole run
+(342 MB is what loading the largest one takes), even between
+statements. With the default, a transaction that freed more than 64 MB
+hands it back when it ends; that cost the next load of the same 1.26 MB
+document 15% (1.7 → 2.0 s), and nothing for documents whose loads stay
+below the threshold. Set it to `-1` (or higher) for a connection that
+keeps reloading the same large documents and has the memory to keep
+them. glibc only (the Docker image and the usual Linux distributions);
+elsewhere it does nothing. Details in
+[DESIGN.md](docs/DESIGN.md#returning-freed-memory-pg_automergetrim_threshold).
+
 ## Monitoring
 
 Automerge documents live in the Rust heap of the backend that loaded
@@ -687,9 +712,11 @@ afterwards.
 
 The counts are exact (a counting allocator; its cost is about 1 ns per
 allocation, not measurable in `mise run bench-sql`), in the bytes Rust
-asks for: the process uses somewhat more (`malloc`'s own overhead), and after a
-large document is freed `malloc` may keep the memory for reuse, so the
-backend's RSS can stay high while `allocated_bytes` is back at zero.
+asks for: the process uses somewhat more (`malloc`'s own overhead), and
+after a large document is freed `malloc` keeps the memory for reuse until
+the end of the transaction (see `pg_automerge.trim_threshold` in
+[Configuration](#configuration)), so the backend's RSS can stay high for
+a while after `allocated_bytes` is back at zero.
 
 To measure one statement, reset first:
 
@@ -710,6 +737,109 @@ target list (`SELECT (automerge_memory_usage()).live_documents FROM ...`)
 to see it per row: in a `FROM` clause that does not depend on the outer
 row, Postgres calls it once. Details in
 [DESIGN.md](docs/DESIGN.md#memory-observability).
+
+## Operations
+
+What a long concurrent load showed (`mise run soak`, 70 minutes, eight
+long-lived connections against the Docker image in a 4 GB container:
+incremental writes, upserts of full saves, concurrent writers on the same
+rows, jsonb, GIN, `automerge_spans`, history and `merge_agg` reads, a
+`LISTEN` client, a table growing from 200 to about 2,500 to 2,900
+documents of 1 kB to 1.26 MB; results in
+[DESIGN.md](docs/DESIGN.md#soak-test-2026-10-01)): no memory leak (the
+Rust heap back to 16 bytes between statements, memory contexts flat at
+3 MB per backend), no lost or duplicated write, exactly one notification
+per write, no error. What to plan for:
+
+### Sizing memory
+
+A backend loading a document needs memory outside `shared_buffers` and
+`work_mem`, for as long as the load lasts. How much depends on the
+document more than on its size: loading a 1.26 MB rich text (paragraphs,
+headings, marks) took 342 MB, a 1.07 MB list of 23,000 small maps 22 to
+24 MB, a 3 MB plain text 273 MB. Measure your own largest documents:
+
+```sql
+SELECT automerge_memory_reset();
+SELECT doc->>'title' FROM docs WHERE id = $1;
+SELECT pg_size_pretty(peak_allocated_bytes) FROM automerge_memory_usage();
+```
+
+Then, for the container (or server) memory limit:
+
+```text
+limit ≥ shared_buffers
+      + connections × (20 MB + trim threshold)     (each backend's own memory, and what it may keep untrimmed)
+      + concurrent loads × largest document's peak (sessions that may load the largest documents at once)
+      + room for the page cache
+```
+
+With `pg_automerge.trim_threshold` (default 64 MB), a connection gives
+back what a transaction freed beyond the threshold, so only concurrent
+loads count in full; with `-1`, count every connection × the largest
+peak instead. In the soak test (8 connections, 4 GB,
+`shared_buffers=256MB`) the container's anonymous memory was 1.3 to
+1.7 GB at the median and 2.5 GB at most with the trim, against 2.4 GB at
+the median without; the page cache took the rest. A backend killed by
+the kernel's OOM killer restarts every session of the cluster, so leave a
+margin.
+
+`pg_automerge.max_load_memory` caps the estimate of what a write's load
+may take (client input and merge results; reads of stored values are not
+capped). The estimate is above the real peak (458 MB for the 342 MB rich
+text above), so set it above the estimate of the largest document you
+accept (a refused write says the estimate) and below `(limit −
+shared_buffers − connections × (20 MB + trim threshold)) / concurrent
+writers`. The soak
+used 512 MB.
+
+### Writes, WAL and TOAST
+
+Every write stores the whole document again: Postgres writes the new
+version's TOAST chunks in full and the old ones become dead (TOAST is
+never updated in place), and a generated `doc::jsonb` column is a second
+copy as large as the document (425 kB against 427 kB stored per 1 MB
+document, with lz4). In the soak, 47.7 GB of WAL in 70 minutes, 950 kB
+per write averaged over a mix where a tenth of the writes went to the
+1 MB documents (1.34 MB with the GIN index's `fastupdate = off`, see
+below). Plan WAL archiving, replication and backup bandwidth for
+`document size × writes`, raise `max_wal_size` (the default 1 GB made
+Postgres warn "checkpoints are occurring too frequently" at that rate),
+and for large documents prefer small generated columns of the fields you
+query to a full jsonb copy.
+
+`default_toast_compression=lz4` stored the 1.07 to 1.26 MB documents in
+437 kB on average. Autovacuum's defaults kept up at about 8 writes per
+second: the TOAST table was vacuumed about once a minute, its dead tuples
+stayed under 30% and its free space (16 to 44%) was reused, so the table
+grew with the number of documents, not with the number of writes. For
+much higher write rates on large documents, lower the table's
+`autovacuum_vacuum_scale_factor` (the TOAST table follows unless
+`toast.autovacuum_vacuum_scale_factor` is set).
+
+### GIN indexes on documents
+
+Create GIN indexes on a document's jsonb (a generated column or
+`(doc::jsonb)`) with `WITH (fastupdate = off)` when the documents are
+written often. With the default (`fastupdate = on`), writes add their
+keys to the index's pending list, and every write of a large document
+adds thousands; the planner counts the pending list in the index's cost,
+so while writes keep it full it chooses a sequential scan, which detoasts
+and checks every row's jsonb. In the soak, a containment query
+that takes 1.5 ms through the index took 600 to 900 ms that way, growing
+with the table (84 → 488 ms at the median over the run); with
+`fastupdate = off` it averaged 12 ms instead of 466 ms under the same
+load, writes took about as long (small documents 74 against 68 ms on
+average, big ones 3.45 against 3.60 s), and the whole mix ran 31.5
+instead of 25.5 transactions per second; over a whole run, the query's
+median stayed at 1.4 to 3 ms. The price is WAL: each write then inserts
+its keys into the index tree directly, and the run wrote 1.34 MB of WAL
+per write instead of 0.95 MB (+41%). `ALTER INDEX .. SET (fastupdate =
+off)` changes an existing index (then `VACUUM` the table to empty its
+pending list). Either way, a GIN index over the whole jsonb of large
+documents is expensive to maintain; index the few fields you query
+(small generated columns, or expression indexes on them) where you
+can.
 
 ## Limitations and gotchas
 
@@ -898,7 +1028,8 @@ mise run bench-expanded  # SQL timings of merge chains and PL/pgSQL loops on a r
 mise run bench-core  # Rust timings of load, normalize and the jsonb walk
 mise run package     # release package for the Postgres of $PG_CONFIG (required)
 mise run docker-build   # the Docker image (see Docker)
-mise run docker-test    # build it, then test it against containers: SQL, dump/restore, suites, memory limit, compose.yaml (not part of test)
+mise run docker-test    # build it, then test it against containers: SQL, dump/restore, suites, memory limit, a soak smoke run, compose.yaml (not part of test)
+mise run soak           # build it, then a 60-minute concurrent load against a memory-capped container, sampled and checked (see Operations)
 mise run docker-bench-sql  # bench-sql against the image (release build on PGDG Postgres, no assertions)
 mise run docker-up      # compose.yaml's development Postgres; docker-down stops it
 # scripts/docker-archive.sh and scripts/docker-push.sh: release archives and pushing (see Publishing the image)

@@ -318,3 +318,75 @@ fn memory_usage_does_not_leak_over_many_statements() {
         after.allocated - start.allocated
     );
 }
+
+/// This process's anonymous resident memory (`RssAnon` in
+/// /proc/self/status), in bytes.
+fn rss_anon() -> i64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let kb: i64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("RssAnon:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap();
+    kb * 1024
+}
+
+#[pg_test]
+fn trim_returns_freed_heap_memory_once_enough_was_freed() {
+    // Start the high point over (a trim whatever was freed before).
+    crate::alloc::trim_if_freed(0);
+    // 32 MB in blocks of 64 kB (below malloc's mmap threshold, so they
+    // come from the heap), then a block that stays above them: once freed,
+    // they are one free chunk inside the heap, which malloc keeps for reuse
+    // (its top cannot shrink past the block that stays) and only
+    // malloc_trim's madvise returns, as with a loaded document freed
+    // below the allocations of later statements.
+    let before = rss_anon();
+    let blocks: Vec<Vec<u8>> = (0..512u32).map(|i| vec![i as u8 | 1; 64 * 1024]).collect();
+    let pin = vec![1u8; 96 * 1024];
+    let loaded = rss_anon();
+    drop(blocks);
+    let freed = rss_anon();
+    // Not enough freed for a 64 MB threshold; enough for 16 MB; and the
+    // high point started over, so not again.
+    assert!(!crate::alloc::trim_if_freed(64 << 20));
+    assert!(crate::alloc::trim_if_freed(16 << 20));
+    let trimmed = rss_anon();
+    assert!(!crate::alloc::trim_if_freed(16 << 20));
+    drop(pin);
+    let mb = |b: i64| b / (1 << 20);
+    assert!(
+        loaded - before >= 30 << 20,
+        "32 MB of blocks: RssAnon {} -> {} MB",
+        mb(before),
+        mb(loaded)
+    );
+    // glibc keeps the holes ...
+    assert!(
+        freed - before >= 30 << 20,
+        "freed blocks kept: RssAnon {} -> {} -> {} MB",
+        mb(before),
+        mb(loaded),
+        mb(freed)
+    );
+    // ... until the trim returns them.
+    assert!(
+        freed - trimmed >= 28 << 20,
+        "trim: RssAnon {} -> {} MB",
+        mb(freed),
+        mb(trimmed)
+    );
+}
+
+#[pg_test]
+fn trim_threshold_setting() {
+    let s: String = one(
+        "SELECT setting || ' ' || unit || ' ' || context FROM pg_settings WHERE name = 'pg_automerge.trim_threshold'",
+        &[],
+    );
+    assert_eq!(s, "65536 kB superuser");
+    Spi::run("SET pg_automerge.trim_threshold = -1").unwrap();
+    Spi::run("SET pg_automerge.trim_threshold = '256MB'").unwrap();
+    let v: String = one("SHOW pg_automerge.trim_threshold", &[]);
+    assert_eq!(v, "256MB");
+}

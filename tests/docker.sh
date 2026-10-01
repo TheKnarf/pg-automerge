@@ -62,6 +62,11 @@
 #     crafted inputs get the backend OOM-killed and the cluster restarts,
 #     with the default limit they get 53400 and nothing restarts (the
 #     postmaster start time, the container's start time and restart count);
+#   - a 60-second smoke run of tests/soak.sh (SOAK_SMOKE=1) in its own
+#     memory-capped container: concurrent writes, reads, history,
+#     merge_agg, notifications and VACUUM, with its checks (no error, no
+#     lost write, one notification per write, nothing left allocated
+#     between statements);
 #   - no container's server log (docker logs) has an assertion failure,
 #     PANIC, Rust panic or a backend killed by a signal (the limits
 #     container: none besides its deliberate crashes);
@@ -70,7 +75,7 @@
 #
 # Env: PG_AUTOMERGE_IMAGE (default pg-automerge:<Cargo.toml version>),
 # PG_CONFIG (the suites' client tools, default pgrx's pg18),
-# DOCKER_TEST_SUITES=0 (skip the suites), DOCKER_TEST_MEMORY (the limits
+# DOCKER_TEST_SUITES=0 (skip the suites and the soak smoke run), DOCKER_TEST_MEMORY (the limits
 # container's memory cap, default 1g).
 
 # shellcheck source=tests/docker_lib.sh
@@ -481,8 +486,13 @@ if [[ "${DOCKER_TEST_SUITES:-1}" == 1 ]]; then
     grep '^==>   ' "$DWORK/limits.log" | sort | uniq -c | sed 's/^ */    /'
     check_log limits --crashes-allowed
     docker rm -f -v "$(cname limits)" >/dev/null
+
+    log "tests/soak.sh smoke run (60 s, 4 clients, documents up to 200 kB, its own container)"
+    SOAK_SMOKE=1 SOAK_OUT="$DWORK/soak" PG_AUTOMERGE_IMAGE="$IMAGE" bash tests/soak.sh >"$DWORK/soak.log" 2>&1 \
+        || { cat "$DWORK/soak.log" >&2; fail "tests/soak.sh smoke run"; }
+    grep -E '^transactions:|^max backend anon RSS' "$DWORK/soak.log" | sed 's/^/    /'
 else
-    log "DOCKER_TEST_SUITES=0: skipping the regress examples, the multi-session suites and limits.sh"
+    log "DOCKER_TEST_SUITES=0: skipping the regress examples, the multi-session suites, limits.sh and the soak smoke run"
 fi
 
 # ---------------------------------------------------------------------------

@@ -127,9 +127,14 @@ description = "Build the Docker image (official postgres:18 + pg_automerge, buil
 run = "bash scripts/docker-build.sh"
 
 [tasks.docker-test]
-description = "Build the Docker image, then test it: init, SQL (casts, merge, jsonb + GIN index, history, LISTEN/NOTIFY), settings, dump/restore into a second container, restart on a volume, PG_AUTOMERGE_CREATE_EXTENSION, the regress examples and the concurrency/notify/dump/extension suites against a container, limits.sh against a memory-capped one, server logs, compose.yaml; not part of test"
+description = "Build the Docker image, then test it: init, SQL (casts, merge, jsonb + GIN index, history, LISTEN/NOTIFY), settings, dump/restore into a second container, restart on a volume, PG_AUTOMERGE_CREATE_EXTENSION, the regress examples and the concurrency/notify/dump/extension/memory suites against a container, limits.sh against a memory-capped one, a 60-second soak.sh smoke run, server logs, compose.yaml; not part of test"
 depends = ["docker-build"]
 run = "bash tests/docker.sh"
+
+[tasks.soak]
+description = "Soak test: a long concurrent pgbench load (writes with merge, upserts of full saves, concurrent writers on one row, jsonb/GIN/generated column reads, automerge_spans, history, merge_agg, a LISTEN client, VACUUM) against the Docker image in a memory-capped container, sampling RSS, automerge_memory_usage(), memory contexts, table/TOAST sizes and bloat, WAL and latency; report and checks in target/soak/<time>/ (SOAK_DURATION, default 60m; SOAK_CLIENTS, default 8; SOAK_DOC_SIZE in kB, default 1000; see tests/soak.sh); not part of test"
+depends = ["docker-build"]
+run = "bash tests/soak.sh"
 
 [tasks.docker-upgrade-test]
 description = "Upgrade a 0.1.0 deployment to the current image: a 0.1.0 container (PG_AUTOMERGE_OLD_IMAGE, or built from the release revision) with tables, a generated doc::jsonb column, indexes, a notify trigger and data; the new image on the same volume, following the README compose steps (a non-postgres superuser, the README's pg_dump and psql commands, a service build: with the version arg); ALTER EXTENSION pg_automerge UPDATE; data, indexes, trigger, automerge_spans and the catalog checked; not part of test or docker-test"

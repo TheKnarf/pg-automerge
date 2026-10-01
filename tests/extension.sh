@@ -21,7 +21,8 @@
 #   - pg_automerge.verify_writes and pg_automerge.max_load_memory stay
 #     superuser-only for that role: SET (before and after the library is
 #     loaded), ALTER ROLE/DATABASE .. SET; a superuser can still set them
-#     per role or GRANT SET ON PARAMETER.
+#     per role or GRANT SET ON PARAMETER; pg_automerge.trim_threshold too
+#     (SET, ALTER ROLE .. SET, GRANT SET ON PARAMETER).
 #
 # Env: see tests/lib.sh.
 
@@ -274,6 +275,25 @@ sql_on "$DB_OWNED" -c "ALTER ROLE $ROLE RESET pg_automerge.max_load_memory" \
         -c "SHOW pg_automerge.max_load_memory" | tail -1)" == -1 ]] \
     || fail "GRANT SET ON PARAMETER did not let $ROLE change max_load_memory"
 sql_on "$DB_OWNED" -c "REVOKE SET ON PARAMETER pg_automerge.max_load_memory FROM $ROLE"
+
+log "pg_automerge.trim_threshold stays superuser-only"
+# A session that turns trimming off holds memory the other sessions of the
+# server compete for.
+for stmt in "SET pg_automerge.trim_threshold = -1" \
+            "ALTER ROLE $ROLE SET pg_automerge.trim_threshold = -1"; do
+    if out="$(as_role -c "SELECT '\\x'::bytea::automerge IS NOT NULL" -c "$stmt" 2>&1)"; then
+        fail "a non-superuser ran: $stmt"
+    fi
+    grep -q 'permission denied to set parameter "pg_automerge.trim_threshold"' <<<"$out" \
+        || fail "$stmt: unexpected error: $out"
+done
+[[ "$(as_role -c "SELECT '\\x'::bytea::automerge IS NOT NULL" -c "SHOW pg_automerge.trim_threshold" | tail -1)" \
+   == 64MB ]] || fail "trim_threshold is not 64MB for $ROLE"
+sql_on "$DB_OWNED" -c "GRANT SET ON PARAMETER pg_automerge.trim_threshold TO $ROLE"
+[[ "$(as_role -c "SELECT '\\x'::bytea::automerge IS NOT NULL" -c "SET pg_automerge.trim_threshold = -1" \
+        -c "SHOW pg_automerge.trim_threshold" | tail -1)" == -1 ]] \
+    || fail "GRANT SET ON PARAMETER did not let $ROLE change trim_threshold"
+sql_on "$DB_OWNED" -c "REVOKE SET ON PARAMETER pg_automerge.trim_threshold FROM $ROLE"
 
 log "misspelled pg_automerge.* settings are removed when the library loads"
 # The library reserves the prefix: a placeholder set before it loaded (here

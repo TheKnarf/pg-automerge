@@ -9,7 +9,8 @@
 //! actor id and makes its own edit, so the correct final state contains all of
 //! them; a lost update shows up as a missing key. `MANY` (for the notify
 //! test) is the base merged with 150 concurrent forks: 150 heads, too many
-//! for a NOTIFY payload.
+//! for a NOTIFY payload. `BIG` (for tests/memory.sh) is a text of 400,000
+//! random characters, whose load takes tens of megabytes.
 
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, ObjType, ROOT};
@@ -55,4 +56,18 @@ fn main() {
         many.merge(&mut fork).unwrap();
     }
     print("MANY", &mut many);
+
+    let mut big = AutoCommit::new().with_actor(ActorId::from([0xbbu8; 16]));
+    let text = big.put_object(ROOT, "text", ObjType::Text).unwrap();
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let body: String = (0..400_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'a' + (x % 26) as u8)
+        })
+        .collect();
+    big.splice_text(&text, 0, 0, &body).unwrap();
+    print("BIG", &mut big);
 }

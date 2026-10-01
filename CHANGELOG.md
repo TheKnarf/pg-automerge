@@ -11,7 +11,8 @@ installing the package) and `ALTER EXTENSION pg_automerge UPDATE`.
 
 Upgrade: `ALTER EXTENSION pg_automerge UPDATE` from 0.2.0
 (`sql/pg_automerge--0.2.0--0.3.0.sql`; from 0.1.0 it runs both scripts in
-one step). It only adds the two functions below: no `REINDEX`, no rewrite
+one step). It only adds the two functions below (the new setting needs
+no SQL): no `REINDEX`, no rewrite
 of generated columns, every function returns what it returned in 0.2.0,
 and the stored format is unchanged. The fixes take effect as soon as a
 backend loads the new library, before the `UPDATE`. With compose, set a
@@ -31,6 +32,27 @@ Added:
   allocation: not measurable in `mise run bench-sql` (reads, writes,
   merges, `merge_agg`), and at most a few percent in the Rust-level
   benchmark of the allocation-heaviest jsonb walk.
+- **`pg_automerge.trim_threshold`** (default `64MB`, superuser-only like
+  the other settings): at the end of a transaction in which
+  pg_automerge's allocation fell by at least this much, return the memory
+  `malloc` kept for reuse to the operating system (glibc's
+  `malloc_trim`). Found by the new soak test: every long-lived connection
+  used to keep the most it had ever needed (200 to 355 MB per connection
+  for documents of up to 1 MB, 2.4 GB of a 4 GB container for eight
+  connections, busy or idle); with the trim the container's median was
+  1.3 to 1.7 GB. It costs the next load of a document that big about
+  15% (the memory is faulted in again), and nothing for documents whose
+  loads stay below the threshold; `-1` restores the old behaviour. See
+  the README's [Configuration](README.md#configuration).
+- **Soak test** (`mise run soak`, `tests/soak.sh`): an hour of
+  concurrent writes, reads, history, `merge_agg`, notifications and
+  VACUUM against the Docker image in a memory-capped container, sampled
+  and checked; its findings are in the README's new
+  [Operations](README.md#operations) section (memory sizing, WAL and
+  TOAST, and GIN indexes on documents: with Postgres' default
+  `fastupdate = on` the planner stops using them while writes keep the
+  pending list full, so create them with `fastupdate = off`, which costs
+  more WAL). A 60-second run is part of `mise run docker-test`.
 
 Fixed:
 

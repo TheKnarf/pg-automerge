@@ -13,7 +13,8 @@
 //! - `history`: the change types and history functions.
 //! - `notify`: the `automerge_notify()` trigger.
 //! - `spans`: `automerge_spans`, the structure of a text object.
-//! - `alloc`: the counting global allocator.
+//! - `alloc`: the counting global allocator, and returning freed memory
+//!   to the system at transaction end (`pg_automerge.trim_threshold`).
 //! - `memory`: `automerge_memory_usage()` and `automerge_memory_reset()`.
 
 // A cdylib: its docs are for developers (built with
@@ -55,11 +56,23 @@ const MAX_LOAD_MEMORY_DEFAULT_KB: i32 = 2 * 1024 * 1024;
 static MAX_LOAD_MEMORY: pgrx::GucSetting<i32> =
     pgrx::GucSetting::<i32>::new(MAX_LOAD_MEMORY_DEFAULT_KB);
 
+/// The default of `pg_automerge.trim_threshold`, in kB: 64 MB.
+const TRIM_THRESHOLD_DEFAULT_KB: i32 = 64 * 1024;
+
+/// `pg_automerge.trim_threshold`: at the end of a transaction, return the
+/// memory `malloc` keeps for reuse to the operating system when the
+/// library's Rust allocation fell by at least this many kB from its high
+/// point since the last time; -1: never (see docs/DESIGN.md, "Returning
+/// freed memory").
+static TRIM_THRESHOLD: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(TRIM_THRESHOLD_DEFAULT_KB);
+
 /// Library initialization: let the core's long loops (the jsonb walk,
 /// history rows, the input scan) honour query cancel and
-/// `statement_timeout`, define the `pg_automerge.verify_writes` and
-/// `pg_automerge.max_load_memory` settings, and reserve the `pg_automerge`
-/// prefix for them.
+/// `statement_timeout`, define the `pg_automerge.verify_writes`,
+/// `pg_automerge.max_load_memory` and `pg_automerge.trim_threshold`
+/// settings, register the transaction callback that trims, and reserve the
+/// `pg_automerge` prefix.
 #[pgrx::pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     pg_automerge_core::set_interrupt_check(check_for_interrupts);
@@ -92,6 +105,25 @@ pub extern "C-unwind" fn _PG_init() {
         pgrx::GucFlags::UNIT_KB,
     );
     pg_automerge_core::budget::set_limit_source(max_load_memory);
+    pgrx::GucRegistry::define_int_guc(
+        c"pg_automerge.trim_threshold",
+        c"Return freed memory to the operating system at transaction end once this much was freed.",
+        c"Loaded documents live in the backend's malloc heap, which keeps freed memory for reuse, \
+          so after one large document a backend would hold that much for the rest of its life. \
+          At the end of a transaction in which pg_automerge's allocation fell by at least this \
+          much from its high point, malloc_trim(0) returns the free memory to the operating \
+          system. -1 never trims. Superuser-only.",
+        &TRIM_THRESHOLD,
+        -1,
+        i32::MAX,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::UNIT_KB,
+    );
+    // SAFETY: a callback with the signature Postgres expects, registered
+    // once per backend (_PG_init runs once); it touches no Postgres state.
+    unsafe {
+        pgrx::pg_sys::RegisterXactCallback(Some(trim_at_transaction_end), std::ptr::null_mut());
+    }
     // Reserve the prefix: a misspelled pg_automerge.* setting is an error
     // from now on (42602), and placeholders already set (from
     // postgresql.conf, ALTER SYSTEM/ROLE/DATABASE or SET before the library
@@ -99,6 +131,35 @@ pub extern "C-unwind" fn _PG_init() {
     // silently while the real setting keeps its default.
     // SAFETY: a NUL-terminated literal; Postgres copies it.
     unsafe { pgrx::pg_sys::MarkGUCPrefixReserved(c"pg_automerge".as_ptr()) };
+}
+
+/// Transaction callback: at the end of every top-level transaction (and
+/// in parallel workers), trim `malloc`'s free memory when the library's
+/// allocation fell by `pg_automerge.trim_threshold` from its high point
+/// ([`alloc::trim_if_freed`]). It reads a setting and calls the C library,
+/// nothing that can raise an error, so it is safe at abort too.
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn trim_at_transaction_end(
+    event: pgrx::pg_sys::XactEvent::Type,
+    _arg: *mut std::ffi::c_void,
+) {
+    use pgrx::pg_sys::XactEvent::{
+        XACT_EVENT_ABORT, XACT_EVENT_COMMIT, XACT_EVENT_PARALLEL_ABORT, XACT_EVENT_PARALLEL_COMMIT,
+        XACT_EVENT_PREPARE,
+    };
+    if !matches!(
+        event,
+        XACT_EVENT_COMMIT
+            | XACT_EVENT_ABORT
+            | XACT_EVENT_PARALLEL_COMMIT
+            | XACT_EVENT_PARALLEL_ABORT
+            | XACT_EVENT_PREPARE
+    ) {
+        return;
+    }
+    if let Ok(kb) = usize::try_from(TRIM_THRESHOLD.get()) {
+        alloc::trim_if_freed(kb.saturating_mul(1024));
+    }
 }
 
 /// The current value of `pg_automerge.verify_writes`.
