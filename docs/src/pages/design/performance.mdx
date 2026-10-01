@@ -19,14 +19,14 @@ bench-core` measures load, normalize, save and walk):
 | 2,000 list items, 41 changes | 83 kB | 16 ms | 0.3 ms | 0.1 ms | 0.3 ms | 6.4 ms |
 
 Building the jsonb value from the walk's events adds about 30 ms on the
-877 kB list document (see [the appendix](/design/benchmarks/2026-09-29#jsonb-built-in-rust-memory-2026-09-29));
+877 kB list document (see [the appendix](./benchmarks/2026-09-29.mdx#jsonb-built-in-rust-memory-2026-09-29));
 a `serde_json::Value`, for comparison, takes 89 ms and 8 ms in total with
 the walk on the two list documents.
 
 Since 0.3.0 every Rust allocation is counted (for
 `automerge_memory_usage()`): about 1 ns per allocation, within noise on
 loads and at most a few percent on the allocation-heavy per-object walk
-(see [Memory observability](/design/memory-observability)); the numbers above
+(see [Memory observability](./memory-observability.mdx)); the numbers above
 were measured before.
 
 What costs a load, per call:
@@ -76,7 +76,7 @@ What costs a load, per call:
   (of the save; 2.8 s on the 3 MB document), and the stored document is
   never loaded. The upsert (`INSERT .. ON CONFLICT DO UPDATE SET doc =
   merge(docs.doc, EXCLUDED.doc)`) and a typed `automerge` parameter in a
-  custom plan cost two (see [Expanded values](/design/expanded-values)). A
+  custom plan cost two (see [Expanded values](./expanded-values.mdx)). A
   concurrent save (neither contains the other) costs a load of each side
   and the verification load.
 - `automerge_contains(doc, changes bytea)` and the no-op check of
@@ -115,7 +115,7 @@ What costs a load, per call:
   `pglz`, so it can trim that part of writes; it is not measured here (the
   pgrx-managed Postgres is built without lz4) and the default is left
   alone.
-- Pricing a write (see [Resource limits](/design/resource-limits)) costs a scan
+- Pricing a write (see [Resource limits](./resource-limits.mdx)) costs a scan
   of the input and, for a merge, of the stored target: 1.7 ms for the
   877 kB list document stored, 3.7 ms for its compressed save, 0.2 / 0.4
   ms at 83 kB; the 3 MB text document scans in under 0.1 ms stored and

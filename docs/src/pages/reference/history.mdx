@@ -47,7 +47,7 @@ CREATE TYPE automerge_change AS (
 - `automerge_get_change(doc, hash text) → automerge_change`: one change with
   its bytes, or NULL if the document does not have it.
 - `automerge_change_count(doc) → bigint`: number of changes. Read from a
-  prefix of the stored value (see [Heads fast path](/reference/merging#heads-fast-path)),
+  prefix of the stored value (see [Heads fast path](./merging.mdx#heads-fast-path)),
   without loading it.
 - `automerge_to_jsonb(doc automerge, heads text[]) → jsonb`: the state as of
   `heads` (Automerge's `*_at` reads), with the same mapping as the cast.

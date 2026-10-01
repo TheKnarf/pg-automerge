@@ -12,7 +12,7 @@ Postgres' memory contexts: `pg_backend_memory_contexts`,
 `pg_log_backend_memory_contexts()`, `work_mem` and HashAgg's accounting do
 not see them, and a 3 MB document takes about 400 MB loaded (see
 [Input amplification
-measurements](/design/benchmarks/2026-09-29#input-amplification-measurements-2026-09-29)). Since 0.3.0
+measurements](./benchmarks/2026-09-29.mdx#input-amplification-measurements-2026-09-29)). Since 0.3.0
 two functions show it, for the current backend:
 
 | Column of `automerge_memory_usage()` | Meaning |
@@ -39,7 +39,7 @@ Two designs were compared:
 
 - **Bookkeeping around documents**: count `LoadedDoc`s and `merge_agg`
   states, and attribute an estimated size to each (the `budget` model of
-  [Resource limits](/design/resource-limits)). Free for everything else, but an
+  [Resource limits](./resource-limits.mdx)). Free for everything else, but an
   estimate (plain text is over-counted about five times), known only for
   documents whose counts were scanned, and blind to the biggest users:
   the document every read loads and drops within one call (`doc->>'a'`
@@ -48,13 +48,13 @@ Two designs were compared:
 - **A counting `#[global_allocator]`** (`src/alloc.rs`): the system
   allocator plus three atomic counters (the allocation, its peak, and
   since 0.3.0 its high point since the last trim, see
-  [Returning freed memory](/design/memory-observability#returning-freed-memory-pg_automergetrim_threshold)).
+  [Returning freed memory](./memory-observability.mdx#returning-freed-memory-pg_automergetrim_threshold)).
   Exact, and covers everything the library's Rust code allocates, at a
   cost on every allocation.
 
 Measured cost of the allocator (release builds, one CPU pinned,
 2026-10-01, on an Intel Atom C3758R at 2.4 GHz; bench-core's documents,
-see [Performance](/design/performance)):
+see [Performance](./performance.mdx)):
 
 - Per allocation, `mise run bench-alloc` (the core crate's `bench_alloc`
   example, which includes `src/alloc.rs` itself and switches the global
@@ -120,7 +120,7 @@ What the numbers mean:
   mapped separately), so a backend's RSS can stay high after
   `allocated_bytes` fell back, until the end of the transaction, where
   the library returns it once enough was freed (see
-  [Returning freed memory](/design/memory-observability#returning-freed-memory-pg_automergetrim_threshold)).
+  [Returning freed memory](./memory-observability.mdx#returning-freed-memory-pg_automergetrim_threshold)).
 - A `#[global_allocator]` covers the Rust code linked into this library:
   Automerge, the core, and pgrx's own Rust allocations (16 to 123 bytes
   between statements in the tests). Another Rust extension in the same
@@ -136,7 +136,7 @@ What the numbers mean:
 
 ## Returning freed memory (`pg_automerge.trim_threshold`)
 
-The [soak test](/operations/soak-test) found it (2026-10-01): with eight long-lived
+The [soak test](../operations/soak-test.mdx) found it (2026-10-01): with eight long-lived
 connections writing and reading documents of up to 1 MB for 70 minutes,
 every backend's anonymous RSS stayed between 200 and 355 MB for the whole
 run while `automerge_memory_usage()` showed 16 bytes allocated between
@@ -162,7 +162,7 @@ is a third counter in the allocator (`alloc::HIGH`, a relaxed load per
 allocation and a plain store, no read-modify-write, on every allocation
 that is a new high since the last trim: rare in a steady state, nearly
 every allocation of a large load after a trim; about 2 ns per
-allocation in all, see [Memory observability](/design/memory-observability)); it
+allocation in all, see [Memory observability](./memory-observability.mdx)); it
 starts over at each trim. The threshold is at least one byte: with `0`
 the trim runs at the end of every transaction in which anything was
 freed since the last one, never when nothing was, so transactions that
@@ -241,7 +241,7 @@ checks the setting
 against the Docker image): after reads of a 400,000-character text (34
 MB peak) with `-1` the backend keeps 36 MB; with `16MB` it is back within
 a few MB of its start after each transaction, but not inside one. The
-soak test with the trim: see [Soak test](/design/benchmarks/2026-10-01#soak-test-2026-10-01).
+soak test with the trim: see [Soak test](./benchmarks/2026-10-01.mdx#soak-test-2026-10-01).
 
 ## Cluster-wide view: not provided
 
@@ -257,7 +257,7 @@ since PostgreSQL 16 a context's methods come from the fixed
 `mcxt_methods[]` table, indexed by the 4-bit method ID in every chunk
 header (`MemoryContextMethodID`, `utils/memutils_internal.h`), so an
 extension cannot define a context type whose statistics it reports. What to do instead (see
-[Monitoring](/operations/monitoring)): sample `automerge_memory_usage()`
+[Monitoring](../operations/monitoring.mdx)): sample `automerge_memory_usage()`
 from the application's own connections (a pooled backend is reached only
 through its connection), and from outside, a backend's RSS, which
 includes this heap.

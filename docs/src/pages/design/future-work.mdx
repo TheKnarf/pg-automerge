@@ -18,7 +18,7 @@ evaluation, for a decision before the first release.
   value at that key (`doc.get(ROOT, key)` and the walk of that subtree).
   The load itself stays: Automerge has no partial load. The gain is the
   walk and jsonb build of everything else, from the primitives in
-  [Performance](/design/performance): on the 877 kB list document about 100 ms
+  [Performance](./performance.mdx): on the 877 kB list document about 100 ms
   (72 ms walk, about 30 ms build) of roughly 260 ms, close to half with
   the per-call overhead; on the 3 MB text document about 0.3 s (the text's
   conversion) of 2.8 s, since the load dominates there. The more of the

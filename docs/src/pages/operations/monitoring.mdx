@@ -43,7 +43,7 @@ benchmarks, not measurable in `mise run bench-sql`), in the bytes Rust
 asks for: the process uses somewhat more (`malloc`'s own overhead), and
 after a large document is freed `malloc` keeps the memory for reuse until
 the end of the transaction (see `pg_automerge.trim_threshold` in
-[Configuration](/reference/configuration)), so the backend's RSS can stay high for
+[Configuration](../reference/configuration.mdx)), so the backend's RSS can stay high for
 a while after `allocated_bytes` is back at zero.
 
 To measure one statement, reset first:
@@ -64,4 +64,4 @@ outside, a backend's RSS (`ps -o rss -p <pid>`, with the pids from
 target list (`SELECT (automerge_memory_usage()).live_documents FROM ...`)
 to see it per row: in a `FROM` clause that does not depend on the outer
 row, Postgres calls it once. Details in
-[Memory observability](/design/memory-observability).
+[Memory observability](../design/memory-observability.mdx).

@@ -13,7 +13,7 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `bytea → automerge` | I S P | Assignment cast (validates). |
 | `automerge → bytea` | | Explicit binary-coercible cast: the stored Automerge bytes. |
 | `automerge → jsonb` | I S P | Implicit cast / `automerge_to_jsonb(automerge)`: the current state. |
-| `merge(a, b)`, `a \|\| b` | I S P | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. Two histories with different changes under one actor id cannot be merged (22000, see [Limitations](/operations/limitations)); a result over `pg_automerge.max_load_memory` is refused (53400). |
+| `merge(a, b)`, `a \|\| b` | I S P | CRDT merge. Commutative and idempotent in state (heads and jsonb), not byte for byte; returns an input unchanged if it already contains the other, otherwise an in-memory (expanded) result. Two histories with different changes under one actor id cannot be merged (22000, see [Limitations](../operations/limitations.mdx)); a result over `pg_automerge.max_load_memory` is refused (53400). |
 | `merge(doc, changes bytea)`, `doc \|\| changes` | I S P | Apply a save or bare change chunks (`save_incremental()` / `save_after()` output, may be concatenated) on top of `doc`. Returns `doc` unchanged if nothing is new; rejects changes with missing dependencies (22P02, naming them in the DETAIL). |
 | `merge_agg(automerge)` | immutable, parallel safe (no combine function) | Aggregate merge of all non-null inputs. Loads a document only to merge it: a single row, or a version plus older ones, costs no load or one. A merged state over `pg_automerge.max_load_memory` is refused (53400). |
 | `automerge_heads(automerge) → text[]` | I S P | Current heads, sorted hex change hashes. Read from the stored header, without loading the document. |
@@ -26,12 +26,12 @@ Functions are `IMMUTABLE STRICT PARALLEL SAFE` (I S P below) unless noted.
 | `automerge_get_change(doc, hash) → automerge_change` | I S P | One change with its bytes; NULL if absent. |
 | `automerge_change_count(doc) → bigint` | I S P | Number of changes, read from the stored bytes without loading the document. |
 | `automerge_to_jsonb(doc, heads text[]) → jsonb` | I S P | The state as of `heads` (`'{}'`: before any change). |
-| `automerge_spans(doc, path text[] [, heads text[]]) → jsonb` | I S P | The structure of the text object at `path` (as for `#>`: `'{notes,0,body}'`): an array of `{"type":"text","value":…,"marks":{…}}` runs and `{"type":"block","value":{…}}` blocks, the shape of Automerge's JavaScript `spans()`; as of `heads` with the third argument. NULL if nothing is at `path`; 22023 if it is not a text object. See [Rich text](/guide/rich-text). |
-| `automerge_memory_usage()` | volatile, parallel restricted | One row: the memory pg_automerge holds in this backend outside Postgres' memory contexts (`allocated_bytes`, `peak_allocated_bytes`), loaded documents alive (`live_documents`), and Automerge loads so far (`loads`, `load_time` in ms). See [Monitoring](/operations/monitoring). |
+| `automerge_spans(doc, path text[] [, heads text[]]) → jsonb` | I S P | The structure of the text object at `path` (as for `#>`: `'{notes,0,body}'`): an array of `{"type":"text","value":…,"marks":{…}}` runs and `{"type":"block","value":{…}}` blocks, the shape of Automerge's JavaScript `spans()`; as of `heads` with the third argument. NULL if nothing is at `path`; 22023 if it is not a text object. See [Rich text](../guide/rich-text.mdx). |
+| `automerge_memory_usage()` | volatile, parallel restricted | One row: the memory pg_automerge holds in this backend outside Postgres' memory contexts (`allocated_bytes`, `peak_allocated_bytes`), loaded documents alive (`live_documents`), and Automerge loads so far (`loads`, `load_time` in ms). See [Monitoring](../operations/monitoring.mdx). |
 | `automerge_memory_reset()` | volatile, parallel restricted | Restart this backend's peak from the current allocation, and its `loads` and `load_time` from zero. |
 
 Every object has a `COMMENT` (`\df+`, `\dT+`). Error codes are listed on the
-[Error codes](/reference/error-codes) page.
+[Error codes](./error-codes.mdx) page.
 
 ## SQL API and semantics
 

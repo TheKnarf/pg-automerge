@@ -10,7 +10,7 @@ little about what loading it takes: a 4 kB compressed save of a
 4,000,000-character text takes 390 MB and 4.3 s to load, a 113-byte
 change chunk can describe 10,000,000 operations (about 5 GB), and memory
 grows with what the input describes (see [Input amplification
-measurements](/design/benchmarks/2026-09-29#input-amplification-measurements-2026-09-29)). Automerge
+measurements](./benchmarks/2026-09-29.mdx#input-amplification-measurements-2026-09-29)). Automerge
 allocates with the Rust global allocator, and a failed Rust allocation
 aborts the backend, after which the postmaster restarts every session of
 the cluster. Anyone who can write an `automerge` value can send such input
@@ -55,7 +55,7 @@ up to about 8 s per GB on the test machine (release build; the core test
 asserts it for every input of its battery when run with `--release`), so
 at the default an uncancellable load takes at most about 16 s, except
 for many marks applied as changes, whose time grows with the square of
-their number (see [What the limit cannot do](/design/resource-limits#what-the-limit-cannot-do)). A dev
+their number (see [What the limit cannot do](./resource-limits.mdx#what-the-limit-cannot-do)). A dev
 build (`cargo pgrx install` without `--release`) does not optimize the
 extension's own crates, and its scan is about ten times slower. Every session can use up to
 the limit at once (plus the stored documents a merge loads, which are not
@@ -140,7 +140,7 @@ are input bytes, already charged 10 each).
   error: 4.0 bytes per byte measured, charged 5), its ops' mark names
   (3.0 bytes per byte measured, charged 5; priced with the keys at 3
   until the neighbouring shapes were measured, see [The estimate's
-  neighbourhood](/design/benchmarks/2026-10-01#the-estimates-neighbourhood-2026-10-01)), and the actor ids
+  neighbourhood](./benchmarks/2026-10-01.mdx#the-estimates-neighbourhood-2026-10-01)), and the actor ids
   longer than the 16 bytes Automerge's `ActorId` holds inline (every
   rebuilt change holds its own actor and the other actors its ops refer
   to, in its bytes and as `ActorId`s: 4.0 bytes per byte measured,
@@ -187,7 +187,7 @@ counts just past a power of two (4,200,000), where a doubling vector
 overshoots most.
 
 For a merge result, the rebuilt bytes of the bound (see [Merge
-results](/design/resource-limits#merge-results)) add the bytes and the repeated bytes of the
+results](./resource-limits.mdx#merge-results)) add the bytes and the repeated bytes of the
 changes applied: a rebuilt change is the change that was applied, so
 this bounds what loading the result copies. It does not always bound
 what a scan of the saved result counts: the actor term is not additive
@@ -273,7 +273,7 @@ inputs of `tests/memory_bounds.rs` (release build):
 
 The rebuilt, repeated and extra-column terms were added after the load
 limit shipped (see [Rebuilt copies and column
-metadata](/design/benchmarks/2026-09-30#rebuilt-copies-and-column-metadata-2026-09-30)): before them, the same
+metadata](./benchmarks/2026-09-30.mdx#rebuilt-copies-and-column-metadata-2026-09-30)): before them, the same
 inputs peaked at 63 to 167 times their estimate (5 to 9 times for the
 metadata entries).
 
@@ -340,7 +340,7 @@ paths inflate a compressed save once, as before. A compressed save that
 is loaded (text or binary input, the `bytea` cast, `merge(automerge,
 bytea)` with a save loaded on its own) keeps the columns the scan
 inflated until the normalized save has been compared with them (see
-[Invariants](/reference/automerge-type#invariants)), so it is inflated twice, by the scan and by
+[Invariants](../reference/automerge-type.mdx#invariants)), so it is inflated twice, by the scan and by
 Automerge's load, as it was before the limit (by the load and by the
 comparison); what is held meanwhile is at most the inflated bytes, each
 charged 10 in the estimate, and they are held only once that estimate
@@ -420,7 +420,7 @@ again as new input, which is what a restore does:
   estimate).
 - Bound the time of applying many marks (open, found by the
   neighbouring-shapes round, see [The estimate's
-  neighbourhood](/design/benchmarks/2026-10-01#the-estimates-neighbourhood-2026-10-01)). Applying
+  neighbourhood](./benchmarks/2026-10-01.mdx#the-estimates-neighbourhood-2026-10-01)). Applying
   changes whose mark ops overlap (marks of one text that are open at the
   same point, such as marks that all start after the same character)
   takes time quadratic in their number, and with different names also
@@ -481,7 +481,7 @@ again as new input, which is what a restore does:
   definition on random histories, merge results outgrowing the limit, the
   guarantees under a lowered limit, bundles, and the messages. The
   neighbouring shapes of the string and actor terms (see [The estimate's
-  neighbourhood](/design/benchmarks/2026-10-01#the-estimates-neighbourhood-2026-10-01)), with the same
+  neighbourhood](./benchmarks/2026-10-01.mdx#the-estimates-neighbourhood-2026-10-01)), with the same
   checks: every string-valued column (document change messages, keys,
   mark names, string values and extra bytes; change-chunk keys, mark
   names, values, messages and extra bytes) as one repeat run, as
@@ -497,7 +497,7 @@ again as new input, which is what a restore does:
   documents written by Automerge, as saves, compressed saves and change
   chunks, on their own and after another save. Inputs with many marks
   are exempt from the time bound only (see [What the limit cannot
-  do](/design/resource-limits#what-the-limit-cannot-do)). And a guard that fails when
+  do](./resource-limits.mdx#what-the-limit-cannot-do)). And a guard that fails when
   `Cargo.lock` has another Automerge or hexane than the cost model was
   measured with.
 - The fuzz harness (`tests/fuzz.rs`): input Automerge loads is never

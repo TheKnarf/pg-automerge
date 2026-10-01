@@ -19,11 +19,11 @@ description: "The test suites, and what each covers."
   change count against the loaded change graph), `loaded.rs` (loaded
   documents are byte-identical to the flat path), `memory_bounds.rs` (the
   load memory limit: measured peaks against the estimate, see
-  [Resource limits](/design/resource-limits)), `blocks.rs` and
+  [Resource limits](./resource-limits.mdx)), `blocks.rs` and
   `deep_structures.rs` (the block check, and every entry point on
   documents nested 20,000 levels deep on a 1 MB stack, see
-  [Deep blocks](/design/deep-blocks)), `stats.rs` (the live document and load
-  counters, see [Memory observability](/design/memory-observability)). `common/`
+  [Deep blocks](./deep-blocks.mdx)), `stats.rs` (the live document and load
+  counters, see [Memory observability](./memory-observability.mdx)). `common/`
   holds the
   random-history generator and stored-bytes wrappers around the
   `Input`-based API.
@@ -33,9 +33,9 @@ description: "The test suites, and what each covers."
   `automerge_contains`, and
   covers the release of the cast's expanded values and the
   `pg_automerge.verify_writes` setting; `limits.rs` the load memory limit,
-  see [Resource limits](/design/resource-limits); `memory.rs`
+  see [Resource limits](./resource-limits.mdx); `memory.rs`
   `automerge_memory_usage()`, see
-  [Memory observability](/design/memory-observability)). They are `include!`d
+  [Memory observability](./memory-observability.mdx)). They are `include!`d
   into the `#[pg_schema] mod tests` in `lib.rs` rather than declared as
   submodules, because pgrx runs each test as a function of the `tests`
   schema and only items of that exact module go there. `cargo pgrx test`
@@ -78,10 +78,10 @@ description: "The test suites, and what each covers."
   recomputed, one more conversion).
 - `tests/upgrade.sh` (`mise run upgrade`, part of `mise run test`) and
   `tests/docker_upgrade.sh` (`mise run docker-upgrade-test`, Docker): see
-  [Upgrade tests](/design/versioning#upgrade-tests).
+  [Upgrade tests](./versioning.mdx#upgrade-tests).
 - `tests/extension.sh` (`mise run extension`, part of `mise run test`):
   the control-file flags, see
-  [Installation, schema and privileges](/design/installation):
+  [Installation, schema and privileges](./installation.mdx):
   `CREATE EXTENSION .. SCHEMA`, `ALTER EXTENSION .. SET SCHEMA` under
   dependent objects, a dump and restore of the moved extension, a
   non-superuser's refused `CREATE EXTENSION`, and
@@ -90,19 +90,19 @@ description: "The test suites, and what each covers."
   when the library loads (the prefix is reserved).
 - `tests/limits.sh` (`mise run limits`, part of `mise run test`): the load
   memory limit against a real crash, in a scratch cluster whose address
-  space is capped (see [Resource limits](/design/resource-limits)), and a
+  space is capped (see [Resource limits](./resource-limits.mdx)), and a
   document with a block nested 5,000 levels deep read through every path
-  there without a crash (see [Deep blocks](/design/deep-blocks)). In its
+  there without a crash (see [Deep blocks](./deep-blocks.mdx)). In its
   container mode (`LIMITS_CONTAINER`, used by `tests/docker.sh`) the
   capped server is a container of the Docker image started with
-  `--memory` (see [Docker image](/design/docker-image)).
+  `--memory` (see [Docker image](./docker-image.mdx)).
 - `tests/memory.sh` (`mise run memory`, part of `mise run test`):
   `automerge_memory_usage()` across top-level statements, transactions
-  and errors, see [Memory observability](/design/memory-observability).
+  and errors, see [Memory observability](./memory-observability.mdx).
 - `tests/replication.sh` (`mise run replication`, not part of `mise run
   test`: it runs its own scratch cluster with `wal_level = logical`):
   logical replication in text and binary mode (see
-  [Limitations and gotchas](/operations/limitations)).
+  [Limitations and gotchas](../operations/limitations.mdx)).
 - Fuzzing: `crates/pg_automerge_core/tests/fuzz.rs` mutates real
   Automerge output at the chunk level (bits, bytes, insertions, deletions,
   dropped, duplicated and reordered chunks) and recomputes lengths and
@@ -113,7 +113,7 @@ description: "The test suites, and what each covers."
   heads, the load memory scan never takes input Automerge loads for
   unparseable, and `normalize`'s peak (a counting allocator) stays below
   the estimate, also when Automerge refuses the input; the block check
-  (see [Deep blocks](/design/deep-blocks)) never panics on any of the bytes, and
+  (see [Deep blocks](./deep-blocks.mdx)) never panics on any of the bytes, and
   answers for a stored value as for a save of its loaded document. The seeds include
   change chunks whose header lists repeat entries. 1,500 inputs per `cargo test`; `mise run fuzz` runs 200,000 (or
   `FUZZ_ITERS`) and can save findings (`FUZZ_SAVE_DIR`) for
@@ -124,18 +124,18 @@ description: "The test suites, and what each covers."
   rejected by the save-and-load check, and found no property violation.
   Two of the latter are in the corpus; the deferred check of `merge`
   results is tested with the test hook (see
-  [The deferred verification](/design/expanded-values#the-deferred-verification)).
+  [The deferred verification](./expanded-values.mdx#the-deferred-verification)).
 - `tests/spans.rs`: `automerge_spans` against Automerge's own spans (see
-  [Rich text spans](/reference/rich-text-spans)).
+  [Rich text spans](../reference/rich-text-spans.mdx)).
 - `tests/json_walk.rs`: the one-sweep jsonb walk, and the choice between
   the walks, against the per-object walk; `tests/normalize.rs`: the compressed-input shortcut against the
   full check; `tests/interrupts.rs`: the interrupt hook runs in the loops
   and its errors pass the guard; `tests/format_fixtures.rs`: values saved
   by every shipped automerge version (see
-  [Versioning and upgrades](/design/versioning)).
+  [Versioning and upgrades](./versioning.mdx)).
 - `tests/bench_expanded.sh` (`mise run bench-expanded`, not part of
   `mise run test`) installs a release build and times the SQL workloads
-  of [Performance](/design/performance) on three generated documents (and a
+  of [Performance](./performance.mdx) on three generated documents (and a
   rich text, `rich20k`, when `BENCH_DOCS` names it);
   `tests/bench_sql.sh` (`mise run bench-sql`) times the everyday paths
   (reads, inserts, the merge and upsert forms of a write, `merge_agg`,
@@ -160,15 +160,15 @@ description: "The test suites, and what each covers."
   `pg_automerge.so` under `--pkglibdir` and the control file under
   `--sharedir/extension`. `tests/check_ci.sh` (part of `mise run lint`)
   checks these refusals and the workflow's concurrency group and package
-  step, the Docker packaging statically (see [Docker image](/design/docker-image)),
+  step, the Docker packaging statically (see [Docker image](./docker-image.mdx)),
   and the workflow with actionlint and its docker and publish jobs'
-  invariants (see [Docker image in CI](/design/docker-image#docker-image-in-ci)).
+  invariants (see [Docker image in CI](./docker-image.mdx#docker-image-in-ci)).
 - `mise run docker-test` (`tests/docker.sh`, not part of `mise run test`)
   builds the Docker image and tests it and `compose.yaml` against
   throwaway containers, including the regress examples, five of the
-  multi-session scripts, `limits.sh` and a soak smoke run (see [Docker image](/design/docker-image));
+  multi-session scripts, `limits.sh` and a soak smoke run (see [Docker image](./docker-image.mdx));
   CI's `docker` job runs it on every push and pull request (see [Docker
-  image in CI](/design/docker-image#docker-image-in-ci)).
+  image in CI](./docker-image.mdx#docker-image-in-ci)).
 - The multi-session shell scripts share `tests/lib.sh`; they start the pgrx-managed
   Postgres if it is not running and stop it again only if they started it.
   With `PG_AUTOMERGE_TEST_HOST` (and `_PORT`, `_USER`, `_PASSWORD`) set
@@ -185,4 +185,4 @@ description: "The test suites, and what each covers."
   `pg_test` and the core-only builds, and rustdoc with `-D warnings`.
 - `tests/soak.sh` (`mise run soak`, not part of `mise run test`; a
   60-second smoke run is part of `mise run docker-test`): a long
-  concurrent load against the Docker image, see [Soak test](/operations/soak-test).
+  concurrent load against the Docker image, see [Soak test](../operations/soak-test.mdx).

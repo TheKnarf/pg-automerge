@@ -10,7 +10,8 @@ description: "Costs, pitfalls and caveats to know before relying on the extensio
   access in a measurement). Convert once with
   `FROM docs, LATERAL (SELECT doc::jsonb AS j OFFSET 0) x` and read
   `x.j->>'a'` (the `OFFSET 0` stops the planner from inlining the cast
-  back), or keep the generated jsonb column shown above.
+  back), or keep the generated jsonb column from the
+  [Quick start](../guide/quick-start.mdx).
 - **Some writes cost two loads.** A full save, compressed
   (`Automerge.save()`) or not (`saveNoCompress()`, `doc::bytea`), is loaded
   once to validate it, and `merge(doc, $save)` with a newer save loads only
@@ -20,7 +21,7 @@ description: "Costs, pitfalls and caveats to know before relying on the extensio
   re-saved and loaded again to verify it; the upsert of a full save loads
   it twice (Postgres hands `EXCLUDED` over flat).
 - **`pg_automerge.verify_writes`** is that verification load; see
-  [Configuration](/reference/configuration).
+  [Configuration](../reference/configuration.mdx).
 - `merge(doc, $1)` with a parameter the driver types as `bytea` uses
   `merge(automerge, bytea)`, which accepts full saves and bare change
   chunks. An *untyped* literal or parameter (`merge(doc, '\x..')`) resolves
@@ -50,7 +51,7 @@ description: "Costs, pitfalls and caveats to know before relying on the extensio
   use `SET enable_hashagg = off` if needed. In-memory merge results (the
   PL/pgSQL example above) are likewise not counted.
   `automerge_memory_usage()` shows this memory per session (see
-  [Monitoring](/operations/monitoring)).
+  [Monitoring](./monitoring.mdx)).
 - **Small input, large load.** Automerge input is compressed and
   run-length encoded: a 4 kB save of a 4,000,000-character text takes
   4.3 s and 390 MB to load, and memory grows linearly with what the input
@@ -58,7 +59,7 @@ description: "Costs, pitfalls and caveats to know before relying on the extensio
   accounting, and when an allocation fails the backend aborts and the
   postmaster restarts every session. `pg_automerge.max_load_memory`
   refuses such input before it is loaded (see
-  [Configuration](/reference/configuration)); what it cannot do is bound several
+  [Configuration](../reference/configuration.mdx)); what it cannot do is bound several
   sessions together, or catch a load that costs more than its measured
   model predicts (an Automerge upgrade re-measures it). Keep memory
   overcommit in mind, and `-1` only for trusted writers.
@@ -78,7 +79,7 @@ description: "Costs, pitfalls and caveats to know before relying on the extensio
   the memory limit does not catch it (the memory stays small). If
   clients' change bytes reach the database, consider refusing changes
   with an implausible number of marks in the application. Saves are not
-  affected. See [What the limit cannot do](/design/resource-limits#what-the-limit-cannot-do).
+  affected. See [What the limit cannot do](../design/resource-limits.mdx#what-the-limit-cannot-do).
 - **Every writer needs its own actor id.** Two writers (or two copies of
   a document) that commit with the same actor id produce different changes
   with the same sequence number, and Automerge cannot merge them. Every

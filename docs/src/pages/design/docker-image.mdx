@@ -7,7 +7,7 @@ description: "Packaging decisions of the Docker image, and how CI builds it."
 
 `docker/Dockerfile` builds the official `postgres:18` image plus the
 extension; `compose.yaml` runs it for local development. Usage is in
-[Docker](/guide/docker). Packaging decisions:
+[Docker](../guide/docker.mdx). Packaging decisions:
 
 - **One pinned base for every stage.** The `versions`, `builder` and
   `runtime` stages are all `FROM ${PG_IMAGE}`, by default
@@ -23,7 +23,7 @@ extension; `compose.yaml` runs it for local development. Usage is in
   are used, with a warning: minor releases keep the server ABI. The digest
   (rather than the tag) makes a rebuild reproducible and a base update a
   visible one-line change; the price is that security fixes arrive only
-  when someone updates it ([Updating](/guide/updating) says how). The tag stays next to the
+  when someone updates it ([Updating](../guide/updating.mdx) says how). The tag stays next to the
   digest for readers. `tests/check_ci.sh` checks that every stage uses
   `PG_IMAGE` and that it is a digest-pinned `postgres:18-*`.
 - **No hand-copied versions.** `scripts/versions.sh` reads Rust and
@@ -66,7 +66,7 @@ extension; `compose.yaml` runs it for local development. Usage is in
   architecture-specific: the base index, PGDG's `postgresql-server-dev-18`
   at the base's exact version and Debian's `rustup` all exist for arm64,
   and CI builds and tests the arm64 image on tags (see [Docker image in
-  CI](/design/docker-image#docker-image-in-ci)).
+  CI](./docker-image.mdx#docker-image-in-ci)).
 - **Init script.** `10-pg-automerge.sh` runs `CREATE EXTENSION IF NOT
   EXISTS pg_automerge` in `POSTGRES_DB` on first initialization, unless
   `PG_AUTOMERGE_CREATE_EXTENSION=0`; any other value than `0`/`1` fails
@@ -77,19 +77,19 @@ extension; `compose.yaml` runs it for local development. Usage is in
   environment for other tools, they would send it over TCP to the
   temporary server, which listens only on the socket. A bind mount over
   `/docker-entrypoint-initdb.d` (the usual way to add init files) hides
-  it, and the extension would silently be missing; [Docker](/guide/docker#configuration) says to
+  it, and the extension would silently be missing; [Docker](../guide/docker.mdx#configuration) says to
   mount single files instead, and the same script is installed as
   `/usr/local/bin/pg-automerge-initdb` for a mounted directory's own
   script to run. It
   does not touch `template1`: the extension is not trusted (see [Why the
-  extension is not trusted](/design/installation#why-the-extension-is-not-trusted)), and a copy
+  extension is not trusted](./installation.mdx#why-the-extension-is-not-trusted)), and a copy
   in the template would install it into every database a `CREATEDB` role
   creates.
 - **Settings are suggested, not baked in.** The image keeps Postgres'
   defaults; `compose.yaml` passes `default_toast_compression=lz4` (the
   image's Postgres is built `--with-lz4`; stored values are uncompressed
-  saves, see [The `automerge` type](/reference/automerge-type)) and
-  `pg_automerge.max_load_memory=1GB` on the command line, which [Docker](/guide/docker#configuration)
+  saves, see [The `automerge` type](../reference/automerge-type.mdx)) and
+  `pg_automerge.max_load_memory=1GB` on the command line, which [Docker](../guide/docker.mdx#configuration)
   explains. A memory-limited container makes the limit matter more: a
   failed allocation or an OOM kill restarts the cluster.
 - **Compose.** Named volume at `/var/lib/postgresql` (the 18 images'
@@ -145,7 +145,7 @@ extension; `compose.yaml` runs it for local development. Usage is in
     `ALTER EXTENSION .. UPDATE` reaches the current version and the
     documents read the same (the catalog comparison stays in
     `upgrade.sh`; a real 0.1.0 deployment moved to the image is
-    `tests/docker_upgrade.sh`, see [Upgrade tests](/design/versioning#upgrade-tests));
+    `tests/docker_upgrade.sh`, see [Upgrade tests](./versioning.mdx#upgrade-tests));
   - `PGHOST=localhost` and `PGHOSTADDR` in the container's environment
     with an init file mounted as a single file next to ours (the
     extension is created, the file runs after it), and a whole directory
@@ -171,7 +171,7 @@ extension; `compose.yaml` runs it for local development. Usage is in
     cgroup) does not. The limit refuses it first either way.
   - a 60-second smoke run of `tests/soak.sh` (`SOAK_SMOKE=1`: 4 clients,
     documents up to 200 kB, 60 rows, its own container with
-    `--memory=2g`), with all its checks (see [Soak test](/operations/soak-test));
+    `--memory=2g`), with all its checks (see [Soak test](../operations/soak-test.mdx));
   - every container's log (`docker logs`) is free of `TRAP:`, `PANIC:`,
     Rust panics and backends terminated by a signal or a non-zero exit
     (not any process's: the logical replication launcher exits with 1 at

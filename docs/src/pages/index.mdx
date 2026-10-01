@@ -16,20 +16,20 @@ and notifies listening backends when a document changes.
 The extension does not edit documents and never creates changes. Your
 backend syncs with its frontends, owns the actor IDs, and persists
 Automerge saves; Postgres stores them, merges them and makes them
-queryable. The [Design](/design) pages are the full specification.
+queryable. The [Design](./design/index.mdx) pages are the full specification.
 
 ## Where to start
 
 | If you want to                                  | Read                                                        |
 | ----------------------------------------------- | ----------------------------------------------------------- |
-| Install the extension, or run the Docker image  | [Install](/guide/install), [Docker](/guide/docker)          |
-| Store and query your first documents            | [Quick start](/guide/quick-start)                           |
-| Keep several backends' replicas up to date      | [Keeping backends in sync](/guide/keeping-backends-in-sync) |
-| Look up a function, setting or error code       | [SQL API](/reference), [Configuration](/reference/configuration), [Error codes](/reference/error-codes) |
-| Size memory, WAL and indexes for production     | [Operations](/operations), [Monitoring](/operations/monitoring) |
-| Know the costs and pitfalls first               | [Limitations and gotchas](/operations/limitations)          |
-| Update a running deployment                     | [Updating](/guide/updating), [Changelog](/changelog)        |
-| Understand how it works, and why                | [Design overview](/design)                                  |
+| Install the extension, or run the Docker image  | [Install](./guide/install.mdx), [Docker](./guide/docker.mdx)          |
+| Store and query your first documents            | [Quick start](./guide/quick-start.mdx)                           |
+| Keep several backends' replicas up to date      | [Keeping backends in sync](./guide/keeping-backends-in-sync.mdx) |
+| Look up a function, setting or error code       | [SQL API](./reference/index.mdx), [Configuration](./reference/configuration.mdx), [Error codes](./reference/error-codes.mdx) |
+| Size memory, WAL and indexes for production     | [Operations](./operations/index.mdx), [Monitoring](./operations/monitoring.mdx) |
+| Know the costs and pitfalls first               | [Limitations and gotchas](./operations/limitations.mdx)          |
+| Update a running deployment                     | [Updating](./guide/updating.mdx), [Changelog](./changelog.mdx)        |
+| Understand how it works, and why                | [Design overview](./design/index.mdx)                                  |
 
 ## Requirements
 
@@ -38,7 +38,7 @@ queryable. The [Design](/design) pages are the full specification.
   `pgrx` crate), both pinned in `mise.toml`, plus what pgrx needs to build
   against Postgres (a C toolchain, libclang).
 - `CREATE EXTENSION` needs a superuser: the extension is not trusted, see
-  [Install](/guide/install).
+  [Install](./guide/install.mdx).
 
 ## License
 

@@ -12,7 +12,7 @@ allocator) found four kinds of input whose peak the estimate did not
 bound, because Automerge copies something the input holds once, per
 change or per op, or keeps per-entry structures the estimate did not
 price. Peak and estimate in MB (2^20 bytes), before and after the terms
-of [The estimate](/design/resource-limits#the-estimate) that price them:
+of [The estimate](../resource-limits.mdx#the-estimate) that price them:
 
 | Input (bytes) | Peak | Estimate before | after |
 |---|---|---|---|
@@ -193,7 +193,7 @@ are about twice what a production server shows.
 ## Deep blocks (2026-09-30)
 
 The jsonb walk before and after it skips Automerge's document iterator
-for documents with blocks (see [Deep blocks](/design/deep-blocks)); release
+for documents with blocks (see [Deep blocks](../deep-blocks.mdx)); release
 builds of the previous commit (555110e) and this one, interleaved.
 
 The crash: the Docker image of 0.1.0 built before `automerge_spans`

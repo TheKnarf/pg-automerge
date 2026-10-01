@@ -36,7 +36,7 @@ Payloads over NOTIFY's 8000-byte limit (about 115 heads) drop the heads and
 carry `"truncated":true`; then just fetch. `seq` (a per-backend counter)
 keeps payloads distinct, since `NOTIFY` would otherwise collapse identical
 events of one transaction (e.g. INSERT, DELETE, INSERT of one row). Details in
-[Change notifications](/reference/change-notifications).
+[Change notifications](../reference/change-notifications.mdx).
 
 A no-op merge still rewrites the row. When re-sends are common, skip them:
 

@@ -34,14 +34,14 @@ payload). Each area and the invariant it relies on:
 | `io.rs`: `automerge_recv` | Reading the `StringInfo` | Postgres passes a valid buffer; the rest of it is consumed and copied before it is used. |
 | `lib.rs`: `_PG_init` | `MarkGUCPrefixReserved`, `RegisterXactCallback` | A NUL-terminated literal, copied by Postgres; a `#[pg_guard]` callback with Postgres' signature, registered once per backend (`_PG_init` runs once), which reads a setting and calls `alloc::trim_if_freed`, nothing that can raise an error at commit or abort. |
 | `alloc.rs`: `malloc_trim` | A hand-declared glibc function (`target_env = "gnu"` only) | Takes no pointer; called from the transaction callback, between allocator calls, never inside one, so malloc's lock is not held and nothing re-enters it. |
-| `alloc.rs`: the global allocator | `GlobalAlloc` for the counting allocator | Every method passes its arguments to `System` and returns its result unchanged; the counters are atomics, which never allocate, panic or re-enter the allocator (see [Memory observability](/design/memory-observability)). |
+| `alloc.rs`: the global allocator | `GlobalAlloc` for the counting allocator | Every method passes its arguments to `System` and returns its result unchanged; the counters are atomics, which never allocate, panic or re-enter the allocator (see [Memory observability](./memory-observability.mdx)). |
 
 What `unsafe` cannot protect against, by design: a Rust stack overflow or
 a failed Rust allocation aborts the backend, and Postgres then restarts
 every session. They are prevented, not caught: the jsonb walk is iterative
 with a 1000-level limit, Automerge never renders blocks (see
-[Deep blocks](/design/deep-blocks)), and client input is priced before it is
-loaded (see [Resource limits](/design/resource-limits)). A new use of a recursive
+[Deep blocks](./deep-blocks.mdx)), and client input is priced before it is
+loaded (see [Resource limits](./resource-limits.mdx)). A new use of a recursive
 Automerge API needs the same gating. pgrx internals relied on
 (`pgrx_extern_c_guard`, the callconv traits, ERROR panics with a
 non-`String` payload, `SetOfIterator`'s memory context) are re-checked

@@ -6,15 +6,15 @@ description: "Reading documents: the jsonb cast and what each read loads."
 ---
 
 - `automerge_to_jsonb(automerge) → jsonb`: the cast function (see
-  [jsonb mapping](/reference/jsonb-mapping)). Each call loads the document (an
+  [jsonb mapping](./jsonb-mapping.mdx)). Each call loads the document (an
   expanded value is used in place).
 - `automerge_spans(doc automerge, path text[] [, heads text[]]) → jsonb`:
   the structure of the text object at `path` (text runs with their marks,
   and blocks), as Automerge's JavaScript `spans()` returns it; see
-  [Rich text spans](/reference/rich-text-spans).
+  [Rich text spans](./rich-text-spans.mdx).
 - `automerge_heads(automerge) → text[]`: current heads as sorted lowercase hex
   change hashes. Read from the header without loading the document (see
-  [Heads fast path](/reference/merging#heads-fast-path)).
+  [Heads fast path](./merging.mdx#heads-fast-path)).
 - `automerge_contains(a automerge, b automerge) → bool`: whether every change
   in `b` is already in `a`, meaning `merge(a, b)` would be a no-op. Decided
   from the two headers when `heads(b) ⊆ heads(a)` (true) or
@@ -28,7 +28,7 @@ description: "Reading documents: the jsonb cast and what each read loads."
     equal, and equal histories have equal heads, which the first test
     would have seen. Both counts come from a prefix of each value (the
     change actor column, as for `automerge_change_count`; see
-    [Heads fast path](/reference/merging#heads-fast-path)), or from the change graph of an
+    [Heads fast path](./merging.mdx#heads-fast-path)), or from the change graph of an
     expanded value. This decides the two common `false` cases without a
     load: an older version asked whether it contains a newer one, and two
     concurrent versions with as many changes each (the same edit count on

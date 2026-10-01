@@ -45,7 +45,7 @@ object`.
 
 **Heads.** The three-argument form reads the state as of `heads` with the
 semantics and errors of `automerge_to_jsonb(doc, heads)` (see
-[History](/reference/history)): every hash must be a change of the
+[History](./history.mdx)): every hash must be a change of the
 document (`22023`), `'{}'` is the state before any change (whose root is
 empty, so any non-empty path gives NULL), malformed hashes are `22P02` and
 NULL elements `22004`.
@@ -125,7 +125,7 @@ level of nesting inside the block and needs about 13 kB of stack per
 level in a release build: a block holding maps nested a few hundred
 levels deep (a document of about 2 kB) overflows the backend's 8 MB stack
 inside `spans()`, a crash (a segfault restarts the cluster) that no guard
-can catch (see [Deep blocks](/design/deep-blocks) for the other paths). So before `spans()` is called, every block of the text is
+can catch (see [Deep blocks](../design/deep-blocks.mdx) for the other paths). So before `spans()` is called, every block of the text is
 found without hydrating (one `list_range` over the text, as of the heads;
 the map objects among its elements are the blocks) and its depth is
 measured with an iterative walk: a block nested more than 32 levels deep

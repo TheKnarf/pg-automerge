@@ -20,7 +20,7 @@ warnings after changing these settings.
 
 `pg_automerge.max_load_memory` protects the server from input that
 describes far more than it holds (see
-[Limitations](/operations/limitations)). Every value built from client
+[Limitations](../operations/limitations.mdx)). Every value built from client
 bytes (text input, `COPY`, binary parameters, the `bytea` cast,
 `merge(doc, $bytes)`, `automerge_contains(doc, $bytes)`) is priced from
 its headers before it is loaded, and so is every merge result (`merge`,
@@ -45,7 +45,7 @@ lower limit refuses the larger rows: restore with
 `PGOPTIONS='-c pg_automerge.max_load_memory=-1' pg_restore ...` as a
 superuser. On a logical replication subscriber, set it for the
 subscription's owner at least as high as on the publisher. Details in
-[Resource limits](/design/resource-limits).
+[Resource limits](../design/resource-limits.mdx).
 
 With `pg_automerge.verify_writes = off`, incremental writes
 (`merge(doc, $changes)`) cost one load instead of two, and input that is not
@@ -60,12 +60,12 @@ breaks reads for everyone. Turn it off only for trusted writers, e.g.
 of a backend that sends what its own Automerge produced. It never changes
 a result's bytes, so functions stay `IMMUTABLE` and dumps are unaffected.
 Details in
-[The `pg_automerge.verify_writes` setting](/reference/automerge-type#the-pg_automergeverify_writes-setting).
+[The `pg_automerge.verify_writes` setting](./automerge-type.mdx#the-pg_automergeverify_writes-setting).
 
 `pg_automerge.trim_threshold`: a loaded document lives in the backend's
 `malloc` heap, which keeps freed memory for reuse, so without it every
 connection would hold on to the most it ever needed: in the
-[soak test](/operations), eight connections reading and writing
+[soak test](../operations/index.mdx), eight connections reading and writing
 documents of up to 1 MB each held 200 to 355 MB for the whole run
 (342 MB is what loading the largest one takes), even between
 statements. With the default, a transaction that freed more than 64 MB
@@ -75,4 +75,4 @@ below the threshold. Set it to `-1` (or higher) for a connection that
 keeps reloading the same large documents and has the memory to keep
 them. glibc only (the Docker image and the usual Linux distributions);
 elsewhere it does nothing. Details in
-[Returning freed memory (`pg_automerge.trim_threshold`)](/design/memory-observability#returning-freed-memory-pg_automergetrim_threshold).
+[Returning freed memory (`pg_automerge.trim_threshold`)](../design/memory-observability.mdx#returning-freed-memory-pg_automergetrim_threshold).

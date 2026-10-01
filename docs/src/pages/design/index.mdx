@@ -10,19 +10,19 @@ stores [Automerge](https://automerge.org) documents in an `automerge`
 column type, lets you **query them as `jsonb`**, and **merges** concurrent
 writes. Only Postgres 18 is supported.
 
-Contents: [Scope](/design#scope) · [Architecture](/design/architecture) ·
-[The `automerge` type](/reference/automerge-type) ·
-[SQL API and semantics](/reference#sql-api-and-semantics) ·
-[jsonb mapping](/reference/jsonb-mapping) · [Resource limits](/design/resource-limits) ·
-[Memory observability](/design/memory-observability) ·
-[Error codes](/reference/error-codes) ·
-[Performance](/design/performance) · [Implementation notes](/design/implementation-notes) ·
-[Testing](/design/testing) ·
-[Installation, schema and privileges](/design/installation) ·
-[Versioning and upgrades](/design/versioning) ·
-[Docker image](/design/docker-image) ·
-[Future work](/design/future-work) ·
-[Appendix: benchmarks](/design/benchmarks)
+Contents: [Scope](./index.mdx#scope) · [Architecture](./architecture.mdx) ·
+[The `automerge` type](../reference/automerge-type.mdx) ·
+[SQL API and semantics](../reference/index.mdx#sql-api-and-semantics) ·
+[jsonb mapping](../reference/jsonb-mapping.mdx) · [Resource limits](./resource-limits.mdx) ·
+[Memory observability](./memory-observability.mdx) ·
+[Error codes](../reference/error-codes.mdx) ·
+[Performance](./performance.mdx) · [Implementation notes](./implementation-notes.mdx) ·
+[Testing](./testing.mdx) ·
+[Installation, schema and privileges](./installation.mdx) ·
+[Versioning and upgrades](./versioning.mdx) ·
+[Docker image](./docker-image.mdx) ·
+[Future work](./future-work.mdx) ·
+[Appendix: benchmarks](./benchmarks/index.mdx)
 
 ## Scope
 
@@ -32,14 +32,14 @@ In scope:
 - Reading them with every `jsonb` operator/function/index.
 - Reading the structure of rich text (marks and blocks, which the jsonb
   view flattens to a string) as jsonb spans (see
-  [Rich text spans](/reference/rich-text-spans)).
+  [Rich text spans](../reference/rich-text-spans.mdx)).
 - `merge`: CRDT merge so concurrent writers never overwrite each other.
 - Read-only history: listing a document's changes, fetching change bytes
   (e.g. everything since a replica's heads), and the state as of earlier
-  heads (see [History](/reference/history)).
+  heads (see [History](../reference/history.mdx)).
 - Change notifications: a trigger that tells listening backends (`LISTEN`)
   which rows' documents changed and their new heads (see
-  [Change notifications](/reference/change-notifications)).
+  [Change notifications](../reference/change-notifications.mdx)).
 
 Out of scope (by decision):
 

@@ -76,7 +76,7 @@ Where it does not:
   context, so it lives exactly as long as the object. The Rust heap
   memory is not counted in the context (as for `merge_agg`'s state);
   `automerge_memory_usage()` shows it (see
-  [Memory observability](/design/memory-observability)).
+  [Memory observability](./memory-observability.mdx)).
 - Flattening: `get_flat_size` computes the stored bytes
   (`save_nocompress()`), caches them in the `LoadedDoc` and returns their
   size; `flatten_into` copies the cached bytes (and checks the size it is
@@ -130,7 +130,7 @@ Where it does not:
 - `merge(automerge, bytea)` on an expanded document parses the change
   chunks (`Change::try_from`, the parser `Automerge::load` uses) and
   applies them to a clone, so it needs no load; a save is loaded on its
-  own and merged like a document (see [Merging](/reference/merging)); compressed
+  own and merged like a document (see [Merging](../reference/merging.mdx)); compressed
   chunks go through a strict load of a fresh save of the document plus
   the input.
 - Sources of expanded values: `merge` and `||` results, `merge_agg`
@@ -154,7 +154,7 @@ missing dependencies, a reused actor id, decoder panics) fails inside
 Verifying eagerly would cost a load per merge and undo most of the gain.
 The check runs only while `pg_automerge.verify_writes` is on (read when
 the value is flattened; see [The `pg_automerge.verify_writes`
-setting](/reference/automerge-type#the-pg_automergeverify_writes-setting)). A save merged with
+setting](../reference/automerge-type.mdx#the-pg_automergeverify_writes-setting)). A save merged with
 `merge(automerge, bytea)` that contains `a` and is its own canonical or
 compressed encoding is the result as it is, verified by that encoding,
 and needs no check.

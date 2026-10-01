@@ -17,16 +17,16 @@ SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge';
 The init script does not run on an existing volume, so this step is
 yours (a migration, say). Until you run it the new library serves the old
 SQL definitions, which it keeps supporting (see
-[Versioning and upgrades](/design/versioning)). What changed in
+[Versioning and upgrades](../design/versioning.mdx)). What changed in
 each version, and whether an update needs more than this (a `REINDEX`,
-say), is in [Changelog](/changelog).
+say), is in [Changelog](../changelog.mdx).
 
 **From 0.2.0 (or 0.1.0) to 0.3.0 with compose** (an app whose
 `compose.yaml` runs this image as a service, called `postgres` below, on
 a named volume; skjera's `postgres` service is one). 0.3.0 adds
 `automerge_memory_usage()` and `automerge_memory_reset()` (see
-[Monitoring](/operations/monitoring)) and fixes a server crash that needed the
-owner to alter the history types (see [Changelog](/changelog));
+[Monitoring](../operations/monitoring.mdx)) and fixes a server crash that needed the
+owner to alter the history types (see [Changelog](../changelog.mdx));
 from 0.1.0 it also brings 0.2.0's fix of a crash (a document with deeply
 nested blocks restarted the whole server when read as jsonb, e.g.
 through a generated `doc::jsonb` column) and `automerge_spans`. No index
@@ -94,7 +94,7 @@ so far, and an image of it for 19 does not exist yet. When it does, the
 18 volume cannot simply be mounted into it; either dump and restore (the
 `automerge` text form is the dump format and is stable across versions;
 restore with `pg_automerge.max_load_memory=-1` as the
-[Configuration](/reference/configuration) section describes), or run `pg_upgrade`
+[Configuration](../reference/configuration.mdx) section describes), or run `pg_upgrade`
 with both majors' binaries and pg_automerge built for both (the
 `/var/lib/postgresql` mount lets `pg_upgrade --link` work within one
 volume).

@@ -11,7 +11,7 @@ incremental writes, upserts of full saves, concurrent writers on the same
 rows, jsonb, GIN, `automerge_spans`, history and `merge_agg` reads, a
 `LISTEN` client, a table growing from 200 to about 2,500 to 2,900
 documents of 1 kB to 1.26 MB; results in
-[Soak test (2026-10-01)](/design/benchmarks/2026-10-01#soak-test-2026-10-01)): no memory leak (the
+[Soak test (2026-10-01)](../design/benchmarks/2026-10-01.mdx#soak-test-2026-10-01)): no memory leak (the
 Rust heap back to 16 bytes between statements, memory contexts flat at
 3 MB per backend), no lost or duplicated write, exactly one notification
 per write, no error. What to plan for:

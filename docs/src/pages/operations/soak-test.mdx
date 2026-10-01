@@ -61,7 +61,7 @@ queries and reads of the generated column (`read_gin`),
 `merge_agg` over four copies of a template (`merge_agg`), and
 self-sampling (`monitor`: the backend inserts its own
 `automerge_memory_usage()` and `pg_backend_memory_contexts` totals, as
-[Monitoring](/operations/monitoring) suggests for pooled connections). A `psql` session `LISTEN`s
+[Monitoring](./monitoring.mdx) suggests for pooled connections). A `psql` session `LISTEN`s
 throughout; `VACUUM (ANALYZE)` runs every 10 minutes on top of
 autovacuum.
 
@@ -97,4 +97,4 @@ once). Don't query the server while it
 runs (an `ERROR` of your own fails the log check); `SOAK_KEEP=1` keeps it
 for afterwards.
 
-Results: [Soak test (2026-10-01)](/design/benchmarks/2026-10-01#soak-test-2026-10-01).
+Results: [Soak test (2026-10-01)](../design/benchmarks/2026-10-01.mdx#soak-test-2026-10-01).

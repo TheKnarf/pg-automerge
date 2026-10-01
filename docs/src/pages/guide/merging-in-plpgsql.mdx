@@ -28,4 +28,4 @@ takes 5.4 s, about two loads of the document in total;
 single `UPDATE .. SET doc = merge(doc, $1)` gains nothing (the column
 arrives flat). A failed `merge` leaves the variable unchanged, also inside
 a `BEGIN .. EXCEPTION` block. Details in
-[Expanded values](/design/expanded-values).
+[Expanded values](../design/expanded-values.mdx).

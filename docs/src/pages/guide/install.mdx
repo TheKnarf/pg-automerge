@@ -5,7 +5,7 @@ order: 10
 description: "Build and install the extension from source, or build a package for another server."
 ---
 
-To self-host, the [Docker image](/guide/docker) is `postgres:18` with the
+To self-host, the [Docker image](./docker.mdx) is `postgres:18` with the
 extension built in. From source, with [mise](https://mise.jdx.dev):
 
 ```sh
@@ -40,11 +40,11 @@ it, not a database owner. A few kB of crafted (or merely compressed,
 highly repetitive) Automerge input can describe a document that takes
 gigabytes to load, and a failed Rust allocation aborts the backend, which
 restarts the whole cluster. Every write is priced before it is loaded and
-refused over [`pg_automerge.max_load_memory`](/reference/configuration), but that
+refused over [`pg_automerge.max_load_memory`](../reference/configuration.mdx), but that
 bound rests on measured costs, memory stays outside Postgres' accounting
 and a load cannot be cancelled, so installing it into a database remains
 a superuser's decision. Details in
-[Installation, schema and privileges](/design/installation).
+[Installation, schema and privileges](../design/installation.mdx).
 
 There are no published packages yet (tag builds in CI attach a tarball,
 built against the PGDG Postgres 18 on Ubuntu, to the workflow run as an

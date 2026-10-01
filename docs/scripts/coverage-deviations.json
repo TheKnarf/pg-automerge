@@ -220,5 +220,11 @@
 		"from": "pg_automerge design",
 		"to": "Overview",
 		"reason": "The document's title: DESIGN.md is the site's Design section, and its first page is titled Overview."
+	},
+	{
+		"source": "README.md",
+		"from": "or keep the generated jsonb column shown above.",
+		"to": "or keep the generated jsonb column from the Quick start.",
+		"reason": "The column was shown above in the README's Quick start, which is a page of its own now; the Limitations page links to it."
 	}
 ]

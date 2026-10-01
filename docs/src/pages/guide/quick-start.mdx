@@ -46,7 +46,7 @@ CREATE INDEX ON docs USING gin ((doc::jsonb)) WITH (fastupdate = off);
 ```
 
 `fastupdate = off` matters for documents that are written often: see
-[GIN indexes](/operations#gin-indexes-on-documents). For large documents, generate
+[GIN indexes](../operations/index.mdx#gin-indexes-on-documents). For large documents, generate
 only the fields you query (`GENERATED ALWAYS AS (doc->>'status') STORED`)
 rather than a full jsonb copy, which doubles what every write stores (see
-[Operations](/operations)).
+[Operations](../operations/index.mdx)).

@@ -8,7 +8,7 @@ description: "Benchmarks recorded on 2026-09-29."
 ## jsonb built in Rust memory (2026-09-29)
 
 `JsonbBuilder` assembles the `JsonbValue` tree itself instead of feeding
-every event to `pushJsonbValue` (see [jsonb mapping](/reference/jsonb-mapping)); the
+every event to `pushJsonbValue` (see [jsonb mapping](../../reference/jsonb-mapping.mdx)); the
 jsonb bytes are unchanged. `mise run bench-sql`, release build, median of
 seven runs, milliseconds, before and after in one session:
 
@@ -31,7 +31,7 @@ the `pushJsonbValue` path before.
 input that its document lacked into it. Its state now keeps the first
 stored input as bytes, loads the larger of two inputs first when the heads
 cannot decide, and lets a loaded input that contains the whole state
-replace it (see [Merging](/reference/merging)). It also skips inputs it already has
+replace it (see [Merging](../../reference/merging.mdx)). It also skips inputs it already has
 by a prefix of their heads, before detoasting them. `mise run bench-sql`,
 release build, median of five runs, milliseconds:
 
@@ -54,7 +54,7 @@ faster, the 3 MB text load about 6% slower).
 The sweep's bookkeeping (a `Vec` of entries per object and a SipHash
 `HashMap` from object id to content, about a third of the walk on the
 877 kB list) became one entry vector and a sorted id index searched by
-bisection (see [jsonb mapping](/reference/jsonb-mapping)); the events are
+bisection (see [jsonb mapping](../../reference/jsonb-mapping.mdx)); the events are
 unchanged. `mise run bench-core`, release build, median of three,
 milliseconds: jsonb walk (no-op sink) 74.3 → 64.3 on the 877 kB list,
 6.6 → 5.7 on the 83 kB list, 250 → 250 on the 3 MB text (one object).
@@ -74,7 +74,7 @@ newer or concurrent version, as a stored value or as a save in a `bytea`
 the heads do not decide, it now compares change counts read from a
 prefix of each value (or a save's header): a version with at least as
 many changes as `a` and other heads is not in `a` (see
-[Reading](/reference/reading)). Older versions still cost one load (true needs the
+[Reading](../../reference/reading.mdx)). Older versions still cost one load (true needs the
 history). `mise run bench-sql`, release build, median of five, ms:
 
 | Case | 877 kB before | after | 3 MB before | after |
@@ -93,7 +93,7 @@ and `automerge_contains(doc, bytea)` accepted a checksummed chunk with
 known heads and a malformed body, which a load of `doc ++ bytes` (and so
 the earlier `merge`) rejects with `22P02`. The header answers that say
 "contained" now first run `header::document_parses` (see
-[Merging](/reference/merging), case 1), which inflates any deflated columns.
+[Merging](../../reference/merging.mdx), case 1), which inflates any deflated columns.
 Answers of "not contained" and paths that load the save are unchanged.
 Release build, median of seven, ms:
 
@@ -177,7 +177,7 @@ Automerge's frames.
 
 ## Load memory limit (2026-09-29)
 
-`pg_automerge.max_load_memory` (see [Resource limits](/design/resource-limits)),
+`pg_automerge.max_load_memory` (see [Resource limits](../resource-limits.mdx)),
 implemented from the measurements of the previous entry.
 
 Measured peaks against the estimate (`tests/memory_bounds.rs`, dev build
@@ -218,7 +218,7 @@ two loads plus the apply estimate. Refused inputs peak below 64 kB for the
 run-length bombs (100 to 221 bytes describing 10^8 to 2^62 rows) and below
 a quarter of the limit for deflate bombs (256 MB of zeros, stopped at a
 tenth of a 100 MB limit). A 200,000-input release fuzz session (the
-properties of [Testing](/design/testing)) found no violation.
+properties of [Testing](../testing.mdx)) found no violation.
 
 `tests/limits.sh`: under `ulimit -v 1000000`, with the limit off, the
 12 kB compressed save of a 12,000,000-character text and a 113-byte change

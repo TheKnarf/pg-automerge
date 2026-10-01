@@ -10,7 +10,7 @@ The extension version is the crate version (`default_version =
 currently 0.3.0; pgrx generates the install script
 `pg_automerge--X.Y.Z.sql` for the build, and the Docker image's version
 label and tag come from it (`scripts/versions.sh`). Released: 0.1.0 and
-0.2.0 (see the [Changelog](/changelog)).
+0.2.0 (see the [Changelog](../changelog.mdx)).
 
 Policy:
 
@@ -50,7 +50,7 @@ that script, and so does 0.2.0's.
 Images built from the tree after 720c5f0 and before the bump were still
 labelled 0.1.0, but their install script created `automerge_spans`
 (identical to 0.2.0's, statement for statement). Their library has the
-deep-block crash ([Deep blocks](/design/deep-blocks)) if it was built from a
+deep-block crash ([Deep blocks](./deep-blocks.mdx)) if it was built from a
 commit up to 555110e (the last commit before the fix, ee574e1), but not
 necessarily if it was built from a working tree: the fix was made
 uncommitted on top of 555110e, and an image built from that tree is
@@ -70,7 +70,7 @@ upgrade scripts like the release.
 
 The install scripts differ only by `automerge_memory_usage()`,
 `automerge_memory_reset()` and their comments (see
-[Memory observability](/design/memory-observability)); no 0.2.0 object's
+[Memory observability](./memory-observability.mdx)); no 0.2.0 object's
 definition, labels, symbol or comment changed, and the library's other
 changes (the altered-change-types check, the reserved settings prefix,
 the virtual key column refusal, detoasting in place) return the same
@@ -130,7 +130,7 @@ with `psql`.
   required and compared as is, so an SQL change without a version bump
   fails.
 - `tests/docker.sh` does the snapshot part again with the image's own
-  scripts and library (see [Docker image](/design/docker-image)).
+  scripts and library (see [Docker image](./docker-image.mdx)).
 - `tests/docker_upgrade.sh` (`mise run docker-upgrade-test`, not part of
   `docker-test`) upgrades a real 0.1.0 deployment: a container of the 0.1.0
   image (`PG_AUTOMERGE_OLD_IMAGE`, a tag or an image ID, or by default
@@ -145,7 +145,7 @@ with `psql`.
   sequential scan, the trigger's notification, `automerge_spans` (54000
   on the deep block), the catalog equal to a fresh install's in the same
   container, and clean server logs. It follows the compose steps of
-  [Updating](/guide/updating) as written: the cluster's superuser is an app's own
+  [Updating](../guide/updating.mdx) as written: the cluster's superuser is an app's own
   `POSTGRES_USER`, not `postgres` (as in skjera, which has no `postgres`
   role), the dump of step 1 and the `ALTER EXTENSION` and version check
   of step 5 are that page's commands (read from its MDX source, `docker compose

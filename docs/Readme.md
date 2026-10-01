@@ -42,7 +42,7 @@ description: One sentence.  # optional: <meta name="description">
 ## A heading
 
 Text, GFM tables, fenced code (sql, rust, sh, json, toml, yaml,
-dockerfile, diff, js, ts), [links](/guide/quick-start#indexing-reads).
+dockerfile, diff, js, ts), [links](../guide/quick-start.mdx).
 
 <Callout type="warning" title="Optional title">note, tip, warning or danger</Callout>
 ```
@@ -60,10 +60,12 @@ commands of `guide/updating.mdx`.
 
 The page's title is its `<h1>`, so content starts at `##`. `##` and `###`
 headings form the page's table of contents; every heading gets a stable
-id (GitHub's slug rules) and an anchor link. Link to other pages with
-absolute paths (`/section/page#anchor`, without the base path) and within
-the page with `#anchor`; `pnpm check-site` fails on links that do not
-resolve.
+id (GitHub's slug rules) and an anchor link. Link to other pages by
+their source file, relative to the page (`../section/page.mdx#anchor`), so
+the link works on GitHub too; `plugins/remark-page-links.ts` turns it into
+a route at build time, and fails the build on a root-relative link
+(`/section/page`, a 404 on GitHub). Link within the page with `#anchor`;
+`pnpm check-site` fails on links that do not resolve.
 
 ## Where the content came from
 
@@ -102,7 +104,8 @@ longer finds.
   `src/mdx-components.tsx`: links, tables, code blocks, `<Callout>`;
   `src/styles.css`: all styling (light/dark from `prefers-color-scheme`).
 - `vite.config.ts`: MDX with remark-gfm, frontmatter,
-  `plugins/remark-include.ts` (`<Include file="..." />` splices a Markdown
+  `plugins/remark-page-links.ts` (page links as `.mdx` paths become
+  routes), `plugins/remark-include.ts` (`<Include file="..." />` splices a Markdown
   file into a page), rehype-slug, autolinked headings and shiki
   (highlighting happens at build time; no highlighter in the browser).
   `plugins/page-meta.ts` runs the same remark plugins and rehype-slug to

@@ -71,7 +71,7 @@ the heads in a prefix of the stored value and returns the TOAST pointer
 it was given, which the `UPDATE` keeps: no detoasting, compressing or
 writing of the document. W4 and W6 stay at two loads because Postgres
 flattens `EXCLUDED` and constant-folded parameters (see
-[Expanded values](/design/expanded-values)).
+[Expanded values](../expanded-values.mdx)).
 
 The pgrx-managed Postgres these numbers come from is an assert-enabled
 build (`randomize_mem` shows up in profiles of the jsonb paths), so the

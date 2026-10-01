@@ -15,14 +15,14 @@ Two crates:
   (`MergeAccumulator`), the stored-header parser behind the heads fast path
   and the change-chunk splitter (`header`), the scan that prices a load
   before Automerge allocates (`budget`, see
-  [Resource limits](/design/resource-limits)), the history functions
+  [Resource limits](./resource-limits.mdx)), the history functions
   (`history`), the jsonb mapping as a walk into a `JsonSink` (`json`), the
   notification payload builder (`notify`), text encodings (`encoding`),
   the counters of live documents and loads (`stats`, see
-  [Memory observability](/design/memory-observability)) and, with the
+  [Memory observability](./memory-observability.mdx)) and, with the
   `test-hooks` feature, test instrumentation (`test_hooks`).
   Every Automerge call runs under a panic guard (see
-  [Errors](/reference/automerge-type#errors-and-panics)).
+  [Errors](../reference/automerge-type.mdx#errors-and-panics)).
 - The root crate (`src/`): the pgrx glue, one module per SQL area:
   `datum.rs` (the Rust types of `automerge` arguments and results, and the
   prefix reads), `expanded.rs` (expanded values), `io.rs` (the type's SQL,

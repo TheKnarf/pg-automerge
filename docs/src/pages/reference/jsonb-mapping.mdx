@@ -51,11 +51,11 @@ case, conflicts, duplicate keys after NUL replacement, historical states,
 generated documents, and wide objects with keys of every length, arrays
 past jsonb's offset stride and strings larger than an arena chunk.
 Postgres errors inside those calls unwind through the walk untouched (see
-[Errors and panics](/reference/automerge-type#errors-and-panics)).
+[Errors and panics](./automerge-type.mdx#errors-and-panics)).
 
 The walk makes one sweep over the document with Automerge's document
 iterator (`ReadDoc::iter_at`), unless the document has blocks (maps
-inside a text; see [Deep blocks](/design/deep-blocks)), buffering each object's visible entries
+inside a text; see [Deep blocks](../design/deep-blocks.mdx)), buffering each object's visible entries
 (borrowed from the document), then emits them depth first from the root.
 The entries of all maps and lists go to one vector (the iterator yields an
 object's items together, so each object's entries are one range of it),
@@ -70,7 +70,7 @@ emit U+FFFC for anything in a text that is not a string and nothing for
 marks). The per-object walk (`json::write_json_per_object`: a
 `map_range` / `list_range` per object, `text()` per text) is taken for
 documents with blocks, which the document iterator renders recursively
-(see [Deep blocks](/design/deep-blocks)), and for documents with legacy `Table`
+(see [Deep blocks](../design/deep-blocks.mdx)), and for documents with legacy `Table`
 objects, which the sweep would read as lists; it is also the reference:
 a core test checks that both walks, and the choice between them, emit
 exactly the same events for current and historical states of generated

@@ -81,7 +81,7 @@ PostgreSQL documentation's "Security Considerations for Extensions":
   text is 4 kB (Automerge deflates the columns; about 1,000 characters per
   byte); the bytea cast validates it (load and save) in 4.3 s (one
   uninterruptible Automerge call, see
-  [Implementation notes](/design/implementation-notes)) with a peak of 390 MB of
+  [Implementation notes](./implementation-notes.mdx)) with a peak of 390 MB of
   backend memory, outside Postgres' memory accounting, and it scales
   linearly. Automerge allocates with the Rust global allocator, and a
   failed Rust allocation aborts the process: reproduced with a server
@@ -96,7 +96,7 @@ PostgreSQL documentation's "Security Considerations for Extensions":
   `automerge_contains(automerge, bytea)`) and every merge result is now
   priced from its chunk headers and column metadata before Automerge
   allocates, and refused over `pg_automerge.max_load_memory` with `53400`
-  (see [Resource limits](/design/resource-limits)); `tests/limits.sh` reproduces
+  (see [Resource limits](./resource-limits.mdx)); `tests/limits.sh` reproduces
   the crash in a memory-capped cluster with the limit off and gets clean
   errors with it on. The setting is `PGC_SUSET`, which Postgres enforces
   whoever installed the extension, so a database owner could not raise it

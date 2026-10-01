@@ -26,12 +26,12 @@ description: "What a stored automerge value is: its invariants, verification of 
   input (`''::bytea`, `'\x'`) is the empty document, whose jsonb is `{}`.
 - **Validated.** Input that does not load is rejected (`22P02`; `22000`
   when it is well formed but holds two conflicting histories of one actor,
-  see [Error codes](/reference/error-codes)), and so is
+  see [Error codes](./error-codes.mdx)), and so is
   input whose changes have missing dependencies: no orphaned changes are
   stored.
 - **Nothing unloadable is stored** (while `pg_automerge.verify_writes` is
   on, the default; see [The `pg_automerge.verify_writes`
-  setting](/reference/automerge-type#the-pg_automergeverify_writes-setting)). The normalized result
+  setting](./automerge-type.mdx#the-pg_automergeverify_writes-setting)). The normalized result
   is loaded back once and must have the same heads, unless that load
   provably reads the bytes the first load already accepted:
   - the input already was the canonical encoding, or
@@ -46,7 +46,7 @@ description: "What a stored automerge value is: its invariants, verification of 
     loading the save parses the very bytes that `Automerge::load(input)`
     already parsed with `VerificationMode::Check`, so it cannot fail or
     change the heads. With a load memory limit (the default), the scan
-    that prices the input (see [The scan](/design/resource-limits#the-scan)) has already inflated
+    that prices the input (see [The scan](../design/resource-limits.mdx#the-scan)) has already inflated
     those columns with the same decoder, and keeps them through the load:
     `header::inflated_document_is` compares the save with the input's
     layout and those columns in place, without inflating the input again
@@ -66,12 +66,12 @@ description: "What a stored automerge value is: its invariants, verification of 
   changes, a document encoded by another implementation) pays the second
   load. The same check applies to results of `merge(automerge, bytea)`,
   when they are first flattened (see
-  [The deferred verification](/design/expanded-values#the-deferred-verification)); a full save
+  [The deferred verification](../design/expanded-values.mdx#the-deferred-verification)); a full save
   merged that way takes the same shortcut when it is the result.
 - **Fit the limit when written.** Every value built from client bytes,
   and every merge result, was priced before it was built and stored
   within `pg_automerge.max_load_memory` as it was set at that time (see
-  [Resource limits](/design/resource-limits)). Loading a stored value is never
+  [Resource limits](../design/resource-limits.mdx)). Loading a stored value is never
   checked, so a lower limit later never makes data unreadable.
 - **Immutable.** Nothing modifies a stored value in place: `merge` returns
   a new value, and an expanded value's document is only ever replaced as a
@@ -140,7 +140,7 @@ the library defines the setting.
 
 | From → To | Context | Notes |
 |---|---|---|
-| `bytea → automerge` | assignment | validates + normalizes; lets drivers bind `bytea` params directly; the result is an expanded value (the loaded document and its stored bytes, see [Expanded values](/design/expanded-values)) |
+| `bytea → automerge` | assignment | validates + normalizes; lets drivers bind `bytea` params directly; the result is an expanded value (the loaded document and its stored bytes, see [Expanded values](../design/expanded-values.mdx)) |
 | `automerge → bytea` | explicit | `WITHOUT FUNCTION` (same varlena layout); stored bytes, loadable by any Automerge implementation |
 | `automerge → jsonb` | **implicit** | so every jsonb operator/function applies to `automerge` directly |
 
@@ -165,7 +165,7 @@ identity; `automerge_heads` is.
 ## Errors and panics
 
 Errors are raised with `ereport(ERROR)` and a SQLSTATE (see
-[Error codes](/reference/error-codes)); nothing panics across FFI. Client input that
+[Error codes](./error-codes.mdx)); nothing panics across FFI. Client input that
 is malformed (bytes, text, hashes) is always `22P02`; well-formed input
 whose history conflicts with the document it meets, or that holds two
 conflicting histories itself (a reused actor id), is `22000`; stored values that fail are `XX000`.
@@ -185,5 +185,5 @@ pgrx carries as a panic with its own payload type and must re-raise as
 is, not relabel as `22P02`/`XX000`.
 
 Messages follow PostgreSQL's error message style guide (see [Error
-codes](/reference/error-codes)). The LOCATION of an error (shown with `\set
+codes](./error-codes.mdx)). The LOCATION of an error (shown with `\set
 VERBOSITY verbose`) is the source file and line that raised it.

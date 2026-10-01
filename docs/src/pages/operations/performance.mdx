@@ -24,11 +24,11 @@ document (3,000,000-character text; release build, warm cache):
 
 On an 83 kB document (2,000 list items) the same single-change `UPDATE`
 takes 41 ms, and `doc->>'status'` 33 ms. More numbers, and what each function loads, in
-[Performance](/design/performance).
+[Performance](../design/performance.mdx).
 
 These were measured on pgrx's development Postgres (assertions on). On
-the [Docker image](/guide/docker) (PGDG Postgres 18, `mise run
+the [Docker image](../guide/docker.mdx) (PGDG Postgres 18, `mise run
 docker-bench-sql`) the paths that load a document take the same time
 (within a few percent: the time is Automerge's), and the millisecond
 paths (heads, no-op merges, containment checks) about half
-([comparison](/design/benchmarks/2026-09-30#the-docker-image-against-the-pgrx-postgres-2026-09-30)).
+([comparison](../design/benchmarks/2026-09-30.mdx#the-docker-image-against-the-pgrx-postgres-2026-09-30)).

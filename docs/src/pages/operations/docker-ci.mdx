@@ -17,7 +17,7 @@ for `automerge_notify()`, the settings and their privileges),
 same volume, the regress examples and the concurrency, notify, dump,
 extension and memory suites, the load memory limit against a container started with
 `--memory=1g`, a 60-second smoke run of the soak test (see
-[Operations](/operations); `mise run soak` is the full hour), and that
+[Operations](./index.mdx); `mise run soak` is the full hour), and that
 no server log shows an assertion failure, panic or crashed backend. The suites need Postgres 18 client tools and cargo:
 those of the pgrx Postgres by default (`mise run pgrx-init`), or PGDG's
 `postgresql-client-18` with
@@ -27,7 +27,7 @@ skips them. It also checks the release scripts:
 `scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
 
 `mise run docker-upgrade-test` (not part of `docker-test`) upgrades a
-0.1.0 deployment to the current version the way the [Updating](/guide/updating)
+0.1.0 deployment to the current version the way the [Updating](../guide/updating.mdx)
 section describes: a
 container of the 0.1.0 image (`PG_AUTOMERGE_OLD_IMAGE=<tag or image ID>`,
 or by default built from the 0.1.0 source in the git history) with
@@ -47,7 +47,7 @@ PG_AUTOMERGE_TEST_USER=postgres PG_AUTOMERGE_TEST_PASSWORD=... \
 ```
 
 `mise run docker-bench-sql` times the everyday SQL paths against the
-image; see [Performance](/operations/performance) for how it compares.
+image; see [Performance](./performance.mdx) for how it compares.
 
 ## CI
 
@@ -75,7 +75,7 @@ image your host cannot run (`exec format error`) until you
 archives too, but puts the tags back as they were.
 
 The arm64 image is built and tested natively, without QEMU or
-cross-compilation ([why](/design/docker-image#docker-image-in-ci)). Where the
+cross-compilation ([why](../design/docker-image.mdx#docker-image-in-ci)). Where the
 arm64 runner is not available (it depends on the repository's plan and
 visibility), set the repository variable `PG_AUTOMERGE_ARM64` to `false`:
 tags then build amd64 only.

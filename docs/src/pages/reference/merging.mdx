@@ -14,7 +14,7 @@ description: "The semantics of merge, merge_agg and automerge_contains, and the 
     case of a backend sending a full, newer save). Checked cheapest first:
     the same expanded object; the heads read from a prefix of each value
     (no load, and nothing else detoasted, see
-    [Heads fast path](/reference/merging#heads-fast-path)): `heads(b) ⊆ heads(a)` → `a`,
+    [Heads fast path](./merging.mdx#heads-fast-path)): `heads(b) ⊆ heads(a)` → `a`,
     `heads(a) ⊊ heads(b)` → `b`; the history
     of an input that is already loaded; then the larger stored input is
     loaded and checked against the other's heads (a containing document is
@@ -27,14 +27,14 @@ description: "The semantics of merge, merge_agg and automerge_contains, and the 
     compressing and writing the document again. On the 3 MB document such
     an update takes about 1 ms instead of 185 ms.
   - A new document is returned as an expanded value (see
-    [Expanded values](/design/expanded-values)): kept loaded in memory and saved
+    [Expanded values](../design/expanded-values.mdx)): kept loaded in memory and saved
     only when it is stored, sent or cast to `bytea`. When `a` is a
     read-write expanded pointer (a PL/pgSQL variable in `d := merge(d, x)`,
     or the result of an inner `merge`), the merge happens in place.
   - Merging two valid stored documents cannot fail except for a reused
     actor id (two histories with different changes for the same (actor,
     seq)): `22000` "conflicting automerge changes", with a HINT (see
-    [Error codes](/reference/error-codes)).
+    [Error codes](./error-codes.mdx)).
   - `merge` is an unreserved keyword since PG15; unqualified
     `SELECT merge(a, b)` and `SET doc = merge(doc, ...)` work on PG18
     (tested), so the function keeps the name `merge`.
@@ -72,7 +72,7 @@ description: "The semantics of merge, merge_agg and automerge_contains, and the 
        Automerge decides). So a chunk with known heads and a malformed
        body is `22P02`, as that load would make it. The check is part of
        the load memory scan of the input (see
-       [Resource limits](/design/resource-limits)), which also prices this
+       [Resource limits](../design/resource-limits.mdx)), which also prices this
        answer at what parsing the chunk takes (its inflated columns,
        nothing for an uncompressed save).
     2. When the headers say the save has no more changes than a stored `a`
@@ -112,7 +112,7 @@ description: "The semantics of merge, merge_agg and automerge_contains, and the 
     is marked unverified (unless it is a save's own encoding, case 3
     above): it gets the save-and-load check of normalization when it is
     first flattened (see
-    [The deferred verification](/design/expanded-values#the-deferred-verification)).
+    [The deferred verification](../design/expanded-values.mdx#the-deferred-verification)).
   - A document chunk after the first chunk of `changes` whose heads `a`
     already has is parsed and checksum-checked by Automerge (as in case 1),
     and its changes are not reconstructed.
@@ -218,18 +218,18 @@ actor column, a null run, or anything that does not add up falls back to
 a load.
 
 `automerge_heads`, `automerge_contains`, `automerge_change_count`, the
-since-functions of [History](/reference/history) and the notification
+since-functions of [History](./history.mdx) and the notification
 trigger take their document without detoasting it (`AutomergeArg`; an
 expanded value is read in memory): they read the value's size with
 `toast_raw_datum_size` and fetch only a prefix (4 kB, grown as needed) with
 `pg_detoast_datum_slice`, which for an out-of-line value reads only the
 TOAST chunks covering it and for a compressed value decompresses only that
 far. `merge` and `merge_agg` also decide their no-op cases from such a
-prefix before they detoast a value (see [Merging](/reference/merging)).
+prefix before they detoast a value (see [Merging](./merging.mdx)).
 
 Deciding containment for a linear history (newer contains older) still
 needs a load of the newer document: the headers only list heads, and
 change hashes are only available after reconstructing the changes. The
 opposite answer (an older or a concurrent version does not contain the
 other) usually needs none: `automerge_contains` compares the two change
-counts, read from the same prefix (see [Reading](/reference/reading)).
+counts, read from the same prefix (see [Reading](./reading.mdx)).

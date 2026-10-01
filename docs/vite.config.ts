@@ -10,6 +10,7 @@ import type { PluggableList } from "unified";
 import { defineConfig, type Plugin } from "vite";
 import { pageMetaPlugin } from "./plugins/page-meta.ts";
 import remarkInclude, { includedFiles } from "./plugins/remark-include.ts";
+import remarkPageLinks from "./plugins/remark-page-links.ts";
 
 // Languages highlighted at build time (shiki runs only in the MDX compile,
 // never in the browser). A fence with any other language fails the build.
@@ -39,6 +40,9 @@ if (!version) throw new Error("no version in ../Cargo.toml");
 const remarkPlugins: PluggableList = [
 	remarkFrontmatter,
 	remarkGfm,
+	// Before remarkInclude: page links are relative .mdx paths in the pages,
+	// routes once remarkInclude has spliced a file in.
+	remarkPageLinks,
 	remarkInclude,
 ];
 const slugPlugins: PluggableList = [rehypeSlug];

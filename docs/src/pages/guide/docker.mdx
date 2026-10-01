@@ -14,7 +14,7 @@ against that image's own PGDG Postgres 18 (release build, no assertions),
 with Rust and cargo-pgrx as pinned in `mise.toml`. Nothing is pushed
 anywhere; the image lives in your local Docker until you push it to a
 registry of your own (CI can do that for tags once you
-[configure it](/operations/docker-ci#publishing-the-image)).
+[configure it](../operations/docker-ci.mdx#publishing-the-image)).
 
 ```sh
 mise run docker-build        # pg-automerge:0.2.0 and pg-automerge:dev
@@ -24,7 +24,7 @@ mise run docker-test         # builds, then tests the image and compose.yaml (ab
 The image is 3.5 MB larger than `postgres:18`. A first build takes about
 8 minutes (Rust, cargo-pgrx and a fat-LTO release build); BuildKit cache
 mounts keep the toolchain and compiled dependencies, so a rebuild after a
-source change takes about a minute ([measurements](/design/docker-image)).
+source change takes about a minute ([measurements](../design/docker-image.mdx)).
 
 Without mise (from the repository root, BuildKit required; the build
 checks the version argument against `Cargo.toml`):
@@ -92,7 +92,7 @@ chmod 755 init/10-pg-automerge.sh
 ```
 
 The extension goes into `POSTGRES_DB` only, not `template1`: it is not
-trusted (see [Install](/guide/install)), and a copy in `template1` would put it
+trusted (see [Install](./install.mdx)), and a copy in `template1` would put it
 into every database a `CREATEDB` role creates later. Other databases get
 it with `CREATE EXTENSION pg_automerge` by a superuser. Your application
 should connect as its own non-superuser role, not as `POSTGRES_USER`.
@@ -112,5 +112,5 @@ The image changes no Postgres setting. Suggested, as command-line options
   kernel's OOM killer does the same. Each session can use up to the limit
   at once, like `work_mem`, so keep it well below the container's memory
   divided by the sessions you expect to load large documents at once (the
-  default is 2GB; compose uses 1GB). See [Configuration](/reference/configuration)
-  and [Sizing memory](/operations#sizing-memory).
+  default is 2GB; compose uses 1GB). See [Configuration](../reference/configuration.mdx)
+  and [Sizing memory](../operations/index.mdx#sizing-memory).
