@@ -1,0 +1,63 @@
+---
+title: "Future work"
+section: Design
+order: 130
+description: "What was evaluated and not (yet) implemented."
+---
+
+## Native `->` / `->>` operators (evaluated, not implemented)
+
+The performance work found that `automerge -> text` / `automerge ->> text`
+operators reading one field without converting the whole document could
+roughly halve single-field reads. They are not implemented; this is the
+evaluation, for a decision before the first release.
+
+- **Benefit.** Today `doc->>'status'` resolves to `jsonb ->> text` through
+  the implicit cast: load the document, convert all of it to jsonb, take
+  one key. A native operator would load the document and convert only the
+  value at that key (`doc.get(ROOT, key)` and the walk of that subtree).
+  The load itself stays: Automerge has no partial load. The gain is the
+  walk and jsonb build of everything else, from the primitives in
+  [Performance](/design/performance): on the 877 kB list document about 100 ms
+  (72 ms walk, about 30 ms build) of roughly 260 ms, close to half with
+  the per-call overhead; on the 3 MB text document about 0.3 s (the text's
+  conversion) of 2.8 s, since the load dominates there. The more of the
+  document lies outside the requested field and the smaller its history,
+  the larger the share.
+- **Expression indexes and plans.** An existing index on `(doc->>'x')`
+  was created when that text resolved to `(doc::jsonb) ->> 'x'`, and
+  stores that expression. Once a native `->>(automerge, text)` exists,
+  the same query text resolves to it (an exact match on the left type
+  beats the implicit cast), the expressions differ, and the planner no
+  longer matches the index: queries silently fall back to scans until the
+  index is recreated. Views, rules and `BEGIN ATOMIC` bodies keep their
+  stored (jsonb) resolution. The same applies to generated columns and
+  check constraints written as `doc->>'x'`. After a release, adding the
+  operators would therefore be a plan-breaking change needing release
+  notes (`REINDEX` is not enough; the index must be dropped and created
+  from the new expression). Before the first release it costs nothing.
+- **Semantics to match exactly.** The operators must return the same
+  types as jsonb's (`->` jsonb, `->>` text) and the same values as the
+  cast's mapping (counters, timestamps, NaN, bytes, conflicts), so that
+  `doc->'a'->>'b'` chains and mixing with jsonb operators stay coherent;
+  the subtree conversion must reuse the core's walk, and a test would
+  compare `doc->k` with `doc::jsonb->k` over the generated documents.
+  `#>` / `#>>` (paths) and array indexes would follow the same pattern;
+  `@>`, `?`, jsonpath and the rest keep going through the cast.
+- **Naming.** To be a drop-in, the operators must be `->` and `->>`;
+  anything else is a new API anyway, which argues for functions instead.
+- **Alternative: functions.** `automerge_extract_path(doc, VARIADIC path
+  text[]) → jsonb` and `automerge_extract_path_text(doc, VARIADIC path
+  text[]) → text`, named after `jsonb_extract_path` / `_text` so jsonb
+  users recognize them (a shorter `automerge_get(doc, VARIADIC path
+  text[])` was considered; the jsonb-parallel names say what the result
+  is). Opt-in: nothing resolves differently, no index stops matching,
+  and hot queries are rewritten deliberately; `IMMUTABLE`, so indexable
+  too. Their cost is discoverability.
+- **Recommendation.** If faster single-field reads are wanted, add the
+  functions (no compatibility hazard). 0.1.0 is released without the
+  operators; adding them now is an SQL change like any other (a new
+  version and upgrade script) and, if at all, needs a test that an index on
+  `(doc->>'x')` created afterwards is used. For read-heavy tables the
+  stored generated jsonb column stays the fastest option either way
+  (no load at read time).

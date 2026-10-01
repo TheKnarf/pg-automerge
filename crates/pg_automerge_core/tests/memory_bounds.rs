@@ -288,8 +288,9 @@ fn check_normalize_as(name: &str, input: &[u8], loads: Option<bool>) -> (u64, f6
     let start = std::time::Instant::now();
     let (result, peak) = peak_of(|| normalize(input));
     let elapsed = start.elapsed().as_secs_f64();
-    // Time follows the estimate (docs/DESIGN.md: about 8 s per GB at
-    // most); only meaningful in a release build (`cargo test --release`),
+    // Time follows the estimate (docs/src/pages/design/resource-limits.mdx:
+    // about 8 s per GB at most); only meaningful in a release build
+    // (`cargo test --release`),
     // the dev build does not optimize this crate.
     let per_gb = elapsed / (limit as f64 / f64::from(1u32 << 30));
     if !cfg!(debug_assertions) && !NO_TIME_BOUND.with(std::cell::Cell::get) {
@@ -370,8 +371,9 @@ thread_local! {
 
 /// Run `f` with its loads exempt from the time bound of
 /// [`check_normalize`] (still measured and printed): for the inputs whose
-/// time is known not to follow the estimate (docs/DESIGN.md, "What the
-/// limit cannot do": overlapping marks applied as changes take time
+/// time is known not to follow the estimate
+/// (docs/src/pages/design/resource-limits.mdx, "What the limit cannot do":
+/// overlapping marks applied as changes take time
 /// quadratic in their number).
 fn without_time_bound<T>(f: impl FnOnce() -> T) -> T {
     NO_TIME_BOUND.with(|c| c.set(true));
@@ -1289,8 +1291,9 @@ fn a_lowered_limit_leaves_stored_values_and_no_op_writes_alone() {
 }
 
 // ---------------------------------------------------------------------------
-// Neighbouring shapes of the string and actor terms (docs/DESIGN.md, "The
-// estimate's neighbourhood"): every string-valued column as one repeat run,
+// Neighbouring shapes of the string and actor terms
+// (docs/src/pages/design/benchmarks/2026-10-01.mdx, "The estimate's
+// neighbourhood"): every string-valued column as one repeat run,
 // many distinct strings and runs interleaved with literals, plain and
 // compressed, as a document chunk, a change chunk and after another save;
 // long actor ids from every actor column; each also through
@@ -1688,7 +1691,7 @@ fn the_cost_model_was_measured_for_this_automerge() {
              (pg_automerge_core::budget) was measured for {name} {measured}: \
              re-measure the cost model (cargo test --release -p pg_automerge_core \
              --test memory_bounds -- --nocapture, and mise run fuzz; revisit the \
-             constants in budget.rs and docs/DESIGN.md, \"The estimate\"), then set \
+             constants in budget.rs and docs/src/pages/design/resource-limits.mdx, \"The estimate\"), then set \
              budget::MEASURED_{} to {locked}",
             name.to_uppercase()
         );

@@ -1,0 +1,190 @@
+---
+title: "Expanded values"
+section: Design
+order: 20
+description: "Merge results that stay loaded in memory until they are stored, sent or cast."
+---
+
+Postgres lets a varlena type have an in-memory "expanded" form
+(`utils/expandeddatum.h`): a function returns a pointer to an object that
+stays in memory, and the flat bytes are produced only when the value is
+stored, sent or copied. For `automerge` the expanded form is the loaded
+Automerge document, so chains of operations do not pay a save and a
+re-load between steps.
+
+Where it helps:
+
+- `merge(merge(a, b), c)`, `a || b || c`: the inner result stays loaded; the
+  outer merge applies into it in place.
+- `merge(...)::jsonb`, `automerge_heads(merge(...))` and the history
+  functions on a merge result read the document in memory (no save, no
+  re-load).
+- PL/pgSQL `d := merge(d, x)` in a loop: the variable holds the expanded
+  document, merged into in place; the save (and its verification) happens
+  once, when `d` is stored.
+- Repeated reads of such a variable (`d->>'a'`, `d->>'b'`) convert from
+  memory instead of loading each time. A variable filled from a table
+  (`SELECT doc INTO d`) is flat until the first `merge` into it (PL/pgSQL
+  expands only arrays by itself).
+- `merge_agg(...)::jsonb` skips the final save and re-load (the inputs
+  still need a load each).
+- The `bytea → automerge` cast returns the document it loaded to validate
+  the input, with its stored bytes already computed: `merge(doc,
+  $1::automerge)` (or `merge(doc, (SELECT ..)::automerge)`) reads it in
+  memory, so a newer full save costs one load in total instead of two, and
+  storing the cast's value copies the bytes (no save).
+
+Where it does not:
+
+- Table columns always arrive flat, so
+  `UPDATE docs SET doc = merge(doc, $1)` loads the stored value, applies,
+  saves and verifies once (nothing to gain without a cross-statement cache).
+- `EXCLUDED` in `INSERT .. ON CONFLICT DO UPDATE` is flat: `ExecInsert`
+  materializes the proposed row (`ExecMaterializeSlot`, which flattens
+  expanded values) before it checks for the conflict, and nothing in a
+  type's control changes that. So the upsert of a full save costs two
+  loads (the cast's, and `merge` loading `EXCLUDED.doc`), where
+  `UPDATE .. SET doc = merge(doc, $save::bytea)` costs one.
+- Query parameters are flat in the plans drivers normally get: for an
+  unnamed statement (and the first five executions of a prepared one)
+  Postgres plans with the parameter values as constants, and folding
+  `$1::automerge` or a typed `automerge` parameter into a constant copies
+  it flat (`datumCopy`). So `merge(doc, $1::automerge)` costs two loads
+  there (one with a generic plan); `merge(doc, $1)` with a `bytea`
+  parameter costs one either way (see `merge(automerge, bytea)`).
+- The type's input and receive functions return flat values. Their
+  results are copied flat almost everywhere (parser constants are
+  detoasted, `COPY` stores them, parameters are folded as above), and an
+  expanded value would keep its loaded document, many times the size of
+  the bytes, alive until the calling memory context ends: for every
+  element of an `automerge[]` literal or binary array parameter, or of a
+  record, until the end of the statement. The `bytea` cast runs in an
+  expression's per-row context instead, which is reset for every row (a
+  pg_test checks that 400 rows of `INSERT .. SELECT` through the cast
+  leave no document behind, and that at most one is alive at a time).
+
+## Implementation
+
+- Object: `ExpandedAutomerge` (`src/expanded.rs`), the standard
+  `ExpandedObjectHeader` followed by a pointer to a Rust
+  `pg_automerge_core::loaded::LoadedDoc` (the `Automerge` document, its
+  sorted heads, and its stored bytes once computed). It lives in its own
+  memory context (`automerge expanded document`, a child of the calling
+  context), so Postgres frees or re-parents it with the value
+  (`TransferExpandedObject` when PL/pgSQL keeps it in a variable). The
+  Rust document is dropped by a reset callback registered on that
+  context, so it lives exactly as long as the object. The Rust heap
+  memory is not counted in the context (as for `merge_agg`'s state);
+  `automerge_memory_usage()` shows it (see
+  [Memory observability](/design/memory-observability)).
+- Flattening: `get_flat_size` computes the stored bytes
+  (`save_nocompress()`), caches them in the `LoadedDoc` and returns their
+  size; `flatten_into` copies the cached bytes (and checks the size it is
+  given). The bytes are the same as the flat path's, byte for byte (a
+  property test runs chains of merges both ways over generated histories:
+  a document chunk lists changes in the order they were applied, and both
+  paths apply them in the same order).
+- The cache cannot go stale: a `LoadedDoc` is never modified. "In place"
+  means the object's `LoadedDoc` is *replaced* by a new one (built from a
+  clone of the old document plus the new changes, with an empty cache).
+- Read-only vs read-write: only a read-write pointer
+  (`VARTAG_EXPANDED_RW`) allows the replacement. With a read-only pointer
+  (a variable passed to another target, a value in a slot, the other
+  arguments of an in-place call) the function returns a new object and
+  never touches the old one. New objects are returned read-write, as the
+  protocol requires.
+- Failure atomicity: the new document is complete before it replaces the
+  old one, and nothing after the replacement can fail. An error (bad
+  changes, missing dependencies, a reused actor id, a decoder panic) leaves
+  the argument's document as it was. This is condition 1 of
+  `SupportRequestModifyInPlace`, and it holds for every read-write call,
+  not just PL/pgSQL's.
+- `merge(x, x)` through a read-write and a read-only pointer to the same
+  object (`d := merge(d, d)`, `d := d || d`): recognized by object identity
+  and returned unchanged, before any document is borrowed.
+  `d := merge(d, d::bytea)` reads a flattened copy (argument unboxing
+  happens before the call). This is condition 2 of the support request.
+- Support function: `automerge_merge_support(internal)` is attached to both
+  `merge`s (and so to both `||`) with `SUPPORT`. For
+  `SupportRequestModifyInPlace` it names the first argument when it is the
+  assignment target's `PARAM_EXTERN` Param, otherwise NULL (also for every
+  other request). PL/pgSQL then passes the variable read-write even when
+  it is declared outside a `BEGIN .. EXCEPTION` block, where its value must
+  survive an error; for a local variable referenced once PL/pgSQL 18
+  already transfers ownership into the expression by itself. Both paths
+  are tested (a test-only counter of in-place replacements).
+- Inputs: every function taking `automerge` accepts both forms
+  (`AutomergeArg`); the read functions (heads, jsonb, history,
+  containment, change count) use an expanded argument's document in
+  memory and never flatten it. Output, `send` and casts flatten it (once;
+  the bytes are cached). Functions that receive `automerge` as `bytea`
+  (`doc::bytea` is binary-coercible) get the flattened bytes through the
+  normal detoast.
+- No-op results: an input that already contains the other is returned as
+  is, the datum itself: a flat input as it arrived (possibly compressed or
+  a TOAST pointer), an expanded input as the same pointer, the way
+  `COALESCE` passes an argument through (whoever keeps the result beyond
+  the expression copies it: slots, PL/pgSQL assignment and SQL function
+  results flatten a read-only pointer; storing a TOAST pointer of the same
+  row keeps its TOAST value).
+- `merge(automerge, bytea)` on an expanded document parses the change
+  chunks (`Change::try_from`, the parser `Automerge::load` uses) and
+  applies them to a clone, so it needs no load; a save is loaded on its
+  own and merged like a document (see [Merging](/reference/merging)); compressed
+  chunks go through a strict load of a fresh save of the document plus
+  the input.
+- Sources of expanded values: `merge` and `||` results, `merge_agg`
+  results, and the `bytea → automerge` cast (whose object starts out
+  verified, with its stored bytes). Input and receive functions return
+  flat values (see above).
+
+## The deferred verification
+
+A result that contains changes from a `bytea` is marked unverified. Its
+save is loaded back and must keep the heads (the safeguard of
+normalization) when it is first flattened, not inside `merge`. So such a
+value can never be stored unless it loads back, but the rare input that
+loads, applies, and then does not survive a save and load (seen only in
+fuzzing, as malformed input with recomputed checksums) fails with `22P02`
+where the value is stored, sent or cast, e.g. at the `UPDATE`, not at the
+`merge` call; a `BEGIN .. EXCEPTION` block around only the `merge` does
+not catch it. Every other bad input (framing, checksums, change columns,
+missing dependencies, a reused actor id, decoder panics) fails inside
+`merge`.
+Verifying eagerly would cost a load per merge and undo most of the gain.
+The check runs only while `pg_automerge.verify_writes` is on (read when
+the value is flattened; see [The `pg_automerge.verify_writes`
+setting](/reference/automerge-type#the-pg_automergeverify_writes-setting)). A save merged with
+`merge(automerge, bytea)` that contains `a` and is its own canonical or
+compressed encoding is the result as it is, verified by that encoding,
+and needs no check.
+
+The failure path is tested with a test-only hook
+(`test_hooks::set_fail_reload_check`, feature `test-hooks`) that makes the
+check fail: `merge(...)` and reads of its result succeed and run no check;
+`UPDATE`/`INSERT` of it, `::bytea` and `automerge_send` fail with `22P02`;
+the row is unchanged; a PL/pgSQL variable holding the result stays usable
+after the failed `UPDATE` and stores fine once the check passes; on input,
+canonical bytes and compressed saves take no check while other input
+fails. The setting is tested the same way (`src/tests/loads.rs`): off, the
+forced failure never runs and a real input whose re-save does not load is
+stored and then fails to read with `XX000`; only superusers may change
+it.
+
+## Pitfalls avoided (supabase/pg_crdt's expanded automerge)
+
+1. Mutating through a read-only pointer: only `VARTAG_EXPANDED_RW` allows
+   replacement; tested with a PL/pgSQL variable passed read-only to two
+   merges and with an alias (`x := d; d := merge(d, y)` leaves `x`).
+2. Stale flat bytes: the cache belongs to an immutable `LoadedDoc`, and a
+   merge replaces the whole `LoadedDoc`; tested by storing, merging in
+   place and storing again (and in the core tests).
+3. Support function not attached: `SUPPORT automerge_merge_support` is in
+   the generated `CREATE FUNCTION`s; a pg_test checks `pg_proc.prosupport`
+   and that PL/pgSQL's in-place path is taken inside an `EXCEPTION` block.
+4. Document memory outside the object's lifecycle: the document is owned
+   by the object and dropped by its context's reset callback; a pg_test
+   runs about 2,400 merges in PL/pgSQL loops and checks that
+   `pg_backend_memory_contexts` shows at most the live variables' objects
+   during the loop and none after, and that the number of live Rust
+   documents returns to where it was.

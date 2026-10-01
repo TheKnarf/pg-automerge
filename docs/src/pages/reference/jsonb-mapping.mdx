@@ -1,0 +1,84 @@
+---
+title: "jsonb mapping"
+section: Reference
+order: 60
+description: "How Automerge values map to jsonb."
+---
+
+Maps/tables → objects, lists → arrays, text → strings, integers and
+counters → exact numbers, NaN/±Infinity → `null`, timestamps → ISO 8601
+UTC strings with milliseconds, bytes → base64 strings. Conflicting
+concurrent values show Automerge's winner. Details below.
+
+The root is always a map, so it maps to a jsonb object. For a map key with
+conflicting concurrent values, Automerge's winner is used (what `get` returns).
+
+| Automerge | jsonb |
+|---|---|
+| Map / Table | object |
+| List | array |
+| Text | string (`doc.text(obj)`; block markers are included as the characters Automerge's `text()` returns) |
+| Str | string |
+| (any string or map key containing U+0000) | U+0000 replaced by U+FFFD (Postgres text and jsonb cannot hold NUL) |
+| Int, Uint, Counter | number (exact). A counter summing past the i64 range wraps, as in Automerge release builds |
+| F64 | number. NaN/±Inf become `null` (jsonb cannot represent them); -0.0 becomes `0` (jsonb numeric has no negative zero) |
+| Boolean | boolean |
+| Null | null |
+| Timestamp (ms since epoch) | string, ISO 8601 UTC with milliseconds, e.g. `"2024-01-02T03:04:05.678Z"`; years outside 0000–9999 use the six-digit signed form (`"+010000-01-01T00:00:00.000Z"`), like JavaScript's `toISOString` |
+| Bytes | string, standard base64 with padding |
+| Unknown | null |
+
+The conversion builds the jsonb value directly: the core's walk
+(`json::write_json_at`) emits events into a `JsonSink`, and the glue's
+`JsonbBuilder` assembles from them the in-memory `JsonbValue` tree that
+`jsonb_in` builds while parsing (the tree `pushJsonbValue` accumulates) and
+finishes with one `JsonbValueToJsonb`, with the same values: strings and
+keys with `jsonb_in`'s 256 MB string limit, `i64` through
+`int64_to_numeric`, and `u64` above `i64::MAX` and floats through
+`numeric_in` on the text `serde_json` writes for them (the shortest
+round-trip form), exactly what the text path parsed. The tree is assembled
+in Rust memory rather than through `pushJsonbValue`, which cost one
+guarded FFI call and a few pallocs per event and doubled its arrays as they
+grew: each container's elements or pairs are allocated once at their final
+size, string bytes are copied into a chunked arena whose chunks never move,
+and object pairs are sorted and de-duplicated as `uniqueifyJsonbObject`
+does (by key length, then bytes; of equal keys the one added last wins),
+with `pushJsonbValue`'s element and pair limits and errors. That memory is
+freed when the builder is dropped, also when an error unwinds through it.
+So the result is byte for byte what the earlier `serde_json::Value` → text
+→ `jsonb_in` path produced; pg_tests compare the two on every scalar edge
+case, conflicts, duplicate keys after NUL replacement, historical states,
+generated documents, and wide objects with keys of every length, arrays
+past jsonb's offset stride and strings larger than an arena chunk.
+Postgres errors inside those calls unwind through the walk untouched (see
+[Errors and panics](/reference/automerge-type#errors-and-panics)).
+
+The walk makes one sweep over the document with Automerge's document
+iterator (`ReadDoc::iter_at`), unless the document has blocks (maps
+inside a text; see [Deep blocks](/design/deep-blocks)), buffering each object's visible entries
+(borrowed from the document), then emits them depth first from the root.
+The entries of all maps and lists go to one vector (the iterator yields an
+object's items together, so each object's entries are one range of it),
+and an object is found by bisecting its id in an index of the visited ids
+ordered by `ObjId`'s own order (counter, then actor bytes), not by hashing
+it: Automerge visits objects in that order (its actor table is kept
+sorted), so building the index costs one pass that checks the order, and
+sorts only if it ever does not hold. One sweep avoids setting up a `map_range`/`list_range` iterator per object
+(about 5 µs each). Text comes from the sweep's spans: string runs, and
+U+FFFC for each block marker, which is exactly what `text()` returns (both
+emit U+FFFC for anything in a text that is not a string and nothing for
+marks). The per-object walk (`json::write_json_per_object`: a
+`map_range` / `list_range` per object, `text()` per text) is taken for
+documents with blocks, which the document iterator renders recursively
+(see [Deep blocks](/design/deep-blocks)), and for documents with legacy `Table`
+objects, which the sweep would read as lists; it is also the reference:
+a core test checks that both walks, and the choice between them, emit
+exactly the same events for current and historical states of generated
+documents, text with blocks, marks and non-string elements, unreachable
+objects, conflicts and deep nesting.
+
+Nesting is capped at 1000 levels (error `54000` program_limit_exceeded,
+like jsonb's own size limits): the walk itself uses an explicit stack, but
+`convertToJsonb` recurses (it checks the stack depth, the cap gives a
+clear error instead). The document is valid and can still be stored,
+merged and read as `bytea`; only its jsonb view fails.

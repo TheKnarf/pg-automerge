@@ -1,5 +1,5 @@
-//! Payloads for the `automerge_notify()` trigger (see docs/DESIGN.md,
-//! "Change notifications").
+//! Payloads for the `automerge_notify()` trigger (see
+//! docs/src/pages/reference/change-notifications.mdx).
 //!
 //! A payload is compact JSON:
 //!

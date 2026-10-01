@@ -1,0 +1,151 @@
+---
+title: "Installation, schema and privileges"
+section: Design
+order: 100
+description: "The control file, relocation, and why the extension is not trusted."
+---
+
+`pg_automerge.control` sets:
+
+| Flag | Value | Why |
+|---|---|---|
+| `relocatable` | `true` | `CREATE EXTENSION .. SCHEMA x` and `ALTER EXTENSION pg_automerge SET SCHEMA y` both work (below) |
+| `superuser` | `true` | the functions are `LANGUAGE c` |
+| `trusted` | `false` | a database owner must not be able to install it without a superuser (below) |
+
+## Relocation
+
+`relocatable = true` needs every member object in the extension's one
+schema, and nothing that names that schema or resolves a member by name
+when it runs. What was checked:
+
+- **The install script** names no schema (no `@extschema@`, which
+  Postgres does not substitute for relocatable extensions anyway, and no
+  qualified name). `CREATE EXTENSION` runs it with `search_path` set to the
+  target schema (then `pg_temp`, with `pg_catalog` implicitly first), so
+  every member lands there; `tests/extension.sh` checks that no member
+  (type, array type, composite type, function, aggregate, operator) is
+  anywhere else. Casts have no schema.
+- **Catalog references are OIDs**: the type's I/O functions, the casts'
+  functions, the operators' functions and `COMMUTATOR` (the `||` on two
+  documents is its own commutator), `merge_agg`'s transition and final
+  functions, `merge`'s `SUPPORT` function, the composite types' columns and
+  every `COMMENT`. `ALTER EXTENSION .. SET SCHEMA` changes only the
+  namespace of the members, and each of these follows.
+- **The C code never finds its own objects through `search_path`**: the
+  history functions build rows with their declared result type (looked up
+  by the function's OID); `automerge_notify()` looks the `automerge` type
+  up in the schema of its own function (`tgfoid`), so it finds the
+  `automerge` columns wherever the extension lives and whatever the
+  session's `search_path` holds (tested with a foreign type named
+  `automerge` first on the path); the OID that the Rust types report for
+  `automerge` (`IntoDatum::type_oid`) is looked up in the extension's
+  current schema (`pg_extension.extnamespace`). The last one used to be
+  `regtypein('automerge')`, which resolves through `search_path`; no
+  current code path calls it, but it would have returned a same-named type
+  earlier on the path (a pg_test pins the new behaviour).
+- **Objects that depend on the extension** store parsed expressions with
+  OIDs: column types, domains, views, expression indexes, stored generated
+  columns, check constraints, triggers and SQL functions with a
+  `BEGIN ATOMIC` body. They keep working after a move (their definitions
+  then print the new schema, e.g. `OPERATOR(ext2.||)`), and indexes and
+  generated columns need no rebuild: the functions are the same.
+  `tests/extension.sh` moves the extension under all of these and compares
+  bytes, heads, jsonb and the generated column, uses the indexes, writes
+  through the moved `merge`, runs an in-place PL/pgSQL merge and
+  `automerge_changes`, and checks the trigger's notification.
+- **What a move does break**, as for any relocated extension: everything
+  that resolves names when it runs — application queries, string-bodied
+  SQL and PL/pgSQL functions, `SET search_path` clauses of functions,
+  `ALTER ROLE/DATABASE .. SET search_path`. Unqualified `automerge`,
+  `merge(..)` and the `||` operator are found only through `search_path`
+  (or as `schema.merge`, `OPERATOR(schema.||)`); the casts to `jsonb` and
+  from `bytea` are found without it.
+- **Dump and restore**: `pg_dump` writes `CREATE EXTENSION .. WITH SCHEMA
+  <current schema>` and qualifies every reference, so a moved extension
+  restores into the schema it was moved to (tested with a custom-format
+  dump, which is then moved again).
+- pg_test builds put the tests in a schema `tests` as members of the
+  extension, so `SET SCHEMA` fails there ("not in the extension's
+  schema"); release and dev builds have no such members.
+
+## Why the extension is not trusted
+
+A trusted extension can be installed by any role with `CREATE` on the
+database; its script runs as the bootstrap superuser. The review, per the
+PostgreSQL documentation's "Security Considerations for Extensions":
+
+- **Input amplification: was the blocker, now bounded.** A few bytes of
+  Automerge input can describe a document that takes orders of magnitude
+  more memory and time to load. A compressed save of one 4,000,000-character
+  text is 4 kB (Automerge deflates the columns; about 1,000 characters per
+  byte); the bytea cast validates it (load and save) in 4.3 s (one
+  uninterruptible Automerge call, see
+  [Implementation notes](/design/implementation-notes)) with a peak of 390 MB of
+  backend memory, outside Postgres' memory accounting, and it scales
+  linearly. Automerge allocates with the Rust global allocator, and a
+  failed Rust allocation aborts the process: reproduced with a server
+  limited to 700 MB of address space and a 12 kB input, the backend died
+  with `memory allocation of 768000064 bytes failed` / signal 6, and the
+  postmaster restarted every session of the cluster. The panic guard
+  cannot catch an abort, and an OOM kill does the same. Type input
+  functions are called without an `EXECUTE` check, so `REVOKE` cannot
+  close this: anyone who can write to an `automerge` column can send such
+  input. Every path that takes client bytes (text and binary input, `COPY`,
+  the `bytea` cast, `merge(automerge, bytea)`,
+  `automerge_contains(automerge, bytea)`) and every merge result is now
+  priced from its chunk headers and column metadata before Automerge
+  allocates, and refused over `pg_automerge.max_load_memory` with `53400`
+  (see [Resource limits](/design/resource-limits)); `tests/limits.sh` reproduces
+  the crash in a memory-capped cluster with the limit off and gets clean
+  errors with it on. The setting is `PGC_SUSET`, which Postgres enforces
+  whoever installed the extension, so a database owner could not raise it
+  in a trusted install either.
+- **Why it stays `trusted = false` for now.** The bounds rest on a cost
+  model of Automerge 0.12 made of the worst measured cost of each unit
+  (every generated, crafted and fuzzed input stays at or below 0.81 of the
+  estimate), not on a proof: an input shape the battery does not cover
+  could cost more than estimated, and then a failed allocation still
+  aborts the backend. Memory stays outside Postgres' accounting, every
+  session can use up to the limit at the same time (plus the stored
+  documents a merge loads, which are not priced), and a load still cannot
+  be cancelled (up to about 16 s at the default). Those are acceptable
+  when a superuser decides to install the extension into a database;
+  `trusted = true` would let any database owner decide it. Revisit when
+  the model has had more exposure (and loads can be cancelled).
+
+The rest of the review found nothing that would stop it:
+
+- No `SECURITY DEFINER` function; every function, including the trigger,
+  runs as the calling role (for the trigger: the role doing the write).
+- `automerge_notify()` calls `Async_Notify` directly with its channel
+  argument (checked to be 1 to 63 bytes), so there is no SQL to inject
+  into; the payload is JSON built and escaped in Rust, the table name
+  quoted, the key values rendered by `to_json`'s machinery (the key types'
+  output functions, as the caller). It finds the `automerge` type by OID
+  (above), not through `search_path`.
+- Functions with `internal` arguments (`automerge_recv`,
+  `automerge_merge_support`, `automerge_merge_agg_trans`, `automerge_merge_agg_final`) cannot
+  be called from SQL, and only a superuser can create an aggregate with
+  an `internal` state or attach a `SUPPORT` function, so no other role can
+  hand them a foreign state.
+- The install script creates every object (no `CREATE OR REPLACE`, nothing
+  pre-existing is altered), references only its own objects and
+  `pg_catalog` types, and an object of the same name already in the
+  target schema makes it fail rather than be adopted (`CREATE TYPE
+  automerge` of an existing shell type fails too). In a trusted install
+  the members would belong to the bootstrap superuser, so the installing
+  role could not, for example, add a `WITHOUT FUNCTION` cast from `bytea`
+  that skips validation (that needs ownership of a type).
+- `pg_automerge.verify_writes` and `pg_automerge.max_load_memory` are
+  `PGC_SUSET`, which Postgres enforces whoever installed the extension.
+  Tested for a non-superuser that owns the database (both settings): `SET` before the library is loaded leaves a placeholder
+  that Postgres discards with a WARNING when the library defines the
+  setting; `SET` afterwards, `ALTER ROLE .. SET` and `ALTER DATABASE ..
+  SET` fail with `42501`; `GRANT SET ON PARAMETER` still delegates it.
+- Recursion: the jsonb walk is iterative and stops at a nesting depth of
+  1000 (`json::MAX_DEPTH`); the history functions and the header parser do
+  not recurse. Set-returning functions materialize their rows in Rust
+  memory (for `automerge_changes`, the rebuilt change bytes), bounded by
+  the document's history, which fit the load memory limit when it was
+  written (reads peak at 1.0 to 1.5 times a load).

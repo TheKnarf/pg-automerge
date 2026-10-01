@@ -1,0 +1,166 @@
+---
+title: "Change notifications"
+section: Reference
+order: 50
+description: "The automerge_notify() trigger: payloads, when it fires, and skipping no-op writes."
+---
+
+Backends keep their in-memory replicas in sync by listening for changes
+other backends persisted, then fetching only what they lack:
+
+```sql
+CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
+    FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id' [, more key columns]);
+```
+
+`automerge_notify()` runs `NOTIFY <channel>` (`Async_Notify`, what
+`pg_notify` calls) with a compact JSON payload:
+
+```json
+{"table":"public.docs","op":"UPDATE","seq":17,"key":{"id":1},
+ "columns":{"doc":{"heads":["79df.."],"prev_heads":["891e.."]}}}
+```
+
+- `table`: schema-qualified, each part quoted as needed
+  (`public."Odd Name"`). For a partitioned table this is the partition
+  holding the row (row triggers run on the partitions).
+- `op`: `INSERT`, `UPDATE` or `DELETE`.
+- `seq`: a per-backend counter, incremented for every notification the
+  sending backend's trigger sends (all channels and tables; numbers of
+  rolled-back work are skipped, so there are gaps). It exists to make every
+  payload distinct: `NOTIFY` silently drops a notification whose channel
+  and payload equal an earlier one of the same transaction, which without
+  `seq` would lose events a listener needs, e.g. the second INSERT of
+  INSERT, DELETE, INSERT of the same row in one transaction (the listener
+  would drop a replica of a row that exists), or the third UPDATE of a key
+  changing 1 → 2 → 1 → 2. Within a transaction `seq` increases in firing
+  order. It is not a global order: another backend (or this one after a
+  reconnect, as a new process) counts separately, and the numbers are not
+  comparable across senders. Kept in every truncated form.
+- `key`: the key columns named in the trigger arguments, in that order,
+  each as `to_json(value)` (numbers stay numbers, uuids and text are
+  strings, NULL is `null`); from the new row, or the old row for DELETE.
+  `old_key`: the old row's key, only for an UPDATE that changed it.
+- `columns`: every column of type `automerge` (or a domain over it):
+  INSERT lists all with `heads`, DELETE all with `prev_heads`, UPDATE only
+  those whose heads changed, with both. Heads are sorted hex hashes as in
+  `automerge_heads`; `null` for a NULL value (`[]` is the empty document).
+- `truncated: true`: see below.
+
+When it fires: INSERT and DELETE always notify. An UPDATE notifies only if
+the heads of some `automerge` column changed, or the key did (a listener
+tracks rows by key). No-op merges (`merge` returning the stored value),
+`SET doc = doc`, and updates of other columns do not notify. Change is
+decided by heads, never by bytes: `merge(a, b)` and `merge(b, a)` may
+differ in bytes with the same heads. An unchanged value whose raw datum is
+identical (same inline bytes or same TOAST pointer, e.g. an update of
+another column) is skipped without reading it; otherwise both heads are
+read from a prefix of the stored values as in `automerge_heads` (4 kB,
+only the TOAST chunks covering it), never a full load. An UPDATE that
+changed no heads and whose key columns are raw-identical returns before
+building any JSON.
+
+Delivery is Postgres' `NOTIFY`: sent at commit (nothing for a rolled-back
+transaction), in commit order, only to sessions connected and listening at
+the time; notifications with identical channel and payload within one
+transaction are collapsed, which `seq` prevents for this trigger's
+notifications (so every row event of a committed transaction arrives, in
+the order it fired). Still, a listener must treat notifications as hints:
+
+1. On connect (and reconnect), `LISTEN docs_changed` first, then resync
+   every replica it holds: `SELECT automerge_changes_bytes(doc,
+   $replica_heads) FROM docs WHERE id = $1` and apply the result.
+2. On a notification for a row it holds: if the payload's `heads` are all
+   in its replica already (e.g. it wrote them), skip; otherwise fetch
+   `automerge_changes_bytes(doc, $replica_heads)` for that key. The row
+   may have moved on since the notification; that just returns more.
+   `automerge_changes_bytes` with heads the row already has returns
+   nothing without loading the document, so fetching on every
+   notification (and on `truncated` ones) is cheap when there is nothing
+   new.
+3. DELETE: drop the replica. `old_key`: re-key it. Apply events in the
+   order they arrive; a DELETE later followed by an INSERT of the same key
+   arrives as both.
+
+Payload size: `NOTIFY` rejects payloads of 8000 bytes or more
+(`NOTIFY_PAYLOAD_MAX_LENGTH`); at 67 bytes per hash that is about 115 heads,
+counting `heads` and `prev_heads` of all columns. The trigger
+never fails a write because of that: it renders the full payload, and if
+it has more than 7999 bytes drops, in this order, until it fits: the heads
+(`"columns":{"doc":{}}`, column names kept), the `columns` object, the
+`key`/`old_key`. Any dropped part adds `"truncated":true`; listeners then
+fetch by key (or resync the table when the key is gone too, which needs a
+key of several kB). Tested with a 150-head document.
+
+Argument checks, when the trigger fires (Postgres does not validate
+trigger arguments at `CREATE TRIGGER`): not `AFTER` or not `FOR EACH ROW` →
+`39P01` (trigger protocol violated), and so is calling
+`automerge_notify()` outside a trigger; fewer than two arguments, an empty
+channel or one of 64 bytes or more, a key column listed twice, of type
+`automerge` or a virtual generated column → `22023`; an unknown key column
+→ `42703`. A virtual generated column (PG18) is computed when read and not
+stored, so the rows an AFTER trigger sees hold NULL in it; reporting that
+NULL as the key would leave a listener unable to find the row, so it is
+refused (HINT: name a STORED generated column or the columns it is
+computed from). A STORED generated column is computed before AFTER
+triggers fire and works as a key. Errors about how
+the trigger is declared carry a HINT with the correct `CREATE TRIGGER`
+(an `automerge` key column, a HINT on which columns to name). These
+errors fail the write, as trigger errors do. The channel is used verbatim,
+like `pg_notify`: `LISTEN` folds unquoted names to lower case, so use a
+lower-case channel (or `LISTEN "Name"`). The `automerge` type is looked up
+in the function's own schema, so the trigger does not depend on
+`search_path`.
+
+Labels: `VOLATILE`, not `STRICT`, `PARALLEL UNSAFE` (the defaults; it sends
+notifications and triggers never run in parallel workers).
+
+Why a C (Rust) trigger and not PL/pgSQL: PL/pgSQL would have to find the
+`automerge` columns in the catalog and read each through dynamic SQL
+(`EXECUTE format('SELECT automerge_heads($1.%I)', col) USING NEW`) per row;
+its `to_jsonb(NEW)` would convert every document to jsonb (a full load
+each). The Rust trigger reads the raw datums (so an unchanged TOAST pointer
+costs nothing and heads come from a prefix), builds the payload in
+`pg_automerge_core::notify` (plain Rust, unit-tested including the size
+limit and escaping) and gets the key values' JSON from Postgres' own
+`to_json` machinery (`json_categorize_type` / `datum_to_json`, exported by
+the server though not in pgrx's bindings). It is written like pgrx's
+`#[pg_trigger]` expansion (V1 info record, guarded entry point, SQL in an
+`extension_sql!` block) so that a call outside a trigger is a clean error.
+
+## Skipping no-op writes
+
+A no-op `UPDATE docs SET doc = merge(doc, $1)` still writes a new row
+version (with WAL and index entries unless it is a HOT update; a TOASTed
+document is not rewritten, since `merge` returns the stored TOAST pointer
+unchanged) and fires triggers (`automerge_notify` stays silent, since the
+heads are unchanged).
+To skip it:
+
+```sql
+UPDATE docs SET doc = merge(doc, $1) WHERE id = $2 AND NOT automerge_contains(doc, $1);
+```
+
+`$1` is the same bytea parameter in both places (`automerge_contains(automerge,
+bytea)`; for a full save cast to `automerge` in both). Under concurrency this
+stays correct in READ COMMITTED: the row qualifies against the statement's
+snapshot; if a concurrent transaction updated it, the UPDATE waits for its
+row lock, and once that transaction commits Postgres re-evaluates the whole
+`WHERE` clause (EvalPlanQual) and the `SET` expression against the newly
+committed row version. If that version already contains the changes, the
+row is skipped (UPDATE 0, nothing lost: the changes are there); otherwise
+`merge` applies them to that version. If the row fails the check against
+the snapshot, it is skipped without waiting: history only grows under
+`merge`, so a later version contains the changes too. That argument
+assumes every writer merges; a plain `SET doc = ...` that replaces history
+breaks it (and loses updates anyway). Tested with two blocking sessions in
+`tests/concurrency.sh` (same changes: B updates no row; different changes:
+B merges into A's version). REPEATABLE READ / SERIALIZABLE raise a
+serialization error instead, as for any concurrent update.
+
+UPDATE 0 means "row missing or nothing new"; check the row's existence
+separately if the difference matters. For bare changes the check usually
+needs no load (new changes built on the current heads, and re-sends of the
+latest changes, are decided from the chunk hashes); for a full save it
+loads the stored document, so a real change then costs one more load than
+the plain `merge`.

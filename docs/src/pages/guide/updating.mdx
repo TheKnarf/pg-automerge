@@ -1,0 +1,100 @@
+---
+title: "Updating"
+section: Guide
+order: 70
+description: "Update to a new pg_automerge version (with compose, step by step), a new Postgres minor release or a new major version."
+---
+
+**A new pg_automerge version** (a newer image on the same volume):
+recreate the container from the new image, then in every database that
+has the extension:
+
+```sql
+ALTER EXTENSION pg_automerge UPDATE;   -- as a superuser
+SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge';
+```
+
+The init script does not run on an existing volume, so this step is
+yours (a migration, say). Until you run it the new library serves the old
+SQL definitions, which it keeps supporting (see
+[Versioning and upgrades](/design/versioning)). What changed in
+each version, and whether an update needs more than this (a `REINDEX`,
+say), is in [Changelog](/changelog).
+
+**From 0.2.0 (or 0.1.0) to 0.3.0 with compose** (an app whose
+`compose.yaml` runs this image as a service, called `postgres` below, on
+a named volume; skjera's `postgres` service is one). 0.3.0 adds
+`automerge_memory_usage()` and `automerge_memory_reset()` (see
+[Monitoring](/operations/monitoring)) and fixes a server crash that needed the
+owner to alter the history types (see [Changelog](/changelog));
+from 0.1.0 it also brings 0.2.0's fix of a crash (a document with deeply
+nested blocks restarted the whole server when read as jsonb, e.g.
+through a generated `doc::jsonb` column) and `automerge_spans`. No index
+rebuild and no data rewrite are needed: every earlier result stays the
+same.
+
+Below, `<user>` is the service's `POSTGRES_USER`, the superuser the
+image created on first start (`skjera` for skjera, `postgres` for this
+repository's `compose.yaml`; a cluster has a `postgres` role only if that
+was its `POSTGRES_USER`), and `<db>` a database with the extension (the
+service's `POSTGRES_DB`, `skjera` for skjera, and any other you created
+it in).
+
+1. Optionally, keep a dump: `docker compose exec -T postgres pg_dump -U <user> -Fc <db> >before-0.3.0.dump`.
+2. Build the new image in this repository: `mise run docker-build`
+   (tags `pg-automerge:0.3.0` and `pg-automerge:dev`), or `docker pull`
+   it from your registry if you publish one.
+3. Point the app's service at it: `image: pg-automerge:0.3.0` in its
+   `compose.yaml` (pin the version tag: the images are local, and a
+   rebuilt image moves `:dev`). If the service also has a `build:`
+   section (skjera's builds the image from a checkout of this
+   repository), set its `args: PG_AUTOMERGE_VERSION:` to `0.3.0` too, or
+   remove the section: compose builds when the tag is missing or with
+   `--build`, and the Dockerfile refuses a version other than
+   Cargo.toml's (`versions: PG_AUTOMERGE_VERSION=0.2.0 != 0.3.0
+   (Cargo.toml)`).
+4. `docker compose up -d`: compose recreates the container from the new
+   image on the same volume (the data stays; the init script does not
+   run again). From here on the new library serves every query, even
+   before the next step.
+5. In every database with the extension:
+
+   ```sh
+   docker compose exec postgres psql -U <user> -d <db> -c 'ALTER EXTENSION pg_automerge UPDATE'
+   docker compose exec postgres psql -U <user> -d <db> -Atc "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'"   # 0.3.0
+   ```
+
+   This adds the two memory functions (and, from 0.1.0,
+   `automerge_spans`); nothing else in the catalog changes, and tables,
+   indexes, generated columns, views and `automerge_notify()` triggers
+   are untouched. From 0.1.0 it runs both upgrade scripts in one step,
+   on both kinds of 0.1.0 database: the released one, and one created by
+   an image built from this repository after `automerge_spans` was added
+   but before the 0.2.0 bump (still labelled 0.1.0, with
+   `automerge_spans` already there).
+
+There is no downgrade script: to go back, restore the dump into the old
+image. `mise run docker-upgrade-test` rehearses these steps from 0.1.0 (and,
+with `PG_AUTOMERGE_OLD_VERSION=0.2.0`, from 0.2.0) against
+throwaway containers (the old image from `PG_AUTOMERGE_OLD_IMAGE`, or
+built from the old version's source), with a `POSTGRES_USER` other than
+`postgres` as skjera has: it runs the commands of steps 1 and 5 as
+written here, and builds a service like step 3's (its `build.args`
+updated, and, to show why, not).
+
+**A new Postgres 18 minor release or Debian security fixes**: the base
+image is pinned by digest in `docker/Dockerfile` (`ARG PG_IMAGE`, with how
+to find the current digest next to it). Update the digest, rebuild,
+recreate the container on the same volume. Nothing else to do: minor
+releases keep the data format and the extension ABI. Check for new
+digests regularly; a pinned image does not get security fixes by itself.
+
+**A new Postgres major version** (19, ...): pg_automerge supports only 18
+so far, and an image of it for 19 does not exist yet. When it does, the
+18 volume cannot simply be mounted into it; either dump and restore (the
+`automerge` text form is the dump format and is stable across versions;
+restore with `pg_automerge.max_load_memory=-1` as the
+[Configuration](/reference/configuration) section describes), or run `pg_upgrade`
+with both majors' binaries and pg_automerge built for both (the
+`/var/lib/postgresql` mount lets `pg_upgrade --link` work within one
+volume).

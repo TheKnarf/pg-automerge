@@ -50,7 +50,7 @@ impl From<Error> for PgError {
     /// 54000 for a document an output cannot represent, 53400 for input
     /// over `pg_automerge.max_load_memory`, 0A000 for input in a form the
     /// extension does not take, XX000 for internal errors. See
-    /// docs/DESIGN.md, "Error codes".
+    /// docs/src/pages/reference/error-codes.mdx.
     fn from(err: Error) -> Self {
         let code = match err {
             Error::InvalidInput(_) | Error::MissingDependencies(_) => {

@@ -173,6 +173,10 @@ echo "check_ci: workflow ok"
 # deploy-docs.yml, and never part of the Docker build context.
 docs_job="$(job docs)"
 has "$docs_job" '^        run: mise run docs-check$' || fail "$wf: the docs job must run mise run docs-check"
+# docs-check's coverage check reads the pre-port documents from git.
+for j in ci docs; do
+  has "$(job "$j")" '^          fetch-depth: 0$' || fail "$wf: the $j job must check out the full history (docs-check)"
+done
 has "$docs_job" '^          install_args: node pnpm$' || fail "$wf: the docs job installs only node and pnpm"
 has "$docs_job" 'MISE_TASK_RUN_AUTO_INSTALL: "false"' \
   || fail "$wf: the docs job must not let mise run install the Rust toolchain"
@@ -180,15 +184,33 @@ grep -qE '^  "mise run docs-check",$' mise.toml || fail "mise.toml: mise run ci 
 for t in docs-install docs-dev docs-build docs-check; do
   grep -qxF "[tasks.$t]" mise.toml || fail "mise.toml: no $t task"
 done
-for f in package.json pnpm-lock.yaml ssg.tsx ssg-for-vite.tsx src/ssg-main.tsx src/main.tsx src/routes.tsx scripts/check-site.ts; do
+for f in package.json pnpm-lock.yaml ssg.tsx ssg-for-vite.tsx src/ssg-main.tsx src/main.tsx src/routes.tsx scripts/check-site.ts \
+  scripts/check-coverage.ts scripts/coverage-deviations.json; do
   [ -f "docs/$f" ] || fail "docs/$f missing"
 done
 [ -x docs/ssg.tsx ] || fail "docs/ssg.tsx must be executable (pnpm build runs it)"
 grep -qE '^      - "docs/\*\*"$' "$docs_wf" || fail "$docs_wf: must run on changes to docs/**"
+grep -qE '^      - CHANGELOG\.md$' "$docs_wf" || fail "$docs_wf: must run on changes to CHANGELOG.md (the changelog page)"
 grep -qE '^        run: pnpm --dir docs install --frozen-lockfile$' "$docs_wf" || fail "$docs_wf: install with --frozen-lockfile"
 [ "$(grep -cE '^          DOCS_BASE: /\$\{\{ github\.event\.repository\.name \}\}/$' "$docs_wf")" -eq 2 ] \
   || fail "$docs_wf: build and check-site with DOCS_BASE=/<repo>/"
 grep -qE '^          path: docs/dist$' "$docs_wf" || fail "$docs_wf: upload docs/dist"
 if grep -qE '^!/?docs' .dockerignore; then fail ".dockerignore: keep docs/ out of the Docker build context"; fi
+grep -qF '<Include file="../../../CHANGELOG.md" />' docs/src/pages/changelog.mdx \
+  || fail "docs/src/pages/changelog.mdx: must include CHANGELOG.md (not a copy of it)"
+# The documents live in docs/src/pages now: every page path named anywhere
+# in the repository (code comments, tests, CHANGELOG.md, README.md) exists,
+# and nothing points at the removed design document (only the coverage
+# check, which reads it from git, and docs/Readme.md, which says so, name it).
+while read -r ref; do
+  [ -f "$ref" ] || fail "a reference to $ref, which does not exist: $(git grep -lF "$ref" | tr '\n' ' ')"
+done < <(git grep -ohE 'docs/src/pages/[A-Za-z0-9_./-]+\.mdx' | sort -u)
+stale="$(git grep -lE '(docs/)?DESIGN\.md' -- ':!docs/scripts/check-coverage.ts' ':!docs/scripts/coverage-deviations.json' ':!docs/Readme.md' || true)"
+[ -z "$stale" ] || fail "references to the removed design document (now docs/src/pages): $stale"
+# tests/docker_upgrade.sh runs the compose commands of the Updating page.
+grep -qxF 'UPDATING_PAGE=docs/src/pages/guide/updating.mdx' tests/docker_upgrade.sh \
+  || fail "tests/docker_upgrade.sh must read the Updating page's commands"
+grep -qE '^\*\*From .* to [0-9.]+ with compose\*\*' docs/src/pages/guide/updating.mdx \
+  || fail "docs/src/pages/guide/updating.mdx: no **From ... to <version> with compose** steps"
 
 echo "check_ci: docs ok"

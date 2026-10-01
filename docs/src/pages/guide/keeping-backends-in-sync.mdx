@@ -1,0 +1,54 @@
+---
+title: "Keeping backends in sync"
+section: Guide
+order: 30
+description: "Learn when another backend persisted changes with automerge_notify() and LISTEN, and fetch only what a replica lacks."
+---
+
+Each backend holds replicas of the documents its clients use. To learn
+when another backend persisted changes, attach the notification trigger and
+`LISTEN`:
+
+```sql
+CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
+    FOR EACH ROW EXECUTE FUNCTION automerge_notify('docs_changed', 'id');
+
+LISTEN docs_changed;
+-- payloads look like
+-- {"table":"public.docs","op":"UPDATE","seq":17,"key":{"id":"…"},
+--  "columns":{"doc":{"heads":["79df…"],"prev_heads":["891e…"]}}}
+```
+
+On a notification for a document you hold, skip it if you already have
+every hash in `heads` (you probably wrote them), otherwise fetch exactly
+what your replica lacks and apply it with `loadIncremental` /
+`applyChanges`:
+
+```sql
+SELECT automerge_changes_bytes(doc, $2) FROM docs WHERE id = $1;  -- $2: your replica's heads
+```
+
+Notifications are sent at commit and only to connected listeners, so after
+(re)connecting, `LISTEN` first and then run the same query for every
+document you hold. INSERT and DELETE always notify; an UPDATE notifies only
+when a document's heads (or the key) change, so no-op merges are silent.
+Payloads over NOTIFY's 8000-byte limit (about 115 heads) drop the heads and
+carry `"truncated":true`; then just fetch. `seq` (a per-backend counter)
+keeps payloads distinct, since `NOTIFY` would otherwise collapse identical
+events of one transaction (e.g. INSERT, DELETE, INSERT of one row). Details in
+[Change notifications](/reference/change-notifications).
+
+A no-op merge still rewrites the row. When re-sends are common, skip them:
+
+```sql
+UPDATE docs SET doc = merge(doc, $1) WHERE id = $2 AND NOT automerge_contains(doc, $1);
+```
+
+This is safe with concurrent writers in READ COMMITTED: a writer that had
+to wait for another's row lock re-checks the whole `WHERE` against the
+committed row (EvalPlanQual), so it skips the row if the other writer
+already stored the same changes and merges into the new version otherwise.
+For bare changes (`$1` bytea) the check usually needs no load of the
+document; for a full save it needs none when the save is the stored
+document's own, and costs one extra load of the stored document when there
+is something new.

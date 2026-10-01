@@ -1,11 +1,9 @@
 ---
-title: Quick start
+title: "Quick start"
 section: Guide
-order: 10
-description: Create a table with an automerge column, persist Automerge saves, and query them as jsonb.
+order: 20
+description: "Create a table with an automerge column, persist Automerge saves, and query them as jsonb."
 ---
-
-## Persist and read documents
 
 ```sql
 CREATE TABLE docs (id uuid PRIMARY KEY, doc automerge NOT NULL);
@@ -37,8 +35,6 @@ SELECT seq, actor, time, message FROM docs, automerge_changes_meta(doc) WHERE id
 SELECT automerge_to_jsonb(doc, ARRAY[$2]) FROM docs WHERE id = $1;
 ```
 
-## Indexing reads
-
 Every read through `jsonb` loads the document. For read-heavy tables, keep
 a jsonb copy and index it (the cast is IMMUTABLE):
 
@@ -49,10 +45,8 @@ CREATE INDEX ON docs USING gin (data jsonb_path_ops) WITH (fastupdate = off);
 CREATE INDEX ON docs USING gin ((doc::jsonb)) WITH (fastupdate = off);
 ```
 
-<Callout type="tip">
-  For large documents, generate only the fields you query
-  (`GENERATED ALWAYS AS (doc->>'status') STORED`) rather than a full jsonb
-  copy, which doubles what every write stores.
-</Callout>
-
-Back to the [introduction](/), or up to [persisting documents](#persist-and-read-documents).
+`fastupdate = off` matters for documents that are written often: see
+[GIN indexes](/operations#gin-indexes-on-documents). For large documents, generate
+only the fields you query (`GENERATED ALWAYS AS (doc->>'status') STORED`)
+rather than a full jsonb copy, which doubles what every write stores (see
+[Operations](/operations)).

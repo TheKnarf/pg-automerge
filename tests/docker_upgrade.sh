@@ -2,7 +2,8 @@
 # Upgrade of a real 0.1.0 deployment to the current image (run via `mise
 # run docker-upgrade-test`, which builds the current image first). Not part
 # of `mise run test` or `mise run docker-test`: it needs a 0.1.0 image. See
-# the README's "Upgrading" and docs/DESIGN.md, "Versioning and upgrades".
+# the docs' "Updating" (docs/src/pages/guide/updating.mdx) and "Versioning
+# and upgrades" (docs/src/pages/design/versioning.mdx).
 #
 # What an app on the 0.1.0 image does when it moves to this one:
 #   1. a container of the OLD image on a fresh volume (labelled
@@ -29,12 +30,13 @@
 #      extension's catalog (tests/catalog.sql) is that of a fresh CREATE
 #      EXTENSION in the same container; no server log shows a crash.
 #
-# The README's compose steps (the "From ... to <current> with compose"
+# The compose steps of the docs' Updating page (the "From ... to <current> with compose"
 # section that names 0.1.0) are
 # followed as written: the cluster's superuser is not postgres (POSTGRES_USER
 # is the app's, as in skjera's compose.yml, so there is no postgres role),
 # the pg_dump of step 1 and the psql commands of step 5 are read from the
-# README and run with `docker compose exec [-T] postgres` as `docker exec -i`
+# page's MDX source ($UPDATING_PAGE) and run with `docker compose exec [-T]
+# postgres` as `docker exec -i`
 # on the container and <user>/<db> filled in; and a service like skjera's
 # (image: plus build: with args PG_AUTOMERGE_VERSION) is built with the old
 # version arg (the Dockerfile refuses it) and after step 3's edit (it
@@ -113,23 +115,24 @@ done
 log "  its install script is $known"
 if grep -q automerge_spans "$DWORK/old.sql"; then OLD_HAS_SPANS=f; else OLD_HAS_SPANS=t; fi
 
-# The README's compose steps, as shell commands: [0] the pg_dump of step 1,
+# The Updating page's compose steps, as shell commands: [0] the pg_dump of step 1,
 # [1] the ALTER EXTENSION and [2] the version check of step 5.
-section="$(sed -n "/^\*\*From .*$OLD_VERSION.* to $VERSION with compose\*\*/,/^There is no downgrade script/p" README.md)"
-[[ -n "$section" ]] || fail "README.md has no section \"From ... $OLD_VERSION ... to $VERSION with compose\""
-mapfile -t README_CMDS < <(grep -o 'docker compose exec [^`]*' <<<"$section")
-expect "README compose commands" 3 "${#README_CMDS[@]}"
-# readme_cmd NAME I: run README_CMDS[I] against container NAME, in DWORK.
-readme_cmd() {
-    local cmd="${README_CMDS[$2]}"
-    [[ "$cmd" =~ ^docker\ compose\ exec\ (-T\ )?postgres\  ]] || fail "README command not of the form 'docker compose exec [-T] postgres ...': $cmd"
+UPDATING_PAGE=docs/src/pages/guide/updating.mdx
+section="$(sed -n "/^\*\*From .*$OLD_VERSION.* to $VERSION with compose\*\*/,/^There is no downgrade script/p" "$UPDATING_PAGE")"
+[[ -n "$section" ]] || fail "$UPDATING_PAGE has no section \"From ... $OLD_VERSION ... to $VERSION with compose\""
+mapfile -t STEP_CMDS < <(grep -o 'docker compose exec [^`]*' <<<"$section")
+expect "Updating page compose commands" 3 "${#STEP_CMDS[@]}"
+# step_cmd NAME I: run STEP_CMDS[I] against container NAME, in DWORK.
+step_cmd() {
+    local cmd="${STEP_CMDS[$2]}"
+    [[ "$cmd" =~ ^docker\ compose\ exec\ (-T\ )?postgres\  ]] || fail "Updating page command not of the form 'docker compose exec [-T] postgres ...': $cmd"
     cmd="docker exec -i $(cname "$1") ${cmd#"${BASH_REMATCH[0]}"}"
     cmd="${cmd//<user>/$PG_USER}"; cmd="${cmd//<db>/app}"
-    [[ "$cmd" != *'<'*'>'* ]] || fail "README command with an unknown placeholder: $cmd"
+    [[ "$cmd" != *'<'*'>'* ]] || fail "Updating page command with an unknown placeholder: $cmd"
     (cd "$DWORK" && eval "$cmd")
 }
 
-log "README step 3: a service with image: and build: args, like skjera's"
+log "Updating step 3: a service with image: and build: args, like skjera's"
 step3_tag="pg-automerge-test-step3-$$:$VERSION"
 cat >"$DWORK/step3.yml" <<YAML
 services:
@@ -182,11 +185,11 @@ FINGERPRINT="SELECT string_agg(d.id || ':' || md5(d.doc::bytea) || ':' || autome
 SELECT string_agg(id || ':' || md5(a::bytea) || ':' || coalesce(md5((a || b)::jsonb::text), '-'), ',' ORDER BY id) FROM pairs;"
 before="$(psql_in old app -c "$FINGERPRINT")"
 [[ -n "$before" ]] || fail "old: no fingerprint"
-log "README step 1: the dump, as $PG_USER"
-readme_cmd old 0
-[[ -s "$DWORK/before-$VERSION.dump" ]] || fail "README step 1 wrote no before-$VERSION.dump"
+log "Updating step 1: the dump, as $PG_USER"
+step_cmd old 0
+[[ -s "$DWORK/before-$VERSION.dump" ]] || fail "Updating step 1 wrote no before-$VERSION.dump"
 docker exec -i "$(cname old)" pg_restore --list <"$DWORK/before-$VERSION.dump" | grep -q 'EXTENSION - pg_automerge' \
-    || fail "the dump of README step 1 has no pg_automerge"
+    || fail "the dump of Updating step 1 has no pg_automerge"
 check_log old
 docker stop -t 30 "$(cname old)" >/dev/null
 docker rm "$(cname old)" >/dev/null
@@ -203,15 +206,15 @@ expect "new, before UPDATE: documents" "$before" "$(psql_in new app -c "$FINGERP
 # generated column (the released 0.1.0 library crashes here).
 psql_in new app -v deep="$DEEP_BLOCK" <<<"INSERT INTO docs VALUES (6, :'deep');"
 
-log "README step 5: ALTER EXTENSION pg_automerge UPDATE, as $PG_USER"
-# What the README's commands used to hardcode fails here, as in skjera's
+log "Updating step 5: ALTER EXTENSION pg_automerge UPDATE, as $PG_USER"
+# What the Updating page's commands used to hardcode fails here, as in skjera's
 # cluster.
 if out="$(docker exec "$C" psql -X -U postgres -d app -c 'SELECT 1' 2>&1)"; then
-    fail "the cluster has a postgres role: the README's commands are not tested with another superuser"
+    fail "the cluster has a postgres role: the Updating page's commands are not tested with another superuser"
 fi
 grep -q 'role "postgres" does not exist' <<<"$out" || fail "psql -U postgres: $out"
-readme_cmd new 1 >/dev/null
-expect "version after UPDATE (README step 5)" "$VERSION" "$(readme_cmd new 2)"
+step_cmd new 1 >/dev/null
+expect "version after UPDATE (Updating step 5)" "$VERSION" "$(step_cmd new 2)"
 expect "documents after UPDATE" "$before" "$(psql_in new app -c "$FINGERPRINT")"
 
 out="$(psql_in new app <<'SQL'

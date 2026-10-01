@@ -1,5 +1,5 @@
 //! Per-process counters of documents, behind `automerge_memory_usage()`
-//! (see docs/DESIGN.md, "Memory observability"): how many loaded
+//! (see docs/src/pages/design/memory-observability.mdx): how many loaded
 //! documents are alive, and how many loads ran and how long they took.
 //!
 //! The bytes those documents take are counted by the extension's global

@@ -1,0 +1,113 @@
+---
+title: "Testing, CI and publishing the image"
+section: Operations
+order: 40
+description: "mise run docker-test, the docker CI job, and pushing tested images to a registry."
+---
+
+## Testing the image
+
+`mise run docker-test` runs everything against throwaway containers of the
+image (labelled `pg-automerge-test`, removed afterwards with their
+volumes): the init script and its variable, SQL through the container's
+own `psql` (casts, merges, jsonb operators with a GIN expression index
+and a generated column, the history functions, a real `LISTEN` session
+for `automerge_notify()`, the settings and their privileges),
+`pg_dump -Fc` in one container restored into a second, a restart on the
+same volume, the regress examples and the concurrency, notify, dump,
+extension and memory suites, the load memory limit against a container started with
+`--memory=1g`, a 60-second smoke run of the soak test (see
+[Operations](/operations); `mise run soak` is the full hour), and that
+no server log shows an assertion failure, panic or crashed backend. The suites need Postgres 18 client tools and cargo:
+those of the pgrx Postgres by default (`mise run pgrx-init`), or PGDG's
+`postgresql-client-18` with
+`PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config` (what CI uses; the soak
+run also needs its `pgbench` and `python3`); `DOCKER_TEST_SUITES=0`
+skips them. It also checks the release scripts:
+`scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
+
+`mise run docker-upgrade-test` (not part of `docker-test`) upgrades a
+0.1.0 deployment to the current version the way the [Updating](/guide/updating)
+section describes: a
+container of the 0.1.0 image (`PG_AUTOMERGE_OLD_IMAGE=<tag or image ID>`,
+or by default built from the 0.1.0 source in the git history) with
+tables, a generated `doc::jsonb` column, GIN and B-tree expression
+indexes, a view, an `automerge_notify()` trigger and documents; then the
+new image on the same volume, `ALTER EXTENSION pg_automerge UPDATE`, and
+checks of the data, indexes, trigger, `automerge_spans`, the memory
+counters and the catalog against a fresh install.
+
+The multi-session suites run against any server of yours, too (it needs
+the extension available, a superuser, and room for scratch databases):
+
+```sh
+PG_AUTOMERGE_TEST_HOST=127.0.0.1 PG_AUTOMERGE_TEST_PORT=5432 \
+PG_AUTOMERGE_TEST_USER=postgres PG_AUTOMERGE_TEST_PASSWORD=... \
+  bash tests/concurrency.sh   # or notify.sh, dump.sh, extension.sh, memory.sh, bench_sql.sh
+```
+
+`mise run docker-bench-sql` times the everyday SQL paths against the
+image; see [Performance](/operations/performance) for how it compares.
+
+## CI
+
+`.github/workflows/ci.yml` has a `docker` job next to the `ci` job, on
+every push and pull request: it builds the image with BuildKit, caching
+its layers in the GitHub Actions cache (so the Rust toolchain and
+cargo-pgrx are built once, not on every run), and runs `tests/docker.sh`
+in full against it, with PGDG's client tools. It does not need pgrx.
+
+On a `v*` tag (which must equal the `Cargo.toml` version) the job runs
+twice, on an amd64 and on GitHub's native arm64 runner
+(`ubuntu-24.04-arm`), each building and testing its own image, and
+uploads each as a workflow artifact
+(`pg-automerge-<version>-linux-<arch>.tar.gz`, under Actions > the run >
+Artifacts). To use one:
+
+```sh
+docker load -i pg-automerge-0.2.0-linux-arm64.tar.gz   # loads pg-automerge:0.2.0
+```
+
+`docker load` moves your local `pg-automerge:0.2.0` tag to the loaded
+image, so loading the other architecture's archive leaves that tag on an
+image your host cannot run (`exec format error`) until you
+`mise run docker-build` again. `scripts/docker-push.sh` (below) loads
+archives too, but puts the tags back as they were.
+
+The arm64 image is built and tested natively, without QEMU or
+cross-compilation ([why](/design/docker-image#docker-image-in-ci)). Where the
+arm64 runner is not available (it depends on the repository's plan and
+visibility), set the repository variable `PG_AUTOMERGE_ARM64` to `false`:
+tags then build amd64 only.
+
+## Publishing the image
+
+The workflow's `publish` job pushes a tag's tested images to a registry of
+yours as one multi-architecture image, `<image>:<version>` and
+`<image>:latest` (plus the per-architecture `<image>:<version>-amd64` and
+`-arm64` it is made of). It is prepared but off: without the secret
+below it only logs a notice. To turn it on, in the repository's Settings >
+Secrets and variables > Actions:
+
+| Kind | Name | Value |
+|---|---|---|
+| Variable | `PG_AUTOMERGE_REGISTRY_IMAGE` | the image, registry host first, lower case: `ghcr.io/you/pg-automerge`, `docker.io/you/pg-automerge`, ... |
+| Variable | `PG_AUTOMERGE_REGISTRY_USERNAME` | the registry user |
+| Secret | `PG_AUTOMERGE_REGISTRY_TOKEN` | a token that may push to that image only (for ghcr.io a personal access token with `write:packages`; for Docker Hub an access token with Read & Write) |
+
+It runs only for tags, only after both the `ci` and the `docker` jobs
+passed, and pushes exactly the archives those jobs tested
+(`scripts/docker-push.sh`, which checks each one's version and
+architecture first). Nothing else in the workflow logs in to a registry or
+pushes, and its token is read-only (`contents: read`); `tests/check_ci.sh`
+fails if that changes. To require an approval for every push, move the
+secret into a GitHub environment with required reviewers and add
+`environment: <name>` to the job. By hand, the same script pushes archives
+you built yourself:
+
+```sh
+bash scripts/docker-archive.sh                     # pg-automerge-0.2.0-linux-amd64.tar.gz
+docker login ghcr.io
+bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.2.0-linux-*.tar.gz  # prints the image IDs and the pushes
+bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.2.0-linux-*.tar.gz
+```

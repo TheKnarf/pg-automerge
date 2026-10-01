@@ -6,9 +6,10 @@ import rehypeAutolinkHeadings from "rehype-autolink-headings";
 import rehypeSlug from "rehype-slug";
 import remarkFrontmatter from "remark-frontmatter";
 import remarkGfm from "remark-gfm";
-import remarkMdxFrontmatter from "remark-mdx-frontmatter";
-import { defineConfig } from "vite";
-import rehypeExportToc from "./plugins/rehype-export-toc.ts";
+import type { PluggableList } from "unified";
+import { defineConfig, type Plugin } from "vite";
+import { pageMetaPlugin } from "./plugins/page-meta.ts";
+import remarkInclude, { includedFiles } from "./plugins/remark-include.ts";
 
 // Languages highlighted at build time (shiki runs only in the MDX compile,
 // never in the browser). A fence with any other language fails the build.
@@ -32,6 +33,27 @@ const cargoToml = readFileSync(
 );
 const version = /^version = "([^"]+)"/m.exec(cargoToml)?.[1];
 if (!version) throw new Error("no version in ../Cargo.toml");
+
+// Shared by the MDX compile and the page-meta pipeline (plugins/page-meta.ts),
+// so a page's table of contents has the ids its headings get.
+const remarkPlugins: PluggableList = [
+	remarkFrontmatter,
+	remarkGfm,
+	remarkInclude,
+];
+const slugPlugins: PluggableList = [rehypeSlug];
+
+// Files spliced into pages with <Include> are not modules; reload the
+// pages when one changes (dev server).
+const reloadIncluded: Plugin = {
+	name: "reload-included",
+	handleHotUpdate({ file, server }) {
+		if (!includedFiles.has(file)) return;
+		server.moduleGraph.invalidateAll();
+		server.ws.send({ type: "full-reload" });
+		return [];
+	},
+};
 
 export default defineConfig(() => ({
 	root: "src",
@@ -72,14 +94,9 @@ export default defineConfig(() => ({
 				// "development" under vite-node (ssg.tsx) even for production
 				// builds; React's production jsx-dev-runtime has no jsxDEV.
 				development: process.env.NODE_ENV !== "production",
-				remarkPlugins: [
-					remarkFrontmatter,
-					[remarkMdxFrontmatter, { name: "frontmatter" }],
-					remarkGfm,
-				],
+				remarkPlugins,
 				rehypePlugins: [
-					rehypeSlug,
-					rehypeExportToc,
+					...slugPlugins,
 					[
 						rehypeAutolinkHeadings,
 						{
@@ -104,6 +121,8 @@ export default defineConfig(() => ({
 				],
 			}),
 		},
+		pageMetaPlugin({ remarkPlugins, rehypePlugins: slugPlugins }),
+		reloadIncluded,
 		react({ include: /\.(mdx|tsx?)$/ }),
 	],
 }));

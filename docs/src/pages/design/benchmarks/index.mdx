@@ -1,0 +1,29 @@
+---
+title: "Appendix: benchmarks"
+section: Design
+order: 140
+description: "Benchmarks recorded during development, with the expanded values measurements of 2026-09-28."
+---
+
+Recorded 2026-09-28 with `mise run bench-expanded` (release build, warm
+cache, mean of two runs, milliseconds), before and after expanded values
+were introduced (commit 6a5f40f). "Before" is the flat path: every merge
+result saved, and loaded again by the next operation.
+
+| Workload | 3.0 MB before | after | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|---|---|
+| `UPDATE .. SET doc = merge(doc, c1)` | 5435 | 5452 | 388 | 379 | 43 | 42 |
+| `automerge_heads(merge(doc, c1))` | 5258 | 2642 | 358 | 180 | 40 | 23 |
+| `merge(doc, c1)::jsonb->>'status'` | 8141 | 2895 | 784 | 448 | 81 | 48 |
+| `automerge_heads(merge(merge(merge(doc, c1), c2), c3))` | 15758 | 2645 | 1034 | 187 | 112 | 24 |
+| PL/pgSQL `d := merge(d, c)`, 20 change sets | 105772 | 2697 | 6852 | 217 | 691 | 31 |
+| the same, each merge in a `BEGIN .. EXCEPTION` block | 105827 | 2693 | 6868 | 229 | 686 | 30 |
+| the same, then `UPDATE .. SET doc = d` | 106136 | 5584 | 6890 | 425 | 699 | 52 |
+| 2 merges into `d`, then 10 reads `d->>'status'` | 38960 | 5154 | 4987 | 2805 | 494 | 271 |
+| `merge_agg(doc)::jsonb` over 9 versions | 26488 | 24111 | 2006 | 1759 | 210 | 179 |
+
+Heads fast path, recorded the same day on the 3 MB document (before: a
+full load for every call): `automerge_heads` 2745 ms → 0.3 ms;
+`automerge_contains(doc, ''::bytea::automerge)` 2738 ms → 0.5 ms;
+`merge(doc, ''::bytea::automerge)` 2743 ms → 16 ms; `merge` of the document
+with a newer version of it 5.3 s → 2.6 s.

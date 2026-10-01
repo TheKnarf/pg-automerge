@@ -1,0 +1,346 @@
+---
+title: "Benchmarks, 2026-09-29"
+section: Design
+order: 142
+description: "Benchmarks recorded on 2026-09-29."
+---
+
+## jsonb built in Rust memory (2026-09-29)
+
+`JsonbBuilder` assembles the `JsonbValue` tree itself instead of feeding
+every event to `pushJsonbValue` (see [jsonb mapping](/reference/jsonb-mapping)); the
+jsonb bytes are unchanged. `mise run bench-sql`, release build, median of
+seven runs, milliseconds, before and after in one session:
+
+| Path | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|
+| R1 `doc->>'status'` | 313 | 265 | 31 | 27 |
+| R2 three accessors in one `SELECT` | 911 | 810 | 91 | 80 |
+
+On the 3 MB text (one string) the build was never the cost: 2812 → 2787
+ms for R1 (median of five), within noise. Writes do not build jsonb and
+are unchanged. After the change a profile of R1 on the 877 kB list puts
+about 47% in the load, 15% in Automerge's document iterator, 4% in the
+walk's own bookkeeping and about 7% in building the jsonb
+(`JsonbValueToJsonb` 2.4%, `int64_to_numeric` 1%), against about 15% for
+the `pushJsonbValue` path before.
+
+## `merge_agg` loads lazily (2026-09-29)
+
+`merge_agg` used to load its first input right away and merge every later
+input that its document lacked into it. Its state now keeps the first
+stored input as bytes, loads the larger of two inputs first when the heads
+cannot decide, and lets a loaded input that contains the whole state
+replace it (see [Merging](/reference/merging)). It also skips inputs it already has
+by a prefix of their heads, before detoasting them. `mise run bench-sql`,
+release build, median of five runs, milliseconds:
+
+| Path | loads before → after | 877 kB before | after | 3.0 MB before | after |
+|---|---|---|---|---|---|
+| A1 `merge_agg` over one row | 1 → 0 | 170 | 8.5 | 2559 | 22 |
+| A2 `merge_agg` over the row and a newer version | 2 → 1 | 335 | 176 | 5061 | 2533 |
+
+A1 is now the detoast of the value and a copy of it into the result. In
+A2 the newer version is loaded, contains the older one and is the result
+as stored: no merge and no save. The other paths are unchanged. A
+profile of R1 on the 877 kB list puts about 77% of the time in Automerge
+and another 11% in glibc's `malloc`/`free`, mostly for Automerge's
+allocations; linking mimalloc as the Rust global allocator instead was
+tried with the core benchmark and rejected (the 877 kB load about 5%
+faster, the 3 MB text load about 6% slower).
+
+## One-sweep walk without per-object vectors and hashing (2026-09-29)
+
+The sweep's bookkeeping (a `Vec` of entries per object and a SipHash
+`HashMap` from object id to content, about a third of the walk on the
+877 kB list) became one entry vector and a sorted id index searched by
+bisection (see [jsonb mapping](/reference/jsonb-mapping)); the events are
+unchanged. `mise run bench-core`, release build, median of three,
+milliseconds: jsonb walk (no-op sink) 74.3 → 64.3 on the 877 kB list,
+6.6 → 5.7 on the 83 kB list, 250 → 250 on the 3 MB text (one object).
+`mise run bench-sql`, median of seven, two before/after pairs in one
+session:
+
+| Path | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|
+| R1 `doc->>'status'` | 268, 268 | 257, 261 | 28, 26 | 26, 25 |
+| R2 three accessors in one `SELECT` | 807, 809 | 782, 777 | 80, 77 | 76, 80 |
+
+## Containment decided by change counts (2026-09-29)
+
+`automerge_contains` loaded the stored document to answer `false` for a
+newer or concurrent version, as a stored value or as a save in a `bytea`
+(one load, 164-167 ms on the 877 kB list, 2.5 s on the 3 MB text). When
+the heads do not decide, it now compares change counts read from a
+prefix of each value (or a save's header): a version with at least as
+many changes as `a` and other heads is not in `a` (see
+[Reading](/reference/reading)). Older versions still cost one load (true needs the
+history). `mise run bench-sql`, release build, median of five, ms:
+
+| Case | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|
+| C1 `automerge_contains(doc, newer save bytea)` | 167 | 1.2 | 2568 | 9.0 |
+| C2 `automerge_contains(doc, newer stored version)` | 164 | 1.2 | 2549 | 1.1 |
+
+C1 on the 3 MB text is the save's checksum (a SHA-256 over 3 MB) and the
+parameter's detoast. No other path changed.
+
+## Header no-ops check that the save parses (2026-09-29)
+
+A save whose header lists heads the document already has was a no-op
+after only its framing and checksum were checked, so `merge(doc, bytea)`
+and `automerge_contains(doc, bytea)` accepted a checksummed chunk with
+known heads and a malformed body, which a load of `doc ++ bytes` (and so
+the earlier `merge`) rejects with `22P02`. The header answers that say
+"contained" now first run `header::document_parses` (see
+[Merging](/reference/merging), case 1), which inflates any deflated columns.
+Answers of "not contained" and paths that load the save are unchanged.
+Release build, median of seven, ms:
+
+| Case | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|
+| `merge(doc, own compressed save)` (no-op) | 1.2 | 2.9 | 8.9 | 32 |
+| `automerge_contains(doc, own compressed save)` | 1.1 | 3.1 | 8.9 | 31 |
+| `merge(doc, doc::bytea)` (uncompressed, no-op) | 5.8 | 5.8 | 15.6 | 14.1 |
+| W2 `merge(doc, newer save)` | 206 | 214 | 2787 | 2767 |
+| C1 `automerge_contains(doc, newer save)` | 1.2 | 1.3 | 9.6 | 9.0 |
+
+The added time is the inflation of the save's columns; loading the save
+instead would cost 200 ms / 2.8 s.
+
+## Input amplification measurements (2026-09-29)
+
+What a load of client bytes costs, measured to design the size limits
+(release build; peak bytes allocated through the Rust global allocator,
+counted by a counting allocator in a scratch harness; "doc" is
+`Automerge::load` of a document chunk, "chunks" is the same history
+loaded as bare change chunks, as `merge(doc, bytea)` applies them).
+
+Small inputs that describe a lot. Automerge's columns are run-length
+encoded, so a run of `n` identical (or equally spaced) values costs a
+few bytes whatever `n` is, before any deflate:
+
+| Input | Bytes | Describes | Peak | Time |
+|---|---|---|---|---|
+| one change chunk, loads fine (a list of nulls) | 104 | 1,000,001 ops | 561 MB | 3.4 s |
+| save of a list of 400,000 nulls (`save_nocompress`) | 174 | 400,001 ops | 36 MB doc, 231 MB chunks | 0.4 s, 1.6 s |
+| save of 200,000 one-op changes | 196 | 200,000 changes | 194 MB | 1.3 s |
+| compressed save of a 1,000,000-character repetitive text | 1,165 | 1,000,001 ops | 93 MB | 1.0 s |
+| crafted document chunk: 1,000 changes with 10,000 deps each | 66 | 10^7 deps | 1.41 GB | 3.4 s, then rejected |
+| crafted document chunk: one op with 10^6 successors | 134 | 10^6 succ entries | 328 MB | 3.7 s, then rejected |
+| crafted document chunk: 100,000 empty changes | 71 | 100,000 changes | 128 MB | 0.3 s, then rejected |
+| crafted change: 2 ops, one with 10^6 preds | 71 | 10^6 preds | 50 MB | 0.2 s |
+| crafted document chunk: `max_op` 10^8, 3 ops | 115 | nothing | 14 kB | - |
+
+So neither the stored size (174 bytes for any number of nulls), nor the
+inflated size, nor a declared `max_op` bounds memory. The crafted
+documents fail only after reconstruction ("mismatching heads"), with the
+memory already spent. Memory is linear in each of these quantities
+(checked at 10^7 ops: 910 MB and 11.3 s as a document, 6.5 GB and 49 s
+as change chunks), with these costs per unit (peak bytes):
+
+| Unit (readable from headers) | doc | chunks |
+|---|---|---|
+| op, appended in counter order (text typed or pasted, list append) | 89-91 | 530-650 |
+| op out of counter order, object creation, distinct map key, mark | 280-372 | 550-810 |
+| change | 900-1,275 | 1,400-2,300 |
+| dependency entry | 141 | - |
+| successor entry (text deletes: one per element) | 13 | - |
+| successor entries pending on one key (put/delete toggling, crafted) | 328-590 | - |
+| pred entry | - | 50 |
+| inflated byte (string, bytes values) | 5-7 | 7 |
+| change × actor (Automerge's clock cache every 16 changes) | 0.25-0.3 | 0.25-0.3 |
+| change with more than ~16 ops × actor (reconstruction) | 3 | - |
+
+Most of a load's peak is transient: after loading, a 1,000,000-character
+text holds 1 MB (the op set is columnar); the peak comes from rebuilding
+every change. Reads of a stored value stay within 1.0-1.5 times its
+load's peak (`automerge_changes`, `automerge_changes_meta`, the jsonb
+walk into a `serde_json::Value`), and a merge of two concurrent
+1,000,000-character documents peaks at 566 MB, almost all of it applying
+the other document's changes (the chunks cost). Time follows memory: at
+most about 8 s per GB of the estimate below on the test machine.
+
+A linear estimate over these quantities with the worst measured cost of
+each (450 bytes per op, 1,600 per change and an encoder term, 200 per
+dependency, 30 per successor plus 600 per successor pending on one
+(object, key) group, 200 per actor, 10 per inflated byte, 0.3 per change
+× actor and 3 per large change × actor; for change chunks 1,000 per op,
+80 per pred, 2,500 per change) stays above the measured peak for every
+generated and crafted input tried: actual/estimate is at most 0.80 (ops
+prepended to a list of maps), about 0.2 for appended text and lists, and
+0.1 for a key overwritten 200,000 times in one change. Allocation
+failure itself cannot be turned into an ERROR: `std::alloc::
+set_alloc_error_hook` is unstable in Rust 1.98, a `#[global_allocator]`
+must not unwind, and allocating with `palloc` would `longjmp` through
+Automerge's frames.
+
+## Load memory limit (2026-09-29)
+
+`pg_automerge.max_load_memory` (see [Resource limits](/design/resource-limits)),
+implemented from the measurements of the previous entry.
+
+Measured peaks against the estimate (`tests/memory_bounds.rs`, dev build
+with optimized dependencies, counting allocator; peak / estimate):
+
+| Input | save | compressed | change chunks |
+|---|---|---|---|
+| 200,000 characters of text | 0.20 | 0.20 | 0.57 |
+| 3,000 typed characters (3,000 changes) | 0.40 | 0.40 | 0.41 |
+| 50,000 characters deleted | 0.21 | 0.21 | 0.39 |
+| 40,000 ints prepended to a list | 0.69 | 0.71 | 0.63 |
+| 20,000 maps prepended to a list | 0.80 | 0.80 | 0.67 |
+| 40,000 map keys | 0.62 | 0.67 | 0.54 |
+| one key overwritten 40,000 times | 0.10 | 0.10 | 0.45 |
+| one key set and deleted 20,000 times | 0.55 | 0.56 | 0.34 |
+| 5,000 one-op changes | 0.33 | 0.33 | 0.46 |
+| 1,000 actors / 1,000 conflicting forks | 0.30 / 0.38 | 0.31 / 0.41 | 0.43 / 0.43 |
+| 400 actors, then 400 changes of 16 ops | 0.32 | 0.32 | 0.41 |
+| 6,000 characters with 2,000 marks | 0.39 | 0.42 | 0.67 |
+| 1 MB of bytes | 0.49 | 0.71 | 0.69 |
+
+Crafted chunks (bytes, peak / estimate): a document chunk of 20,000 empty
+changes (77 bytes) 0.71, of 1,000 changes with 1,000 dependencies each (70
+bytes) 0.68, of one op with 200,000 successors (136 bytes) 0.48, of a
+200,000-item list (141 bytes) 0.17; a change chunk of 100,000 ops (104
+bytes) 0.58, of one op with 1,000,000 preds (71 bytes) 0.08 (priced as the
+document it normalizes to, where the preds become successors on one key);
+a save followed by 2,000 change chunks 0.34. Change chunks whose header
+lists repeat entries (added after review, which found the first version
+priced other actors by name: a 200 kB input estimated just under 2 GB
+aborted a scratch cluster capped at 4 GB): 1,100,000 or 2,200,000 empty
+other actors, plain or compressed (1-2 kB), 0.64, 1,100,000 copies of one
+16-byte actor 0.32, 1,100,000 copies of one dependency (compressed, 34 kB)
+0.36; in release they take 1.3 s per GB of the estimate, the battery's
+worst being 5.5 s per GB (change chunks of 1,000 actors). Merges of two concurrent
+documents (both loaded, the other's changes applied): 0.21 to 0.38 of the
+two loads plus the apply estimate. Refused inputs peak below 64 kB for the
+run-length bombs (100 to 221 bytes describing 10^8 to 2^62 rows) and below
+a quarter of the limit for deflate bombs (256 MB of zeros, stopped at a
+tenth of a 100 MB limit). A 200,000-input release fuzz session (the
+properties of [Testing](/design/testing)) found no violation.
+
+`tests/limits.sh`: under `ulimit -v 1000000`, with the limit off, the
+12 kB compressed save of a 12,000,000-character text and a 113-byte change
+chunk describing 20,000,000 ops each abort the backend (`memory allocation
+of 1543503872 bytes failed`, signal 6) and the cluster restarts; with the
+default limit both are refused with `53400` through every path and nothing
+restarts. 32 s, most of it generating the text.
+
+Cost (release build, median; before is the previous commit, two runs
+each). `mise run bench-core`, ms:
+
+| | before | after |
+|---|---|---|
+| normalize, 3 MB text stored / compressed | 2498 / 2526 | 2495 / 2567 |
+| normalize, 877 kB list stored / compressed | 161 / 166 | 166 / 172 |
+| normalize, 83 kB list stored / compressed | 16.0 / 16.6 | 16.1 / 17.4 |
+| the scan alone, 877 kB list stored / compressed | - | 1.7 / 3.7 |
+| the scan alone, 3 MB text stored / compressed | - | 0.0 / 21.6 |
+
+`mise run bench-sql` (`BENCH_REPS=5`, ms; before: the mean of two runs):
+
+| case | 83 kB before | after | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|---|---|
+| R1 read (unchanged code) | 25 | 26 | 261 | 265 | 2789 | 2780 |
+| R2 three reads (unchanged code) | 77 | 78 | 781 | 806 | 8362 | 8333 |
+| I1 insert of a compressed save | 21 | 22 | 205 | 210 | 2756 | 2752 |
+| W1 merge(doc, changes) | 38 | 38 | 364 | 368 | 5204 | 5223 |
+| W2 merge(doc, newer save) | 22 | 23 | 209 | 211 | 2771 | 2791 |
+| W3 merge(doc, save::automerge) | 22 | 24 | 206 | 214 | 2765 | 2793 |
+| W4 upsert | 41 | 39 | 369 | 382 | 5283 | 5318 |
+| W6 W3 as a text parameter | 39 | 39 | 374 | 383 | 5312 | 5382 |
+| A2 merge_agg of two versions | 18 | 18 | 172 | 176 | 2547 | 2532 |
+| R3, W5, A1, C1, C2 (no load) | unchanged | | | | | |
+
+The differences are of the size of the drift of the read-only cases R1
+and R2, whose code did not change (up to 3%). The first version of the
+scan decoded every value and computed Gmax exactly for every document,
+10.7 ms on the 877 kB list (+6% on its writes); counting literal runs
+without decoding them and taking Gmax at its bound unless that decides a
+refusal brought it to 1.7 ms.
+
+Remeasured at the final verification, interleaved (the 72e8d57 build,
+then this one, three pairs of `mise run bench-sql` runs, 5 to 9
+repetitions each; mean of the medians, ms), the write cost is above the
+drift after all on the smaller documents, while the read-only R1 stays
+within 0.5%:
+
+| case | 83 kB before | after | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|---|---|
+| R1 read (unchanged code) | 26.0 | 26.0 | 260 | 261 | 2781 | 2765 |
+| I1 insert of a compressed save | 21.3 | 23.0 (+8%) | 201 | 213 (+6%) | 2754 | 2765 (+0.4%) |
+| W1 merge(doc, changes) | 37.7 | 41.0 (+9%) | 360 | 374 (+4%) | 5196 | 5219 (+0.4%) |
+| W2 merge(doc, newer save) | 22.3 | 23.7 (+6%) | 208 | 215 (+4%) | 2788 | 2790 (+0.1%) |
+| W3 merge(doc, save::automerge) | 22.0 | 23.0 (+5%) | 205 | 215 (+5%) | 2770 | 2802 (+1.2%) |
+| W6 W3 as a text parameter | 38.3 | 40.3 (+5%) | 373 | 390 (+5%) | 5345 | 5363 (+0.3%) |
+
+(3 MB: one pair.) `bench-core`, two pairs: normalize of the 877 kB list
+161.9 → 164.6 ms stored, 167.7 → 175.6 ms compressed (+5%), of the 3 MB
+text within 1%. So the price of the limit is about 4-6% on writes of
+list-shaped documents of 0.1-1 MB (1-2 ms at 83 kB, 7-15 ms at 877 kB,
+of which the scans of a compressed input and of its normalized result
+account for 5.4 ms; the rest was not attributed), and about 1% on a
+large text, whose columns are few long runs. Recovered in the next
+entry. Reads are unchanged; a
+merge of stored values pays the scan of its result (A2, `merge_agg` of
+two versions: 174 → 181 ms at 877 kB, one pair).
+
+## The limit's write cost recovered (2026-09-29)
+
+Profiled with `perf` on an LTO-off symbolized build of the extension
+(backends running I1 and W1-W3 in a loop) and timed piece by piece in
+the core, the write cost of the limit was all in the scans, and the
+unattributed part was the inflation of a compressed save done three
+times: by the scan, by `Automerge::load`, and by `header::inflate_document`
+for the save-and-load shortcut, which also hashed the inflated chunk
+(together 4.1 ms of `normalize`'s 173 ms on the 877 kB list). Two
+changes:
+
+- The scan keeps the columns it inflated for a single compressed save
+  (`budget::scan_input_keep`) and `header::inflated_document_is` compares
+  the normalized save with them in place: 0.19 ms instead of 4.1 ms (on
+  the 3 MB text 0.7 ms instead of 28 ms), so a compressed save is
+  inflated twice, as before the limit (without a limit, three times:
+  nothing is kept). The columns are held through the load, after its
+  estimate is checked, at most the inflated bytes, each charged 10: the compressed saves
+  of the memory battery peak a little higher (1 MB of bytes 0.61 → 0.71
+  of the estimate, 40,000 map keys 0.65 → 0.67), the worst input is still
+  0.80.
+- `column_stats` steps over literal numbers by their LEB128 last bytes,
+  eight bytes at a time, over strings by their lengths without the
+  general decoder, and reads one-byte run headers inline: the scan of the
+  stored 877 kB list takes 0.7 ms instead of 1.7 ms (compressed: 2.6
+  instead of 3.7, most of it the inflation). A unit test checks it
+  against decoding every value on 20,000 generated and corrupted columns.
+
+Interleaved `mise run bench-sql` runs (the 72e8d57 build before the limit,
+the previous commit, this one; median of the per-run medians of 9
+repetitions, six rounds, 3 MB text three rounds of 5; ms) and user-space
+instructions per statement (`perf stat` on the backend, 10-20
+statements):
+
+| case | doc | before the limit | limit | this | instructions: limit | this |
+|---|---|---|---|---|---|---|
+| I1 | 83 kB | 21.4 | 22.4 (+5%) | 21.0 (-2%) | +2.6% | +0.2% |
+| I1 | 877 kB | 203.2 | 207.9 (+2%) | 199.7 (-2%) | +2.4% | +0.0% |
+| I1 | 3 MB | 2745 | 2774 (+1%) | 2740 (-0.2%) | | |
+| W1 | 83 kB | 37.6 | 38.0 (+1%) | 37.7 (+0.4%) | +0.6% | +0.3% |
+| W1 | 877 kB | 361.7 | 367.2 (+2%) | 363.9 (+0.6%) | +0.7% | +0.3% |
+| W1 | 3 MB | 5159 | 5245 (+2%) | 5221 (+1%) | | ±0.0% |
+| W2 | 83 kB | 22.1 | 22.8 (+3%) | 22.4 (+1%) | +2.5% | +0.2% |
+| W2 | 877 kB | 205.4 | 213.2 (+4%) | 204.3 (-0.5%) | +2.4% | +0.1% |
+| W2 | 3 MB | 2770 | 2785 (+0.5%) | 2756 (-0.5%) | | |
+| W3 | 83 kB | 22.1 | 22.7 (+3%) | 22.0 (-0.4%) | +2.5% | +0.2% |
+| W3 | 877 kB | 205.7 | 211.5 (+3%) | 204.2 (-0.8%) | +2.4% | +0.0% |
+| W3 | 3 MB | 2771 | 2771 (0%) | 2755 (-0.6%) | | |
+
+What is left is the scan of the stored document a merge of change
+chunks applies them to (W1, 0.3% of its instructions; its time is within
+the drift, and on the 3 MB text W1 executes the same number of
+instructions as before the limit, ±0.004%, so its +1% is drift too). In
+`bench-core` `Automerge::load` itself, which did not change, varies by
+2-4% between the three binaries (code layout), so its `normalize` is best
+compared net of the load in the same binary: on the 877 kB list a
+compressed save costs 8.2 ms beyond its load before the limit, 13.7 with
+the limit, 7.3 now; a canonical one 2.6, 5.4 and 3.8 (three runs each).

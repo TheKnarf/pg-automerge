@@ -145,7 +145,7 @@ depends = ["docker-build"]
 run = "bash tests/soak.sh"
 
 [tasks.docker-upgrade-test]
-description = "Upgrade a 0.1.0 (or, with PG_AUTOMERGE_OLD_VERSION=0.2.0, a 0.2.0) deployment to the current image: an old container (PG_AUTOMERGE_OLD_IMAGE, or built from the release revision) with tables, a generated doc::jsonb column, indexes, a notify trigger and data; the new image on the same volume, following the README compose steps (a non-postgres superuser, the README's pg_dump and psql commands, a service build: with the version arg); ALTER EXTENSION pg_automerge UPDATE; data, indexes, trigger, automerge_spans and the catalog checked; not part of test or docker-test"
+description = "Upgrade a 0.1.0 (or, with PG_AUTOMERGE_OLD_VERSION=0.2.0, a 0.2.0) deployment to the current image: an old container (PG_AUTOMERGE_OLD_IMAGE, or built from the release revision) with tables, a generated doc::jsonb column, indexes, a notify trigger and data; the new image on the same volume, following the compose steps of docs/src/pages/guide/updating.mdx (a non-postgres superuser, that page's pg_dump and psql commands, a service build: with the version arg); ALTER EXTENSION pg_automerge UPDATE; data, indexes, trigger, automerge_spans and the catalog checked; not part of test or docker-test"
 depends = ["docker-build"]
 run = "bash tests/docker_upgrade.sh"
 
@@ -182,7 +182,7 @@ dir = "{{config_root}}/docs"
 run = "pnpm build"
 
 [tasks.docs-check]
-description = "Docs site: typecheck, biome, the static build under /pg-automerge/ (or DOCS_BASE), and check-site (every page emitted, every internal link and anchor resolves)"
+description = "Docs site: typecheck, biome, the static build under /pg-automerge/ (or DOCS_BASE), check-site (every page emitted, every internal link and anchor resolves) and check-coverage (every block of the pre-port README.md, design document and CHANGELOG.md is on a page)"
 depends = ["docs-install"]
 dir = "{{config_root}}/docs"
 run = "DOCS_BASE=\"${DOCS_BASE:-/pg-automerge/}\" pnpm check"

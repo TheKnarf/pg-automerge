@@ -4,7 +4,7 @@ module_pathname = 'pg_automerge'
 # CREATE EXTENSION .. SCHEMA x and ALTER EXTENSION pg_automerge SET SCHEMA y
 # both work: the install script names no schema, and the C code finds its
 # own objects by OID or in the extension's schema, never via search_path.
-# See docs/DESIGN.md, "Installation, schema and privileges".
+# See docs/src/pages/design/installation.mdx.
 relocatable = true
 # Superuser-only, not trusted: the functions are LANGUAGE c, and a small
 # crafted input can describe a document that takes gigabytes to load (the
@@ -12,7 +12,7 @@ relocatable = true
 # cluster). Every write is priced before it loads and refused over
 # pg_automerge.max_load_memory, but that bound rests on measured costs,
 # and memory stays outside Postgres' accounting: a database owner must not
-# be able to expose that on their own. See docs/DESIGN.md, "Why the
-# extension is not trusted".
+# be able to expose that on their own. See
+# docs/src/pages/design/installation.mdx, "Why the extension is not trusted".
 superuser = true
 trusted = false

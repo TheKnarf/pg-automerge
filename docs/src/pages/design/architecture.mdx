@@ -1,0 +1,50 @@
+---
+title: "Architecture"
+section: Design
+order: 10
+description: "The core crate, the pgrx glue, and how a value flows through them."
+---
+
+Two crates:
+
+- `crates/pg_automerge_core`: all Automerge logic, plain Rust with no
+  Postgres dependency, tested with `cargo test`: validation and
+  normalization (`normalize`), merging and containment on stored bytes or
+  loaded documents (`loaded`: `Input`, `LoadedDoc`, `merge`,
+  `merge_changes`, `contains`, `contains_changes`), the `merge_agg` state
+  (`MergeAccumulator`), the stored-header parser behind the heads fast path
+  and the change-chunk splitter (`header`), the scan that prices a load
+  before Automerge allocates (`budget`, see
+  [Resource limits](/design/resource-limits)), the history functions
+  (`history`), the jsonb mapping as a walk into a `JsonSink` (`json`), the
+  notification payload builder (`notify`), text encodings (`encoding`),
+  the counters of live documents and loads (`stats`, see
+  [Memory observability](/design/memory-observability)) and, with the
+  `test-hooks` feature, test instrumentation (`test_hooks`).
+  Every Automerge call runs under a panic guard (see
+  [Errors](/reference/automerge-type#errors-and-panics)).
+- The root crate (`src/`): the pgrx glue, one module per SQL area:
+  `datum.rs` (the Rust types of `automerge` arguments and results, and the
+  prefix reads), `expanded.rs` (expanded values), `io.rs` (the type's SQL,
+  I/O functions and casts), `merge.rs` (`merge`, `||`, `merge_agg`, the
+  support function), `introspect.rs` (`automerge_heads`,
+  `automerge_contains`), `history.rs`, `notify.rs` (the trigger),
+  `jsonb.rs` (building jsonb from the core's walk), `error.rs` (raising
+  errors), and `alloc.rs` (the counting global allocator) with
+  `memory.rs` (`automerge_memory_usage`, `automerge_memory_reset`). The
+  glue converts datums, calls the core,
+  and raises core errors with their SQLSTATE.
+
+Data flow:
+
+- **Writes** arrive as `bytea` or text and pass the input functions, which
+  validate and normalize them into stored bytes; or they go through
+  `merge`, whose result is a loaded document (an expanded value) that is
+  saved once, when Postgres stores it.
+- **Reads** (`::jsonb`, history) load the stored bytes into an Automerge
+  document per call; `automerge_heads`, `automerge_change_count`, the
+  no-op checks and the notification trigger read only a prefix of the
+  stored value (the header).
+- **Notifications** are built from the old and new row's headers by the
+  trigger and sent with `NOTIFY`; listeners fetch what they lack with
+  `automerge_changes_bytes`.

@@ -115,7 +115,8 @@ fn automerge_from_bytea(bytes: &[u8]) -> AutomergeValue {
     AutomergeValue::Datum(new_expanded(LoadedDoc::from_external(bytes).or_raise()))
 }
 
-/// The current state of the document as jsonb (see the mapping in DESIGN.md).
+/// The current state of the document as jsonb (see the mapping in
+/// docs/src/pages/reference/jsonb-mapping.mdx).
 #[pg_extern(immutable, strict, parallel_safe)]
 fn automerge_to_jsonb(doc: AutomergeArg) -> JsonbDatum {
     let mut jsonb = JsonbBuilder::default();

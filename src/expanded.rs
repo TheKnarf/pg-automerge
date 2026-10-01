@@ -15,7 +15,7 @@ use crate::error::{OrRaise, raise};
 // function calls (Postgres' expanded-object protocol, utils/expandeddatum.h),
 // so that `merge(merge(a, b), c)`, `doc := merge(doc, x)` in a PL/pgSQL loop
 // or `merge(..)::jsonb` do not save and re-load the document at every step.
-// See docs/DESIGN.md, "Expanded values".
+// See docs/src/pages/design/expanded-values.mdx.
 //
 // - The object lives in its own memory context, a child of the context the
 //   function was called in; Postgres moves or deletes that context with the

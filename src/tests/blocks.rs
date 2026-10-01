@@ -2,7 +2,7 @@
 // without overflowing the stack (Automerge's own rendering of such a
 // block, which the jsonb view once reached through its document iterator,
 // recurses about 13 kB per level: 5,000 levels need some 65 MB). See
-// docs/DESIGN.md, "Deep blocks".
+// docs/src/pages/design/deep-blocks.mdx.
 
 /// {text: "ab" with a block at 1 holding maps nested `depth` levels} in a
 /// first change, then {status: "new"} in a second one.

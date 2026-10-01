@@ -1,8 +1,8 @@
 //! Memory observability: `automerge_memory_usage()` and
 //! `automerge_memory_reset()`, reading the counting global allocator
 //! ([`crate::alloc`]) and the core's document counters
-//! ([`pg_automerge_core::stats`]). See docs/DESIGN.md, "Memory
-//! observability".
+//! ([`pg_automerge_core::stats`]). See
+//! docs/src/pages/design/memory-observability.mdx.
 
 use pg_automerge_core::stats;
 use pgrx::prelude::*;
@@ -19,8 +19,8 @@ fn to_i64(n: impl TryInto<i64>) -> i64 {
 ///
 /// The counters are read before anything of the call is allocated. Only
 /// this backend's are visible: each backend has its own heap, and nothing
-/// is shared (see the README's Monitoring section for sampling them from
-/// every connection).
+/// is shared (see docs/src/pages/operations/monitoring.mdx for
+/// sampling them from every connection).
 #[pg_extern(volatile, parallel_restricted)]
 fn automerge_memory_usage() -> TableIterator<
     'static,

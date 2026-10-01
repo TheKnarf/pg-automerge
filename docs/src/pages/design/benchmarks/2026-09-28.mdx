@@ -1,0 +1,78 @@
+---
+title: "Benchmarks, 2026-09-28"
+section: Design
+order: 141
+description: "Benchmarks recorded on 2026-09-28."
+---
+
+## Hardening and performance stage (2026-09-28)
+
+Measured before (commit e4eeb26) and after, same machine, release builds.
+`mise run bench-core` (Rust, median of five, milliseconds):
+
+| Operation | 3.0 MB text before | after | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|---|---|
+| `normalize` of a compressed save | 5280 | 2530 | 324 | 169 | 32.7 | 16.7 |
+| `normalize` of stored bytes | 2637 | 2488 | 163 | 164 | 16.2 | 16.1 |
+| jsonb walk (no-op sink) | 194 (per object) | 247 (one sweep) | 144 | 72 | 13.4 | 6.4 |
+
+(5,000 one-character changes, 5 kB: `normalize` of a compressed save
+45.5 → 22.5 ms.) The compressed-save shortcut halves writes of
+`Automerge.save()` output; the one-sweep walk halves the walk of
+documents made of many small objects and is a quarter slower on one huge
+text.
+
+`mise run bench-expanded` (SQL, mean of three runs, milliseconds):
+
+| Workload | 3.0 MB before | after | 877 kB before | after | 83 kB before | after |
+|---|---|---|---|---|---|---|
+| `bytea` → `automerge` of a compressed save | 5199 | 2617 | 341 | 182 | 36.0 | 20.4 |
+| `bytea` → `automerge` of stored bytes | 2594 | 2581 | 178 | 178 | 19.8 | 20.6 |
+| `doc->>'status'` | 2845 | 2816 | 439 | 314 | 44.3 | 32.6 |
+| `jsonb_array_length(doc->'items')` | 2830 | 2840 | 451 | 317 | 46.1 | 32.7 |
+| `merge(doc, c1)::jsonb->>'status'` | 2837 | 2827 | 446 | 320 | 45.5 | 33.9 |
+| 2 merges into `d`, then 10 reads `d->>'status'` | 5117 | 5209 | 2816 | 1541 | 278 | 153 |
+| `merge_agg(doc)::jsonb` over 9 versions | 23583 | 23136 | 1755 | 1629 | 179 | 168 |
+| `UPDATE .. SET doc = merge(doc, c1)` | 5320 | 5246 | 374 | 377 | 39.8 | 41.2 |
+
+The jsonb reads gain from building jsonb directly (no JSON text and
+`jsonb_in`: about 60 ms on the 3 MB and 877 kB documents) and, on the
+list documents, from the one-sweep walk; on the 3 MB text the two
+roughly cancel out.
+
+## SQL paths: redundant loads removed (2026-09-28)
+
+`mise run bench-sql` (release build, median of three, milliseconds; one
+load of the 3 MB text takes about 2.5 s, of the 877 kB list about 160
+ms). "newer" is the stored document plus one change by another actor as a
+compressed save; "changes" its `save_after(stored heads)`. Loads counted
+by the pg_tests of `src/tests/loads.rs`.
+
+| Path | loads before → after | 877 kB before | after | 3.0 MB before | after |
+|---|---|---|---|---|---|
+| R1 `doc->>'status'` | 1 → 1 | 310 | 313 | 2817 | 2793 |
+| R2 three accessors in one `SELECT` | 3 → 3 | 908 | 921 | 8423 | 8383 |
+| R3 `automerge_heads(doc)` | 0 → 0 | 0.5 | 0.5 | 0.5 | 0.5 |
+| I1 `INSERT` of newer (bytea) | 1 → 1 | 210 | 218 | 2778 | 2744 |
+| W1 `merge(doc, changes::bytea)` | 2 → 2 | 362 | 375 | 5217 | 5205 |
+| W2 `merge(doc, newer::bytea)` | 3 → 1 | 505 | 210 | 7390 | 2772 |
+| W3 `merge(doc, newer::automerge)` | 2 → 1 | 395 | 209 | 5311 | 2775 |
+| W4 upsert of newer, `merge(docs.doc, excluded.doc)` | 2 → 2 | 381 | 373 | 5342 | 5288 |
+| W5 W1 again (already there) | 0 → 0 | 35 | 1.0 | 185 | 0.9 |
+| W6 W3 with a text parameter (`\bind`, custom plan) | 2 → 2 | 391 | 380 | 5365 | 5344 |
+
+With `pg_automerge.verify_writes = off`, W1 takes one load (207 ms and
+2739 ms); the other paths are unchanged (their writes need no check).
+W2 no longer loads the stored document plus the save (as `a ++ save`)
+and then verifies the result: the save is loaded on its own and, since
+it contains the stored document, is the result, verified by its own
+encoding. W3's cast hands its loaded document to `merge`. W5 decides from
+the heads in a prefix of the stored value and returns the TOAST pointer
+it was given, which the `UPDATE` keeps: no detoasting, compressing or
+writing of the document. W4 and W6 stay at two loads because Postgres
+flattens `EXCLUDED` and constant-folded parameters (see
+[Expanded values](/design/expanded-values)).
+
+The pgrx-managed Postgres these numbers come from is an assert-enabled
+build (`randomize_mem` shows up in profiles of the jsonb paths), so the
+jsonb part of R1 and R2 is somewhat slower than on a production build.

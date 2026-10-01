@@ -1,0 +1,94 @@
+---
+title: "Overview"
+section: Design
+order: 0
+description: "The design of pg_automerge: scope, intended usage, and the map of the design pages."
+---
+
+A Postgres 18 extension (Rust, pgrx 0.19.3, `automerge` crate 0.12.0) that
+stores [Automerge](https://automerge.org) documents in an `automerge`
+column type, lets you **query them as `jsonb`**, and **merges** concurrent
+writes. Only Postgres 18 is supported.
+
+Contents: [Scope](/design#scope) · [Architecture](/design/architecture) ·
+[The `automerge` type](/reference/automerge-type) ·
+[SQL API and semantics](/reference#sql-api-and-semantics) ·
+[jsonb mapping](/reference/jsonb-mapping) · [Resource limits](/design/resource-limits) ·
+[Memory observability](/design/memory-observability) ·
+[Error codes](/reference/error-codes) ·
+[Performance](/design/performance) · [Implementation notes](/design/implementation-notes) ·
+[Testing](/design/testing) ·
+[Installation, schema and privileges](/design/installation) ·
+[Versioning and upgrades](/design/versioning) ·
+[Docker image](/design/docker-image) ·
+[Future work](/design/future-work) ·
+[Appendix: benchmarks](/design/benchmarks)
+
+## Scope
+
+In scope:
+
+- Storing Automerge documents produced elsewhere.
+- Reading them with every `jsonb` operator/function/index.
+- Reading the structure of rich text (marks and blocks, which the jsonb
+  view flattens to a string) as jsonb spans (see
+  [Rich text spans](/reference/rich-text-spans)).
+- `merge`: CRDT merge so concurrent writers never overwrite each other.
+- Read-only history: listing a document's changes, fetching change bytes
+  (e.g. everything since a replica's heads), and the state as of earlier
+  heads (see [History](/reference/history)).
+- Change notifications: a trigger that tells listening backends (`LISTEN`)
+  which rows' documents changed and their new heads (see
+  [Change notifications](/reference/change-notifications)).
+
+Out of scope (by decision):
+
+- Server-side edits (no `set`/`splice`/subscripting, no `jsonb -> automerge`).
+- Actor IDs. All changes are authored by the application backend, which owns
+  actor IDs. The extension never creates changes.
+- Sync protocol, history pruning, and anything that writes history (the
+  history functions only read it).
+
+### Intended usage
+
+The application backend syncs with frontends via Automerge and persists
+documents in Postgres:
+
+```sql
+CREATE TABLE docs (id uuid PRIMARY KEY, doc automerge NOT NULL);
+
+-- persist a full save: $2 is Automerge.save() (optionally followed by later
+-- save_incremental() chunks), bound as bytea. Every writer must use its own
+-- actor id: two different histories claiming the same (actor, seq) cannot be
+-- merged (ERROR 22000 "conflicting automerge changes").
+INSERT INTO docs (id, doc) VALUES ($1, $2)
+ON CONFLICT (id) DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc);
+
+-- persist incrementally: $2 is only the new changes (save_incremental() /
+-- save_after(heads) output, one or more change chunks) bound as bytea, or a
+-- full save. A typed bytea parameter selects merge(automerge, bytea), which
+-- applies the chunks on top of the stored document; no cast needed.
+UPDATE docs SET doc = merge(doc, $2) WHERE id = $1;
+
+-- (The row must exist for incremental changes: an INSERT's VALUES are cast
+-- to automerge on their own, and bare changes are not a complete document.)
+
+-- The upsert costs two loads of a full save (the cast validates it, and
+-- EXCLUDED reaches merge flat, see "Expanded values"); when the row usually
+-- exists, UPDATE .. SET doc = merge(doc, $2) with the save as bytea costs
+-- one (see "Merging"), with an INSERT when it updated no row.
+
+-- read
+SELECT doc->>'title' FROM docs WHERE doc @> '{"status": "open"}';
+SELECT jsonb_path_query(doc, '$.items[*] ? (@.done == false)') FROM docs;
+```
+
+#### Why `SET doc = merge(doc, $1)` is concurrency-safe
+
+Under READ COMMITTED, when two transactions update the same row, the second
+blocks on the row lock; after the first commits, Postgres re-evaluates the
+SET expression against the *newly committed* row version (EvalPlanQual). So
+`merge(doc, $1)` merges into the latest state and no write is lost.
+
+Under REPEATABLE READ / SERIALIZABLE the second writer instead fails with a
+serialization error and must retry, as with any concurrent update.

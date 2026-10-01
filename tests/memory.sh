@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # automerge_memory_usage() in real sessions (run via `mise run memory`,
-# also part of `mise run test`). See docs/DESIGN.md, "Memory
-# observability". The pg_tests (src/tests/memory.rs) check the counters
+# also part of `mise run test`). See
+# docs/src/pages/design/memory-observability.mdx. The pg_tests
+# (src/tests/memory.rs) check the counters
 # inside one call; this checks them across top-level statements and
 # transactions, which is where a leak would build up in production:
 #

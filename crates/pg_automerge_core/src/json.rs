@@ -1,5 +1,6 @@
 //! Conversion of the state of an Automerge document (current, or as of given
-//! heads) to JSON, following the mapping table in docs/DESIGN.md.
+//! heads) to JSON, following the mapping table in
+//! docs/src/pages/reference/jsonb-mapping.mdx.
 //!
 //! The walk ([`write_json_at`]) emits events into a [`JsonSink`]: the
 //! extension builds jsonb directly from them, and [`ValueSink`] builds a
@@ -509,7 +510,7 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// Emit a scalar per the DESIGN.md table.
+/// Emit a scalar per the jsonb mapping table.
 pub fn write_scalar<S: JsonSink + ?Sized>(scalar: &ScalarValueRef<'_>, sink: &mut S) {
     match scalar {
         ScalarValueRef::Str(s) => sink.string(&sanitize(s)),
@@ -542,7 +543,7 @@ pub fn write_owned_scalar<S: JsonSink + ?Sized>(scalar: &ScalarValue, sink: &mut
     }
 }
 
-/// Map a scalar per the DESIGN.md table, as a `serde_json::Value`.
+/// Map a scalar per the jsonb mapping table, as a `serde_json::Value`.
 pub fn scalar_to_json(scalar: &ScalarValueRef<'_>) -> Value {
     let mut sink = ValueSink::default();
     write_scalar(scalar, &mut sink);

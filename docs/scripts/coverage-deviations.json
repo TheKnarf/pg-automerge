@@ -1,0 +1,224 @@
+[
+	{
+		"source": "README.md",
+		"from": "and makes them queryable. docs/DESIGN.md is the full specification.",
+		"to": "and makes them queryable. The Design pages are the full specification.",
+		"reason": "docs/DESIGN.md is the Design section of the site now."
+	},
+	{
+		"source": "README.md",
+		"from": "superuser's decision. Details in DESIGN.md.",
+		"to": "superuser's decision. Details in Installation, schema and privileges.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "it keeps supporting (see DESIGN.md). What changed in each version, and whether an update needs more than this (a REINDEX, say), is in CHANGELOG.md.",
+		"to": "it keeps supporting (see Versioning and upgrades). What changed in each version, and whether an update needs more than this (a REINDEX, say), is in Changelog.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "the history types (see CHANGELOG.md); from 0.1.0 it also brings",
+		"to": "the history types (see Changelog); from 0.1.0 it also brings",
+		"reason": "A link titled CHANGELOG.md now names the Changelog page."
+	},
+	{
+		"source": "README.md",
+		"from": "of one row). Details in DESIGN.md.",
+		"to": "of one row). Details in Change notifications.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "EXCEPTION block. Details in DESIGN.md.",
+		"to": "EXCEPTION block. Details in Expanded values.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "\\dT+). Error codes are listed in DESIGN.md.",
+		"to": "\\dT+). Error codes are listed on the Error codes page.",
+		"reason": "A link titled DESIGN.md now names the page, as 'the Error codes page' (not 'listed in Error codes')."
+	},
+	{
+		"source": "README.md",
+		"from": "Automerge's winner. Details in DESIGN.md.",
+		"to": "Automerge's winner. Details below.",
+		"reason": "The README's summary and the design's mapping are on the same page now; 'Details in DESIGN.md' became 'Details below'."
+	},
+	{
+		"source": "README.md",
+		"from": "renders blocks). Details in DESIGN.md and Deep blocks.",
+		"to": "renders blocks). Details in Rich text spans and Deep blocks.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "the publisher. Details in DESIGN.md.",
+		"to": "the publisher. Details in Resource limits.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "are unaffected. Details in DESIGN.md.",
+		"to": "are unaffected. Details in The pg_automerge.verify_writes setting.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "does nothing. Details in DESIGN.md.",
+		"to": "does nothing. Details in Returning freed memory (pg_automerge.trim_threshold).",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "calls it once. Details in DESIGN.md.",
+		"to": "calls it once. Details in Memory observability.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "kB to 1.26 MB; results in DESIGN.md): no memory leak (the Rust",
+		"to": "kB to 1.26 MB; results in Soak test (2026-10-01)): no memory leak (the Rust",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "Saves are not affected. See docs/DESIGN.md, \"What the limit cannot do\".",
+		"to": "Saves are not affected. See What the limit cannot do.",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "README.md",
+		"from": "each function loads, in DESIGN.md.",
+		"to": "each function loads, in Performance.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "README.md",
+		"from": "src/ is the pgrx glue. See DESIGN.md.",
+		"to": "src/ is the pgrx glue. See Architecture.",
+		"reason": "A link titled DESIGN.md (or docs/DESIGN.md) now names the page or section it leads to."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "reports. What to do instead (README, Monitoring): sample automerge_memory_usage()",
+		"to": "reports. What to do instead (see Monitoring): sample automerge_memory_usage()",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "text and binary mode (see the README's limitations).",
+		"to": "text and binary mode (see Limitations and gotchas).",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "pg_backend_memory_contexts totals, as the README suggests for pooled connections).",
+		"to": "pg_backend_memory_contexts totals, as Monitoring suggests for pooled connections).",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "Released: 0.1.0 and 0.2.0 (see CHANGELOG.md).",
+		"to": "Released: 0.1.0 and 0.2.0 (see the Changelog).",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "It follows the README's compose steps as written:",
+		"to": "It follows the compose steps of Updating as written:",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "of step 5 are the README's commands (read from it,",
+		"to": "of step 5 are that page's commands (read from its MDX source,",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "development. Usage is in the README's Docker section. Packaging decisions:",
+		"to": "development. Usage is in Docker. Packaging decisions:",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "when someone updates it (the README says how). The tag stays",
+		"to": "when someone updates it (Updating says how). The tag stays",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "would silently be missing; the README says to mount single files",
+		"to": "would silently be missing; Docker says to mount single files",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "the command line, which the README explains. A memory-limited",
+		"to": "the command line, which Docker explains. A memory-limited",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "per second. The README recommends fastupdate = off",
+		"to": "per second. Operations recommends fastupdate = off",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "against 6). The README says both.",
+		"to": "against 6). Operations says both.",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "space after VACUUM 26-28%). README: Operations.",
+		"to": "space after VACUUM 26-28%). See Operations.",
+		"reason": "Referred to the README (or CHANGELOG.md, docs/DESIGN.md) by name; now names and links the page that has that content."
+	},
+	{
+		"source": "CHANGELOG.md",
+		"from": "the library's version; see the README's Updating and docs/DESIGN.md). Each entry says whether",
+		"to": "the library's version; see Updating and Versioning and upgrades in the documentation). Each entry says whether",
+		"reason": "CHANGELOG.md pointed into README.md and docs/DESIGN.md; it now links the documentation pages (docs/src/pages/*.mdx on GitHub, the routes on the site)."
+	},
+	{
+		"source": "CHANGELOG.md",
+		"from": "PG_AUTOMERGE_VERSION arg to 0.3.0 (the README's Updating).",
+		"to": "PG_AUTOMERGE_VERSION arg to 0.3.0 (see Updating).",
+		"reason": "CHANGELOG.md pointed into README.md and docs/DESIGN.md; it now links the documentation pages (docs/src/pages/*.mdx on GitHub, the routes on the site)."
+	},
+	{
+		"source": "CHANGELOG.md",
+		"from": "statement. Per backend; see the README's Monitoring. The allocator",
+		"to": "statement. Per backend; see Monitoring. The allocator",
+		"reason": "CHANGELOG.md pointed into README.md and docs/DESIGN.md; it now links the documentation pages (docs/src/pages/*.mdx on GitHub, the routes on the site)."
+	},
+	{
+		"source": "CHANGELOG.md",
+		"from": "50 µs each for it). See the README's Configuration.",
+		"to": "50 µs each for it). See Configuration.",
+		"reason": "CHANGELOG.md pointed into README.md and docs/DESIGN.md; it now links the documentation pages (docs/src/pages/*.mdx on GitHub, the routes on the site)."
+	},
+	{
+		"source": "CHANGELOG.md",
+		"from": "its findings are in the README's new Operations section (memory",
+		"to": "its findings are in the new Operations section (memory",
+		"reason": "CHANGELOG.md pointed into README.md and docs/DESIGN.md; it now links the documentation pages (docs/src/pages/*.mdx on GitHub, the routes on the site)."
+	},
+	{
+		"source": "CHANGELOG.md",
+		"from": "ordinary rich text (see docs/DESIGN.md, \"What the limit cannot do\").",
+		"to": "ordinary rich text (see What the limit cannot do).",
+		"reason": "CHANGELOG.md pointed into README.md and docs/DESIGN.md; it now links the documentation pages (docs/src/pages/*.mdx on GitHub, the routes on the site)."
+	},
+	{
+		"source": "docs/DESIGN.md",
+		"from": "pg_automerge design",
+		"to": "Overview",
+		"reason": "The document's title: DESIGN.md is the site's Design section, and its first page is titled Overview."
+	}
+]

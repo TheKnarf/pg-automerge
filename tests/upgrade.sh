@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Extension upgrade test (run via `mise run upgrade`, also part of `mise
-# run test`). See docs/DESIGN.md, "Versioning and upgrades".
+# run test`). See
+# docs/src/pages/design/versioning.mdx.
 #
 # For every released version V with a committed install script
 # (sql/snapshots/pg_automerge--V.sql):
@@ -92,7 +93,7 @@ grep -q '^depends ' "$WORK/catalog.new" || fail "no dependencies in the catalog 
 shopt -s nullglob
 # Released scripts, and variants of a released version's catalog that
 # exist in deployments (sql/snapshots/variants/pg_automerge--V+NAME.sql,
-# updated with V's upgrade scripts; see docs/DESIGN.md).
+# updated with V's upgrade scripts; see docs/src/pages/design/versioning.mdx).
 snapshots=(sql/snapshots/pg_automerge--*.sql sql/snapshots/variants/pg_automerge--*.sql)
 ((${#snapshots[@]})) || fail "no snapshots in sql/snapshots"
 [[ -e "sql/snapshots/pg_automerge--$CURRENT.sql" ]] \

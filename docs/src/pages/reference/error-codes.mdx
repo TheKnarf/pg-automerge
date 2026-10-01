@@ -1,0 +1,119 @@
+---
+title: "Error codes"
+section: Reference
+order: 90
+description: "The SQLSTATEs the extension raises, and why."
+---
+
+Every error the extension raises, by SQLSTATE. The core crate's `Error`
+enum carries the class (`InvalidInput`, `MissingDependencies`,
+`ConflictingChanges`, `InvalidParameter`, `LimitExceeded`, `LoadLimit`,
+`Unsupported`, `Internal`),
+and `src/error.rs` maps it; errors that only the glue can detect (NULL
+array elements, trigger usage, jsonb limits) are built there directly.
+
+| SQLSTATE | When | Message (DETAIL / HINT) |
+|---|---|---|
+| `0A000` feature_not_supported | A bundle chunk (Automerge's experimental format) in client input, whatever the limit | `automerge bundle chunks are not supported` |
+| `22P02` invalid_text_representation | Bad text input; bytes that are not a loadable Automerge save or change sequence (including decoder panics); a result that does not survive a save and load | `invalid input syntax for type automerge: ...`, `invalid automerge document: ...`, `invalid automerge changes: ...` |
+| `22P02` | `merge(automerge, bytea)` with changes whose dependencies are in neither input | `invalid automerge changes: missing N dependencies that neither the document nor the input contains` (DETAIL: `Missing changes: <hashes>.`) |
+| `22P02` | A change hash that is not 64 hex digits | `invalid automerge change hash "...": expected 64 hexadecimal digits` |
+| `22000` data_exception | Two histories that disagree about one actor's changes (a reused actor id): two different changes with the same (actor, seq), or a second author assignment, met by `merge`, `\|\|`, `merge_agg`, `merge(automerge, bytea)`, `automerge_contains(automerge, bytea)` when it loads, or one input holding both (text input, the `bytea` cast) | `conflicting automerge changes: actor <hex> has two different changes with seq N`, or for a second author assignment (Automerge writes an actor's author only on its seq 1 change, so this takes a writer that reuses an actor id across authors or crafts changes) `conflicting automerge changes: actor <hex> is assigned an author again at seq N`; both with DETAIL: `An actor's changes form one sequence; these inputs hold two different ones, which cannot be merged.` HINT: `Each writer must use its own actor id. Automerge picks a random one for every document instance unless the application sets it.`) |
+| `22003` numeric_value_out_of_range | A change's `seq`, `start_op` or `op_count`, or the change count, above `bigint`'s range (Automerge rejects such changes on load, so this is not expected to occur) | `automerge seq N is out of range for type bigint` (DETAIL: the change) |
+| `22004` null_value_not_allowed | A NULL element in `since_heads` / `heads` | `since_heads must not contain NULL` |
+| `22023` invalid_parameter_value | `automerge_to_jsonb(doc, heads)` or `automerge_spans(doc, path, heads)` with a head the document lacks; `automerge_spans` with a path to something other than a text object (`automerge value at path {notes,0} is a map, not a text object`); bad `automerge_notify` arguments (count, channel length, key column listed twice or of type `automerge`) | `automerge document does not contain change <hash>`, `automerge_notify(): ...` (HINT on how to declare the trigger, or which columns to name) |
+| `39P01` trigger_protocol_violated | `automerge_notify()` not fired `AFTER ... FOR EACH ROW` for INSERT/UPDATE/DELETE, or called outside a trigger | `automerge_notify() must be fired ...`, `automerge_notify() can only be called as a trigger` (HINT: the correct `CREATE TRIGGER`) |
+| `42703` undefined_column | `automerge_notify()` key column that does not exist | `automerge_notify(): key column "x" does not exist in table ...` |
+| `53400` configuration_limit_exceeded | Client input, changes a merge applies, or a merge result whose estimated load exceeds `pg_automerge.max_load_memory` (see [Resource limits](/design/resource-limits)) | `estimated memory to load automerge input exceeds "pg_automerge.max_load_memory" (2048 MB)`, `estimated memory to load merged automerge document exceeds ...`, `estimated memory for applying automerge changes exceeds ...` (DETAIL: `Loading it could take up to N MB (X operations, Y changes, Z actors, B bytes uncompressed).`, "at least" when the scan stopped early; HINT: `A superuser can raise "pg_automerge.max_load_memory".`) |
+| `54000` program_limit_exceeded | A document nested deeper than 1000 levels, or with more elements, pairs or a longer string than jsonb allows, read as jsonb; a text block nested deeper than 32 levels read with `automerge_spans` | `automerge document is nested more than 1000 levels deep`, `automerge text block is nested more than 32 levels deep`, `number of jsonb array elements exceeds the maximum allowed (N)`, `string too long to represent as jsonb string` (DETAIL, as jsonb's) |
+| `XX000` internal_error | A stored value that does not load (corruption, or a value stored with `pg_automerge.verify_writes` off that does not survive a save and load), broken invariants (bugs), `automerge_change`/`automerge_change_meta` altered by their owner | `corrupt stored automerge value: ...`, `automerge failed on a stored value: ...`, others naming the invariant |
+
+## Why `22000` for a reused actor id
+
+Merging two histories that hold different changes with the same (actor,
+seq) used to fail with `XX000` when both were `automerge` values and with
+`22P02` when the changes came as `bytea`. Neither fits: `XX000` says the
+extension is broken (and monitoring pages someone for it), `22P02` says the
+bytes are malformed, but each input is a valid document. What is wrong is
+the combination, caused by a writer bug: two writers (or two copies of a
+document) used the same actor id. Candidates, against PostgreSQL's
+errcodes table (Appendix A) and how drivers map classes:
+
+- `23505` unique_violation / class `23` integrity_constraint_violation:
+  (actor, seq) is a key, but not a table constraint. Drivers map class 23
+  to "integrity error" exceptions (psycopg's `IntegrityError`, JDBC's
+  `SQLIntegrityConstraintViolationException`) that applications routinely
+  catch in an upsert-or-ignore path, which would silently drop the
+  write; clients also expect a constraint name with it. Rejected.
+- `55000` object_not_in_prerequisite_state: for an object whose state
+  forbids the operation (a sequence not yet used, a replication slot in
+  use); retrying later can succeed. Here neither document is in a wrong
+  state and no retry helps. Rejected.
+- `40001` serialization_failure: drivers and ORMs retry it automatically,
+  which would loop. Rejected.
+- `22023` invalid_parameter_value: the extension uses it for an argument
+  that does not fit the document (unknown heads); the (actor, seq) clash
+  is not about one argument, and in a merge either side can be the
+  "wrong" one. Rejected.
+- `22000` data_exception, chosen: the class for data values that are
+  unacceptable, with no more specific code in class `22` for this.
+  Drivers map class `22` to a non-transient data error (psycopg's
+  `DataError`, JDBC's `SQLDataException`): not retried, not confused with
+  a constraint, and distinct from `22P02` so a client can tell "these
+  bytes are corrupt" from "these two histories cannot be combined" by
+  SQLSTATE alone.
+
+Every path reports it the same way, since the cause is the same: the
+Automerge errors `DuplicateSeqNumber` and `DuplicateAuthor` become
+`Error::ConflictingChanges` wherever Automerge raises them (a load of
+concatenated input, applying change chunks, merging two documents); other
+Automerge errors keep their class. So input that holds both histories on
+its own (a save followed by the other writer's change chunk, through text
+input or the `bytea` cast) is also `22000` now, where it was `22P02`.
+Both variants are tested in the core crate (`merge_changes.rs`:
+`reused_actor_id_is_a_conflict_on_every_path` for `DuplicateSeqNumber`,
+`reassigned_author_is_a_conflict` for `DuplicateAuthor`, with a change
+crafted by adding an author footer to a seq 2 change); the SQL tests
+check the SQLSTATE, DETAIL and HINT for the first, which share one mapping
+in `src/error.rs`.
+
+## Other reclassifications (before 0.1.0)
+
+- Nesting deeper than 1000 levels: `XX000` → `54000`. The document is
+  valid; the jsonb view has a limit, like jsonb's own element and string
+  limits, which are already `54000`.
+- A change field above `bigint`: `XX000` → `22003`, as for any value out
+  of `bigint`'s range.
+- `automerge_notify()` called outside a trigger: `0A000` → `39P01`, the
+  code of every other misuse of the trigger and the one Postgres' own C
+  trigger function `suppress_redundant_updates_trigger` raises for the
+  same mistake (PL/pgSQL's compiler uses `0A000` for it; a C function is
+  closer to the former).
+- The `automerge_notify()` error for an `automerge` key column moved its
+  advice ("name the columns that identify the row") from the message into
+  a HINT.
+
+## Message style
+
+Following PostgreSQL's error message style guide:
+
+- The primary message is short, factual, lowercase and without a trailing
+  period; it names the specific object (the hash, the actor and seq, the
+  key column, the trigger) after a colon or in quotes, as Postgres' own
+  messages do (`invalid input syntax for type ...: ...`).
+- The DETAIL carries supporting facts as complete sentences (the hashes
+  of missing dependencies, the change holding an out-of-range value, why
+  conflicting changes cannot be merged).
+- The HINT carries advice as complete sentences: how to declare the
+  notification trigger, which key columns to name, that each writer needs
+  its own actor id.
+- Messages of Automerge's own errors are embedded after a colon (`invalid
+  automerge document: <Automerge's message>`), and the message of a
+  caught decoder panic in parentheses; their wording is Automerge's.
+
+Tests: `reused_actor_id_is_a_conflict_on_every_path` (core) and
+`reused_actor_id_is_a_data_exception_with_a_hint` (pg_test: SQLSTATE,
+message, DETAIL and HINT for every SQL path, and that the failed writes
+changed nothing), the pg_regress example showing the error, and the
+existing per-code tests (`notify_trigger_validates_usage`, the nesting and
+hash tests).

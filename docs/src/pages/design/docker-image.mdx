@@ -1,0 +1,308 @@
+---
+title: "Docker image"
+section: Design
+order: 120
+description: "Packaging decisions of the Docker image, and how CI builds it."
+---
+
+`docker/Dockerfile` builds the official `postgres:18` image plus the
+extension; `compose.yaml` runs it for local development. Usage is in
+[Docker](/guide/docker). Packaging decisions:
+
+- **One pinned base for every stage.** The `versions`, `builder` and
+  `runtime` stages are all `FROM ${PG_IMAGE}`, by default
+  `postgres:18-trixie@sha256:<index digest>` (Debian 13, Postgres 18.6 at
+  the time of writing). Building in the runtime's own image means the
+  library is linked against exactly the glibc it runs with, and compiled
+  against the headers of the very Postgres it is loaded into: the builder
+  installs `postgresql-server-dev-18=$PG_VERSION` (the official image's own
+  package version) from the PGDG repository the image already configures,
+  and `cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config`, so
+  pgrx never builds a Postgres of its own (whose assertions and paths
+  differ). If PGDG has dropped that exact version the newest 18.x headers
+  are used, with a warning: minor releases keep the server ABI. The digest
+  (rather than the tag) makes a rebuild reproducible and a base update a
+  visible one-line change; the price is that security fixes arrive only
+  when someone updates it ([Updating](/guide/updating) says how). The tag stays next to the
+  digest for readers. `tests/check_ci.sh` checks that every stage uses
+  `PG_IMAGE` and that it is a digest-pinned `postgres:18-*`.
+- **No hand-copied versions.** `scripts/versions.sh` reads Rust and
+  cargo-pgrx from `mise.toml`, checks cargo-pgrx against the pgrx crate in
+  `Cargo.lock`, and the crate version from `Cargo.toml`; the `versions`
+  stage runs it and hands the builder only `/toolchain.env`. BuildKit keys
+  that `COPY` by content, so editing `mise.toml` or `Cargo.toml` does not
+  rebuild the toolchain layers unless a toolchain version changed.
+  `check_ci.sh` fails if the Dockerfile spells out any of those versions.
+  The crate version is also a required build argument
+  (`PG_AUTOMERGE_VERSION`, for the OCI version label, which a Dockerfile
+  cannot read from a file); the build fails if it disagrees with
+  `Cargo.toml`. `mise run docker-build` passes it, plus the git remote
+  (empty while there is none) and commit for the `source` and `revision`
+  labels. The remote goes through `scripts/oci-source-url.sh` first: the
+  label is public (every archive and pushed image carries it), so an
+  https remote's credentials are stripped, an ssh or scp-style remote
+  becomes its https URL, and anything else (a local path) gives an empty
+  label; `check_ci.sh` tests those cases.
+- **Toolchain from Debian's rustup.** `rustup` comes from the signed
+  Debian archive (no `curl | sh`) and installs the pinned toolchain
+  (minimal profile); `cargo install --locked cargo-pgrx`. The package is
+  built by `scripts/package.sh`, the script behind `mise run package` and
+  the tag CI job, which now passes `--locked` to cargo, so a stale
+  `Cargo.lock` fails the build instead of being updated. BuildKit cache
+  mounts keep the cargo registry and `target/` between builds; since
+  `target/` is a cache mount, the package is copied out to `/out` in the
+  same step. The build fails if the package holds anything besides the
+  library, the control file and SQL scripts.
+- **Runtime: files only.** The runtime stage copies `pg_automerge.so`
+  (to `pg_config --pkglibdir`), the control file and SQL scripts (to
+  `--sharedir/extension`; the builder asserts these are the paths the
+  `COPY` uses), `LICENSE` as `/usr/share/doc/pg_automerge/copyright` (the
+  MIT notice must travel with copies), the version, and the init script.
+  The entrypoint, `CMD`, user and volume are the official image's
+  (`check_ci.sh` rejects `ENTRYPOINT`/`CMD`/`USER`/`VOLUME` in the
+  Dockerfile). The library links only `libc` and `libgcc_s`. The build
+  targets the generic CPU of its architecture (no `target-cpu=native`),
+  so the image runs on any host of it. Nothing in the Dockerfile is
+  architecture-specific: the base index, PGDG's `postgresql-server-dev-18`
+  at the base's exact version and Debian's `rustup` all exist for arm64,
+  and CI builds and tests the arm64 image on tags (see [Docker image in
+  CI](/design/docker-image#docker-image-in-ci)).
+- **Init script.** `10-pg-automerge.sh` runs `CREATE EXTENSION IF NOT
+  EXISTS pg_automerge` in `POSTGRES_DB` on first initialization, unless
+  `PG_AUTOMERGE_CREATE_EXTENSION=0`; any other value than `0`/`1` fails
+  initialization rather than guessing. It is executable, so the entrypoint
+  runs it in its own process instead of sourcing it into its shell. Its
+  `psql` connects like the entrypoint's own `docker_process_sql`, over the
+  socket with `PGHOST` and `PGHOSTADDR` cleared: set in the container's
+  environment for other tools, they would send it over TCP to the
+  temporary server, which listens only on the socket. A bind mount over
+  `/docker-entrypoint-initdb.d` (the usual way to add init files) hides
+  it, and the extension would silently be missing; [Docker](/guide/docker#configuration) says to
+  mount single files instead, and the same script is installed as
+  `/usr/local/bin/pg-automerge-initdb` for a mounted directory's own
+  script to run. It
+  does not touch `template1`: the extension is not trusted (see [Why the
+  extension is not trusted](/design/installation#why-the-extension-is-not-trusted)), and a copy
+  in the template would install it into every database a `CREATEDB` role
+  creates.
+- **Settings are suggested, not baked in.** The image keeps Postgres'
+  defaults; `compose.yaml` passes `default_toast_compression=lz4` (the
+  image's Postgres is built `--with-lz4`; stored values are uncompressed
+  saves, see [The `automerge` type](/reference/automerge-type)) and
+  `pg_automerge.max_load_memory=1GB` on the command line, which [Docker](/guide/docker#configuration)
+  explains. A memory-limited container makes the limit matter more: a
+  failed allocation or an OOM kill restarts the cluster.
+- **Compose.** Named volume at `/var/lib/postgresql` (the 18 images'
+  `PGDATA` is `/var/lib/postgresql/18/docker`, so a later major's data
+  directory can sit next to it for `pg_upgrade --link`), port on
+  `127.0.0.1` only, `shm_size` above Docker's 64 MB for parallel query,
+  and a `pg_isready` healthcheck over TCP, which fails during first
+  initialization (the entrypoint's temporary server listens only on the
+  socket), so the service is healthy only once the extension is created
+  and the real server runs. `pull_policy: never`: the image is local.
+- **Tests.** `tests/docker.sh` (`mise run docker-test`, after
+  `docker-build`; not part of `mise run test` because it needs Docker and
+  a release build; CI's `docker` job runs it) checks the labels, the
+  version file and license, that no toolchain is in the image, lz4
+  support, the exact set of extension files (the install script, the
+  control file, the library, and every `sql/pg_automerge--*--*.sql`
+  upgrade script the repository has) and a `source` label without
+  credentials. Then, against fresh
+  containers and volumes (labelled `pg-automerge-test`, port 5432
+  published on a free port of 127.0.0.1, all removed on exit; helpers in
+  `tests/docker_lib.sh`):
+  - default init: installed in `POSTGRES_DB` at the crate version, not in
+    `postgres` or `template1`, `debug_assertions` off;
+  - SQL through the container's own `psql`: text and bytea casts
+    round-trip, `||` (documents and bare changes), `merge` and
+    `merge_agg` of the regress fixtures' concurrent edits agree (heads and
+    content: `merge_agg` in another order may lay out the bytes
+    differently), jsonb operators on the type, `22P02` for corrupt input,
+    lz4 on an `automerge` column; a GIN `jsonb_path_ops` index on
+    `(doc::jsonb)` that `doc @> ...` uses (the implicit cast matches the
+    index expression) and a STORED generated `doc::jsonb` column; the
+    history functions against each other (change counts, changes since
+    the base's heads, their bytes merged onto the base give the same
+    heads, jsonb at the base's heads is the base, `automerge_get_change`,
+    `automerge_contains`);
+  - `automerge_notify()` with a separate `LISTEN` session (it holds a
+    statement open until the writer is done, so the delivery is
+    deterministic): payload table, op, key, heads and prev_heads;
+  - the settings' defaults, and a plain role's `SET` of either refused;
+  - `pg_dump -Fc` in one container, `pg_restore --exit-on-error` into a
+    second one initialized with `PG_AUTOMERGE_CREATE_EXTENSION=0` (the
+    dump's `CREATE EXTENSION` installs it): same bytes, heads, jsonb and
+    generated columns, column compression, the index valid and used, the
+    trigger present;
+  - a restart on the same volume (data kept, init not re-run, `ALTER
+    EXTENSION .. UPDATE` a no-op), `PG_AUTOMERGE_CREATE_EXTENSION=0` (then
+    a manual `CREATE EXTENSION .. SCHEMA`), an invalid value failing init;
+  - the upgrade path with the image's own scripts and library, as
+    `tests/upgrade.sh` does against pgrx's Postgres: each
+    `sql/snapshots` version and variant is copied into the container under a scratch
+    version name, with the first hop of each upgrade path the image ships
+    (so an image missing an upgrade script fails), documents are stored,
+    `ALTER EXTENSION .. UPDATE` reaches the current version and the
+    documents read the same (the catalog comparison stays in
+    `upgrade.sh`; a real 0.1.0 deployment moved to the image is
+    `tests/docker_upgrade.sh`, see [Upgrade tests](/design/versioning#upgrade-tests));
+  - `PGHOST=localhost` and `PGHOSTADDR` in the container's environment
+    with an init file mounted as a single file next to ours (the
+    extension is created, the file runs after it), and a whole directory
+    mounted over `/docker-entrypoint-initdb.d` whose own script runs
+    `pg-automerge-initdb`;
+  - the regress examples through `pg_regress --use-existing` (the same
+    expected output as `mise run regress`), and `concurrency.sh`,
+    `notify.sh`, `dump.sh`, `extension.sh` and `memory.sh` in
+    `tests/lib.sh`'s external mode, against one container;
+  - `limits.sh` in container mode, against a container started with
+    `--memory=1g --memory-swap=1g` (`DOCKER_TEST_MEMORY`) and the default
+    limit: without the limit, six of the seven crafted inputs get the
+    backend killed by the cgroup's OOM killer (signal 9) and the
+    postmaster restarts every session, which is what a production
+    container would do; with the limit, every path gets `53400` and
+    nothing restarts (no new "terminated by signal", the sentinel session
+    alive, `pg_postmaster_start_time()`, the container's start time and
+    restart count unchanged). The seventh input, a compressed change
+    chunk listing 20,000,000 empty other actors, gets Automerge's own
+    `22P02` without the limit instead: it reserves a large table that it
+    barely touches before rejecting the chunk, which an address-space cap
+    (`ulimit -v`, the scratch cluster) refuses and a used-memory cap (the
+    cgroup) does not. The limit refuses it first either way.
+  - a 60-second smoke run of `tests/soak.sh` (`SOAK_SMOKE=1`: 4 clients,
+    documents up to 200 kB, 60 rows, its own container with
+    `--memory=2g`), with all its checks (see [Soak test](/operations/soak-test));
+  - every container's log (`docker logs`) is free of `TRAP:`, `PANIC:`,
+    Rust panics and backends terminated by a signal or a non-zero exit
+    (not any process's: the logical replication launcher exits with 1 at
+    every shutdown, including the init server's); the limits container
+    may show its deliberate crashes only;
+  - `compose.yaml` (`up --wait` healthy, settings applied, port on
+    127.0.0.1, `down -v` leaves no volume);
+  - the release scripts: `scripts/docker-archive.sh` names the archive by
+    version and architecture, `scripts/docker-push.sh --dry-run` loads it
+    back as the same image (the ID it prints) and prints the pushes it
+    would make; loading an archive whose tag (e.g. `pg-automerge:<version>`)
+    points to another image locally, or to none, leaves that tag as it
+    was; and it
+    refuses a repository without a registry host (Docker would send it to
+    Docker Hub), another version's archive and a duplicate architecture.
+
+  The whole run takes about 6 minutes once the image is built (about 2
+  of them the suites, 1.5 the soak smoke run, up to 1 the archive).
+  `mise run docker-bench-sql` (`tests/docker_bench.sh`) runs
+  `tests/bench_sql.sh` against a container of the image (see the
+  appendix).
+
+Measured 2026-09-30 on an 8-core Intel Atom C3758R (2.4 GHz), Docker 29.8
+with BuildKit:
+
+| | |
+|---|---|
+| Image size | 460 MB (`postgres:18` is 457 MB: the extension adds 3.5 MB, of which the library is 3.47 MB) |
+| Cold build (fresh builder, base pulled) | 462 s: apt 51 s, Rust + cargo-pgrx 168 s, the extension (fat LTO) 205 s |
+| Warm build, nothing changed | 1.3 s |
+| Warm build, one source file changed | 65 s (dependencies cached in the `target/` mount; the release profile's fat LTO and one codegen unit dominate) |
+
+## Docker image in CI
+
+The `docker` job of `.github/workflows/ci.yml` runs on every push and pull
+request, in parallel with the `ci` job (it needs neither pgrx nor its
+Postgres): it builds the image with `scripts/docker-build.sh` (the same
+build arguments as locally) on a `docker-container` BuildKit builder, and
+runs `tests/docker.sh` in full, the suites included, with PGDG's
+`postgresql-client-18` as the client tools
+(`PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config`; `tests/lib.sh` takes
+any Postgres 18 client in external mode) and Rust from `mise.toml` for the
+suites' fixture generators. The nightly run also benchmarks the image.
+
+- **Layer cache in the GitHub Actions cache** (`type=gha`, one scope per
+  architecture, `mode=max` so the builder stage's layers are exported, not
+  only the final image's; `ignore-error=true` so a cache hiccup does not
+  fail a build). BuildKit's cache *mounts* (cargo registry, `target/`) are
+  not exported, so on a runner a source change recompiles the
+  dependencies; the apt and toolchain layers (Rust, cargo-pgrx: 3.5 of the
+  cold build's 7.5 minutes) come from the cache. Persisting the mounts too
+  (e.g. a cargo-chef-style dependency layer, or copying the mounts in and
+  out of the cache) would save most of the rest, at the price of a more
+  involved Dockerfile; not done. `docker build` in a `run:` step reaches
+  the cache through `crazy-max/ghaction-github-runtime`, which exposes the
+  runtime token that `docker/build-push-action` would otherwise handle;
+  the build stays in the one script that local builds use.
+- **Tags: amd64 and native arm64.** On a `v*` tag (checked against the
+  crate version first) the job is a matrix of `ubuntu-24.04` and
+  `ubuntu-24.04-arm`; each leg builds and tests its own image natively and
+  uploads it as a workflow artifact (`scripts/docker-archive.sh`: a gzipped
+  `docker save`, 177 MB for amd64). The repository variable
+  `PG_AUTOMERGE_ARM64=false` drops the arm64 leg where GitHub's arm64
+  runners are not available. Alternatives considered for arm64:
+  - *QEMU* (`docker buildx build --platform linux/arm64` on an amd64
+    runner): no change to the Dockerfile, but every compiler process of
+    the builder stage runs emulated. The cold build is about 6 minutes of
+    compilation (cargo-pgrx, then the extension with fat LTO); user-mode
+    emulation typically slows `rustc` by an order of magnitude, so that
+    becomes an hour or more per cold tag build, and a source change still
+    recompiles everything that is not in the layer cache. Not measured
+    here: that would need QEMU's binfmt handlers registered in this
+    machine's kernel, a host-wide change.
+  - *Cross-compilation* (an amd64 builder targeting
+    `aarch64-unknown-linux-gnu`). Tried on 2026-09-30 in a throwaway
+    container of the builder stage (adding `gcc-aarch64-linux-gnu`,
+    `libc6-dev-arm64-cross` and the Rust target): it works with pgrx
+    0.19.3, but only with hand-made flags. bindgen needs
+    `--sysroot=/usr/aarch64-linux-gnu` and then fails on ICU's headers,
+    which `pg_locale.h` includes, until the amd64 system headers are added
+    after the sysroot (`-idirafter /usr/include`); the linker needs
+    `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`. The library built
+    (an AArch64 ELF, 4 min 36 s for a dev build, the same as native) and
+    `cargo pgrx package --target aarch64-unknown-linux-gnu` generated the
+    SQL (28 entities, as natively). But the bindings come from the amd64
+    `pg_config.h` (the arm64 `postgresql-server-dev-18` cannot be
+    co-installed with the amd64 one; its headers would have to be
+    unpacked by hand), and the result could not be run or tested on the
+    build host. A second, fragile build path for an image nobody tested.
+  - *Native arm64 runner* (chosen): the unchanged Dockerfile, no
+    emulation, and the whole of `tests/docker.sh` (memory-limit crashes,
+    `pg_regress`, the suites) runs on the architecture it ships for. Its
+    cost is the dependency on GitHub's arm64 runner and a second cold
+    build per tag, in parallel.
+- **Publishing is prepared, not enabled.** The `publish` job runs on tags
+  after both `ci` and `docker` passed, downloads the tested archives and
+  pushes them with `scripts/docker-push.sh`: each archive is loaded (the
+  local tags it carries are put back afterwards, so a by-hand run with
+  the arm64 archive on an amd64 host does not repoint
+  `pg-automerge:<version>`), checked (version label equals the crate version, architecture equals
+  the file name's), tagged `<image>:<version>-<arch>` and pushed, then
+  `docker buildx imagetools create` makes `<image>:<version>` and
+  `<image>:latest` an index of them. Pushing the tested bytes rather than
+  rebuilding for the registry means what is published is what passed.
+  Every step after the first is gated on the secret
+  `PG_AUTOMERGE_REGISTRY_TOKEN` (plus the variables for the image and
+  user): without it the job logs a notice and succeeds. The workflow's
+  token is `contents: read`; `tests/check_ci.sh` fails if any step outside
+  `publish` logs in or pushes, if a `publish` step is not gated, if
+  anything asks for write permissions or `push: true`, or if the job stops
+  depending on both test jobs. The repository name must start with a
+  registry host, so a typo cannot send the image to Docker Hub.
+- **Linting the workflow.** `mise.toml` pins `actionlint` and `shellcheck`
+  (prebuilt binaries); `check_ci.sh` runs actionlint on the workflow
+  (syntax, expression types, runner labels, and shellcheck on every
+  `run:` script) and shellcheck (warnings and errors) on the scripts CI
+  runs, then the job invariants above. Each invariant was checked by
+  breaking it once.
+
+Measured 2026-09-30 on the same machine, with a fresh `docker-container`
+builder per build and a local cache export standing in for the GitHub
+Actions cache (the same export format; the upload to GitHub is not
+included):
+
+| | |
+|---|---|
+| Cold build, exporting the cache | 9 min 42 s: 7 min 30 s building (apt 52 s, Rust + cargo-pgrx 163 s, extension 210 s), 2 min 5 s exporting it |
+| Exported cache (`mode=max`) | 693 MB per architecture (the GitHub Actions cache holds 10 GB per repository) |
+| Fresh builder, cache imported, nothing changed | 34 s |
+| Fresh builder, cache imported, one source file changed | 5 min 36 s (221 s compiling the extension and its dependencies) |
+| `tests/docker.sh` with PGDG's client tools | 239 s, including 35 to 60 s for the archive and the push dry run |
+
+GitHub's standard runners have 4 vCPUs (this machine: 8 slower cores), so
+the absolute times there will differ; the proportions should not.

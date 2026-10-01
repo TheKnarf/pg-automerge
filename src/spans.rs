@@ -1,6 +1,7 @@
 //! `automerge_spans`: the structure of a text object (text runs with their
 //! marks, and blocks) as jsonb, in the shape of the Automerge JavaScript
-//! API's `spans()`. See docs/DESIGN.md, "Rich text spans".
+//! API's `spans()`. See
+//! docs/src/pages/reference/rich-text-spans.mdx.
 
 use pg_automerge_core::{self as am, Error};
 use pgrx::prelude::*;

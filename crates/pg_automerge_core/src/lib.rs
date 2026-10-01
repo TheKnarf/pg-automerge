@@ -1,15 +1,16 @@
 //! Postgres-independent Automerge logic for pg_automerge.
 //!
 //! Everything here is plain Rust and tested with `cargo test -p pg_automerge_core`;
-//! the pgrx crate at the repo root is only glue. See docs/DESIGN.md.
+//! the pgrx crate at the repo root is only glue. See
+//! docs/src/pages/design/architecture.mdx.
 //!
 //! "Stored bytes" below always means the canonical representation of the SQL
 //! `automerge` type: the output of [`Automerge::save_nocompress`] for a
 //! document without queued (dependency-less) changes.
 
 #![warn(missing_docs)]
-// No unsafe code of its own: all of it is in the pgrx glue (docs/DESIGN.md,
-// "Unsafe code").
+// No unsafe code of its own: all of it is in the pgrx glue
+// (docs/src/pages/design/unsafe-code.mdx).
 #![forbid(unsafe_code)]
 
 use std::fmt;

@@ -1,0 +1,107 @@
+---
+title: "Operations"
+section: Operations
+order: 0
+description: "What a long concurrent load showed, and what to plan for: memory, WAL and TOAST, GIN indexes."
+---
+
+What a long concurrent load showed (`mise run soak`, 70 minutes, eight
+long-lived connections against the Docker image in a 4 GB container:
+incremental writes, upserts of full saves, concurrent writers on the same
+rows, jsonb, GIN, `automerge_spans`, history and `merge_agg` reads, a
+`LISTEN` client, a table growing from 200 to about 2,500 to 2,900
+documents of 1 kB to 1.26 MB; results in
+[Soak test (2026-10-01)](/design/benchmarks/2026-10-01#soak-test-2026-10-01)): no memory leak (the
+Rust heap back to 16 bytes between statements, memory contexts flat at
+3 MB per backend), no lost or duplicated write, exactly one notification
+per write, no error. What to plan for:
+
+## Sizing memory
+
+A backend loading a document needs memory outside `shared_buffers` and
+`work_mem`, for as long as the load lasts. How much depends on the
+document more than on its size: loading a 1.26 MB rich text (paragraphs,
+headings, marks) took 342 MB, a 1.07 MB list of 23,000 small maps 22 to
+24 MB, a 3 MB plain text 273 MB. Measure your own largest documents:
+
+```sql
+SELECT automerge_memory_reset();
+SELECT doc->>'title' FROM docs WHERE id = $1;
+SELECT pg_size_pretty(peak_allocated_bytes) FROM automerge_memory_usage();
+```
+
+Then, for the container (or server) memory limit:
+
+```text
+limit ≥ shared_buffers
+      + connections × (20 MB + trim threshold)     (each backend's own memory, and what it may keep untrimmed)
+      + concurrent loads × largest document's peak (sessions that may load the largest documents at once)
+      + room for the page cache
+```
+
+With `pg_automerge.trim_threshold` (default 64 MB), a connection gives
+back what a transaction freed beyond the threshold, so only concurrent
+loads count in full; with `-1`, count every connection × the largest
+peak instead. In the soak test (8 connections, 4 GB,
+`shared_buffers=256MB`) the container's anonymous memory was 1.3 to
+1.7 GB at the median and 2.5 GB at most with the trim, against 2.4 GB at
+the median without; the page cache took the rest. A backend killed by
+the kernel's OOM killer restarts every session of the cluster, so leave a
+margin.
+
+`pg_automerge.max_load_memory` caps the estimate of what a write's load
+may take (client input and merge results; reads of stored values are not
+capped). The estimate is above the real peak (458 MB for the 342 MB rich
+text above), so set it above the estimate of the largest document you
+accept (a refused write says the estimate) and below `(limit −
+shared_buffers − connections × (20 MB + trim threshold)) / concurrent
+writers`. The soak
+used 512 MB.
+
+## Writes, WAL and TOAST
+
+Every write stores the whole document again: Postgres writes the new
+version's TOAST chunks in full and the old ones become dead (TOAST is
+never updated in place), and a generated `doc::jsonb` column is a second
+copy as large as the document (425 kB against 427 kB stored per 1 MB
+document, with lz4). In the soak, 47.7 GB of WAL in 70 minutes, 950 kB
+per write averaged over a mix where a tenth of the writes went to the
+1 MB documents (1.34 MB with the GIN index's `fastupdate = off`, see
+below). Plan WAL archiving, replication and backup bandwidth for
+`document size × writes`, raise `max_wal_size` (the default 1 GB made
+Postgres warn "checkpoints are occurring too frequently" at that rate),
+and for large documents prefer small generated columns of the fields you
+query to a full jsonb copy.
+
+`default_toast_compression=lz4` stored the 1.07 to 1.26 MB documents in
+437 kB on average. Autovacuum's defaults kept up at about 8 writes per
+second: the TOAST table was vacuumed about once a minute, its dead tuples
+stayed under 30% and its free space (16 to 44%) was reused, so the table
+grew with the number of documents, not with the number of writes. For
+much higher write rates on large documents, lower the table's
+`autovacuum_vacuum_scale_factor` (the TOAST table follows unless
+`toast.autovacuum_vacuum_scale_factor` is set).
+
+## GIN indexes on documents
+
+Create GIN indexes on a document's jsonb (a generated column or
+`(doc::jsonb)`) with `WITH (fastupdate = off)` when the documents are
+written often. With the default (`fastupdate = on`), writes add their
+keys to the index's pending list, and every write of a large document
+adds thousands; the planner counts the pending list in the index's cost,
+so while writes keep it full it chooses a sequential scan, which detoasts
+and checks every row's jsonb. In the soak, a containment query
+that takes 1.5 ms through the index took 600 to 900 ms that way, growing
+with the table (84 → 488 ms at the median over the run); with
+`fastupdate = off` it averaged 12 ms instead of 466 ms under the same
+load, writes took about as long (small documents 74 against 68 ms on
+average, big ones 3.45 against 3.60 s), and the whole mix ran 31.5
+instead of 25.5 transactions per second; over a whole run, the query's
+median stayed at 1.4 to 3 ms. The price is WAL: each write then inserts
+its keys into the index tree directly, and the run wrote 1.34 MB of WAL
+per write instead of 0.95 MB (+41%). `ALTER INDEX .. SET (fastupdate =
+off)` changes an existing index (then `VACUUM` the table to empty its
+pending list). Either way, a GIN index over the whole jsonb of large
+documents is expensive to maintain; index the few fields you query
+(small generated columns, or expression indexes on them) where you
+can.

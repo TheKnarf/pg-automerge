@@ -1,0 +1,64 @@
+---
+title: "Naming"
+section: Reference
+order: 100
+description: "Why the SQL objects are named the way they are."
+---
+
+The SQL surface was reviewed as a whole before the first release (0.1.0;
+until then renames needed no aliases or upgrade script, now every change
+needs a version and an upgrade script, see [Versioning and
+upgrades](/design/versioning)). Principles:
+objects that cannot collide because they take an `automerge` argument may
+use generic names where that reads better (`merge`, `merge_agg`, `||`);
+everything else carries the `automerge_` prefix; parameter names are the
+same for the same role, so named-argument calls read consistently (`doc`
+for the document, `changes` for bytes, `since_heads`/`heads`, `hash`).
+
+Renamed:
+
+- `merge_agg_trans` / `merge_agg_final` → `automerge_merge_agg_trans` /
+  `automerge_merge_agg_final`. `merge_agg_final(internal)` has no
+  extension type in its signature, so another extension (or a user
+  function) of that name in the same schema would make `CREATE EXTENSION`
+  fail, or ours block theirs; both support functions also show up in
+  `\df`. The prefix removes the clash; the aggregate keeps its name.
+- The first parameter of `merge(automerge, bytea)` and
+  `automerge_contains(automerge, bytea)`: `a` → `doc`, as in every other
+  function whose first argument is the document the bytes apply to
+  (`merge(doc => d, changes => c)`). `merge(a, b)` and
+  `automerge_contains(a, b)` keep `a`, `b`: a pair of documents.
+
+Considered and kept:
+
+- `merge`, `||`: required, and keyed on the `automerge` type (`merge` is an
+  unreserved keyword; unqualified calls work, tested).
+- `merge_agg` rather than `automerge_merge_agg`: Postgres identifies an
+  aggregate by name and argument types, so another extension's
+  `merge_agg(hll)` or `merge_agg(anyelement)` coexists with ours in the
+  same schema, and a call on an `automerge` argument resolves to ours (an
+  exact match beats a polymorphic or cast candidate). It pairs with `merge`
+  the way `string_agg`, `json_object_agg` pair with their scalar forms.
+- `automerge_changes` / `automerge_changes_meta` / `automerge_changes_bytes`:
+  one family with the same `since_heads` parameter. `automerge_save_after`
+  (Automerge's name) for the last was rejected: it would split the family,
+  and "save" suggests a document, while the result is change chunks.
+- `automerge_get_change` rather than `automerge_change(doc, hash)`: a
+  function named like the composite type `automerge_change` would read as
+  the function-call form of a cast to that type.
+- `automerge_change_count`, `automerge_heads`, `automerge_contains`,
+  `automerge_notify` (trigger functions are named for what they do, like
+  `pg_notify`), `automerge_from_bytea` (the cast function),
+  `automerge_merge_support`.
+- `automerge_to_jsonb(doc, heads)` as an overload of the cast function
+  rather than `automerge_to_jsonb_at`: same result, "the jsonb of `doc`",
+  as of `heads`; the cast is bound by OID, so the overload cannot change
+  what the cast calls, and `heads => '{}'` reads well in named form.
+- The composite types' columns (`hash`, `actor`, `seq`, `start_op`,
+  `op_count`, `time`, `message`, `deps`, `change`): Automerge's own field
+  names in snake case. `time` is a non-reserved keyword and works unquoted
+  as a column (`SELECT seq, time FROM ...`, in the regress examples);
+  `change` (the change's bytes, for `decodeChange` / `applyChanges`) was
+  kept over `bytes`, which names a representation, not what it is.
+- The setting `pg_automerge.verify_writes`: custom settings are prefixed
+  with the extension name.

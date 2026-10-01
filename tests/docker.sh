@@ -115,8 +115,8 @@ contents="$(docker run --rm --label "$LABEL" --entrypoint bash "$IMAGE" -euc "
 " 2>&1)" || { echo "$contents" >&2; fail "image contents"; }
 files="$(sort <<<"$contents" | tr '\n' ' ')"
 # The install script, the control file, the library, and every upgrade
-# script in sql/ (cargo pgrx package ships them; see "Versioning and
-# upgrades" in docs/DESIGN.md).
+# script in sql/ (cargo pgrx package ships them; see
+# docs/src/pages/design/versioning.mdx).
 expected_files="$( { printf '%s\n' "pg_automerge--$VERSION.sql" pg_automerge.control pg_automerge.so
     for f in sql/pg_automerge--*--*.sql; do if [[ -e "$f" ]]; then basename "$f"; fi; done; } | sort | tr '\n' ' ')"
 expect "extension files" "$expected_files" "$files"
@@ -429,7 +429,7 @@ docker rm -f -v "$(cname bad)" >/dev/null
 log "PGHOST in the environment, and an init file mounted next to ours"
 # The init script connects over the socket like the entrypoint's own psql,
 # whatever PGHOST says; a single file mounted into
-# /docker-entrypoint-initdb.d runs after it (README.md, Docker).
+# /docker-entrypoint-initdb.d runs after it (docs/src/pages/guide/docker.mdx).
 INIT="$DWORK/init"; mkdir -p "$INIT"; chmod 755 "$INIT"
 printf '%s\n' 'CREATE TABLE app_t (id int PRIMARY KEY, doc automerge NOT NULL);' \
     "INSERT INTO app_t VALUES (1, '\\x$BASE');" >"$INIT/20-app.sql"

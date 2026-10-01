@@ -1,5 +1,6 @@
 -- A re-sent change (a retry after a lost acknowledgement), skipped with
--- the README's WHERE NOT automerge_contains pattern: updates no row and
+-- the WHERE NOT automerge_contains pattern of
+-- docs/src/pages/guide/keeping-backends-in-sync.mdx: updates no row and
 -- notifies nobody.
 SELECT last_value AS maxid FROM soak_id \gset
 \set id random(0, :maxid)

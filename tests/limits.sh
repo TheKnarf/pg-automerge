@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The load memory limit against a real crash (run via `mise run limits`,
-# also part of `mise run test`). See docs/DESIGN.md, "Resource limits".
+# also part of `mise run test`). See
+# docs/src/pages/design/resource-limits.mdx.
 #
 # A scratch cluster (initdb into a temporary directory, its own port) runs
 # with its address space capped (`ulimit -v`, LIMITS_AS_KB, default about

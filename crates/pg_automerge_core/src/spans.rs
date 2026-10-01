@@ -1,6 +1,7 @@
 //! The structure of a text object (text runs with their marks, and block
 //! markers) as JSON, in the shape of the Automerge JavaScript API's
-//! `spans()` (see docs/DESIGN.md, "Rich text spans").
+//! `spans()` (see
+//! docs/src/pages/reference/rich-text-spans.mdx).
 //!
 //! The result is an array of
 //!

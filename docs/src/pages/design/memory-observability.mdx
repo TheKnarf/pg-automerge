@@ -1,0 +1,310 @@
+---
+title: "Memory observability"
+section: Design
+order: 50
+description: "The counting allocator behind automerge_memory_usage(), and returning freed memory."
+---
+
+Automerge allocates with the Rust global allocator, so every loaded
+document, the buffers around it, the rows a set-returning function holds
+and a `merge_agg` state live in the backend's `malloc` heap, outside
+Postgres' memory contexts: `pg_backend_memory_contexts`,
+`pg_log_backend_memory_contexts()`, `work_mem` and HashAgg's accounting do
+not see them, and a 3 MB document takes about 400 MB loaded (see
+[Input amplification
+measurements](/design/benchmarks/2026-09-29#input-amplification-measurements-2026-09-29)). Since 0.3.0
+two functions show it, for the current backend:
+
+| Column of `automerge_memory_usage()` | Meaning |
+|---|---|
+| `allocated_bytes bigint` | Bytes the library's Rust code holds now: exact, counted by the global allocator |
+| `peak_allocated_bytes bigint` | The most it held since the backend started or the last `automerge_memory_reset()`, including documents a call loads and drops |
+| `live_documents bigint` | Loaded documents alive: `LoadedDoc`s (expanded values: `merge` results, the `bytea` cast's) and `merge_agg` states. A document a read loads and drops within one call is not counted (it shows in the peak and in `loads`) |
+| `loads bigint` | `Automerge::load` calls: every load of a stored value, of client input, and every save-and-load check, failed ones included |
+| `load_time double precision` | Their total time in milliseconds (wall clock, `Instant`) |
+
+`automerge_memory_reset()` sets the peak to the current allocation and
+`loads` and `load_time` to zero (the two others are current values). Both
+are `VOLATILE` and `PARALLEL RESTRICTED` (in a parallel worker they would
+report the worker's own heap; restricted keeps them in the leader), and
+`STRICT` like every pgrx function (they have no arguments). They are
+executable by `PUBLIC`: a session sees and resets only its own backend's
+counters. `automerge_memory_usage()` returns a set (`RETURNS TABLE`, one
+row), pgrx's way to return named columns; `SELECT * FROM
+automerge_memory_usage()` or `(automerge_memory_usage()).loads`.
+
+## Counting allocator or bookkeeping
+
+Two designs were compared:
+
+- **Bookkeeping around documents**: count `LoadedDoc`s and `merge_agg`
+  states, and attribute an estimated size to each (the `budget` model of
+  [Resource limits](/design/resource-limits)). Free for everything else, but an
+  estimate (plain text is over-counted about five times), known only for
+  documents whose counts were scanned, and blind to the biggest users:
+  the document every read loads and drops within one call (`doc->>'a'`
+  loads the whole document), the rows of a set-returning function, the
+  jsonb builder's tree, merge intermediates.
+- **A counting `#[global_allocator]`** (`src/alloc.rs`): the system
+  allocator plus three atomic counters (the allocation, its peak, and
+  since 0.3.0 its high point since the last trim, see
+  [Returning freed memory](/design/memory-observability#returning-freed-memory-pg_automergetrim_threshold)).
+  Exact, and covers everything the library's Rust code allocates, at a
+  cost on every allocation.
+
+Measured cost of the allocator (release builds, one CPU pinned,
+2026-10-01, on an Intel Atom C3758R at 2.4 GHz; bench-core's documents,
+see [Performance](/design/performance)):
+
+- Per allocation, `mise run bench-alloc` (the core crate's `bench_alloc`
+  example, which includes `src/alloc.rs` itself and switches the global
+  allocator between it and `System`; best of 7 rounds, 3 runs): a 16 to
+  79-byte allocation and free 32.1 to 32.6 ns without, 38.6 to 39.1 ns
+  with counting (+6.5 ns: two uncontended atomic read-modify-writes on
+  `ALLOCATED`, relaxed loads of `PEAK` and `HIGH`); an allocation while
+  the allocation only grows (2 million live blocks after a trim, each a
+  new high: a store to `HIGH` and a `fetch_max` on `PEAK` too) 82 to
+  84 ns without, 85 to 90 ns with (+3 to +7 ns, noisy). The first
+  version, with two counters (before the trim), cost +4.5 ns per
+  allocation and free on the same benchmark, so `HIGH` adds about 2 ns. (An earlier figure of
+  1.1 ns came from a different, unpublished loop; this one is the
+  published benchmark.)
+- `mise run bench-core` with the three-counter allocator installed as
+  the global allocator (a temporary edit; best of 2 runs per variant,
+  alternating, each a median of 5; items20k, items2k, text3mb,
+  2026-10-01): the walks within noise (-3.5% to +1.2%; items20k
+  per-object walk 144.2 → 145.7 ms); `Automerge::load` and `normalize`
+  of the small-map documents +0.6% to +1.3%; of text3mb, the largest
+  load (hundreds of MB allocated from a fresh heap, so nearly every
+  allocation a new high), +3.1% to +3.7% (`Automerge::load` 2489 →
+  2580 ms). The first measurement, with two counters:
+  `Automerge::load` and `normalize` of every document within noise (-0.8% to +0.6%; text3mb 2583 → 2563 ms,
+  items20k 157.8 → 158.1 ms); the jsonb walks +0.4% to +2.3%
+  (items20k one-sweep walk 63.2 → 64.6 ms); the allocation-heaviest case,
+  the per-object walk of many small maps, +3.6% (items20k 144.5 →
+  149.7 ms) and +6% (items2k 13.1 → 13.9 ms); `save_nocompress` and the
+  load memory scan unchanged.
+- `mise run bench-sql` (release build installed in the pgrx Postgres,
+  each SQL path timed alone, median of 3; runs with, without and again
+  with the two-counter allocator): no measurable cost. The run without it was the
+  slower one, by 2% in the geometric mean over the cases above 5 ms
+  (R1 text3mb 2979 ms without, 2898 and 2902 ms with; W1 items20k 373,
+  361 and 363 ms; W4 text3mb 5689, 5595 and 5564 ms; the largest
+  difference either way within 5%, except `A1` items20k at 9 ms), so the
+  machine's drift between runs exceeds the allocator's cost.
+
+So the allocator was chosen: its cost is at most a few percent on paths
+that allocate per object and within noise elsewhere, and it answers the
+question that matters ("how much memory does this backend's Automerge
+hold, and how much did it take at most") exactly. Bookkeeping is kept
+only where it is exact and nearly free: the live document count (a
+token in each `LoadedDoc` and `merge_agg` document, `stats::Live`) and the
+load count and time (`stats::timed_load` around the one
+`Automerge::load` call site, `load_bytes`), in the core crate
+(`stats`; no unsafe code).
+
+Soundness of the allocator: every method passes its arguments to
+`std::alloc::System` and returns its result unchanged; the counters are
+`AtomicUsize` statics updated with `Relaxed` read-modify-writes (exact
+under any number of threads; a backend has one) that never allocate,
+panic or re-enter the allocator. A failed allocation or reallocation
+changes no counter (the old block stays counted). The peak is raised
+with `fetch_max` only when the new total exceeds it, and read as at least
+the current total.
+
+What the numbers mean:
+
+- Bytes are what Rust asks for (`Layout::size`). `malloc` adds its chunk
+  headers and rounding, and keeps freed memory for reuse (glibc returns
+  it to the system only at the top of the heap or for large blocks it
+  mapped separately), so a backend's RSS can stay high after
+  `allocated_bytes` fell back, until the end of the transaction, where
+  the library returns it once enough was freed (see
+  [Returning freed memory](/design/memory-observability#returning-freed-memory-pg_automergetrim_threshold)).
+- A `#[global_allocator]` covers the Rust code linked into this library:
+  Automerge, the core, and pgrx's own Rust allocations (16 to 123 bytes
+  between statements in the tests). Another Rust extension in the same
+  backend has its own allocator and is not counted, nor is Postgres'
+  `palloc` memory (the jsonb results, detoasted values), which its memory
+  contexts show.
+- With the library in `shared_preload_libraries`, a backend inherits the
+  postmaster's counters along with its memory (a copy of what `_PG_init`
+  allocated, if anything; a fresh backend reports 16 bytes).
+- In a `FROM` clause that does not depend on the outer row the function
+  scan runs once and is rescanned from its stored result, so to watch the
+  counters change per row call it in the target list (the pg_tests do).
+
+## Returning freed memory (`pg_automerge.trim_threshold`)
+
+The [soak test](/operations/soak-test) found it (2026-10-01): with eight long-lived
+connections writing and reading documents of up to 1 MB for 70 minutes,
+every backend's anonymous RSS stayed between 200 and 355 MB for the whole
+run while `automerge_memory_usage()` showed 16 bytes allocated between
+statements. Not a leak (the high-water mark did not grow: 342 MB, the
+peak of loading the largest document, a 1.26 MB rich text), but `malloc`
+keeping the freed document for reuse: glibc gives memory back only from
+the top of the heap (`M_TRIM_THRESHOLD`) or for blocks it mapped
+separately, and it raises its mmap threshold (up to 32 MB) after the first
+large block is freed, so a loaded document ends up as holes in the heap.
+The container's anonymous memory was 2.4 to 2.6 GB of its 4 GB limit
+throughout: each connection holding the most it ever needed, whether
+idle or not. For an application pool that is `connections × the largest
+document's load`, permanently.
+
+Since 0.3.0 a transaction callback (`RegisterXactCallback` in
+`_PG_init`; no `shared_preload_libraries` needed) calls glibc's
+`malloc_trim(0)` at the end of every top-level transaction (commit,
+abort, prepare; and in parallel workers) in which the library's Rust
+allocation fell by at least `pg_automerge.trim_threshold` from its high
+point since the last trim. `malloc_trim` returns the top of the heap and,
+with `madvise(MADV_DONTNEED)`, every free page inside it. The high point
+is a third counter in the allocator (`alloc::HIGH`, a relaxed load per
+allocation and a plain store, no read-modify-write, on every allocation
+that is a new high since the last trim: rare in a steady state, nearly
+every allocation of a large load after a trim; about 2 ns per
+allocation in all, see [Memory observability](/design/memory-observability)); it
+starts over at each trim. The threshold is at least one byte: with `0`
+the trim runs at the end of every transaction in which anything was
+freed since the last one, never when nothing was, so transactions that
+freed nothing (those of other applications in the same backend, which
+never call the library) do not pay for it. Inside a transaction nothing is trimmed, so a loop over documents
+in one transaction reuses the memory.
+
+Measured on the pgrx Postgres (dev build, its dependencies optimized; one
+backend reading `doc::jsonb` of the soak's templates, each read its own
+transaction, median of 7 after one warm-up):
+
+| Document (load peak) | RssAnon after, `-1` | after, 64MB | Read, `-1` | Read, 64MB | Read, `0` |
+|---|---|---|---|---|---|
+| 1.26 MB rich text (342 MB) | 274 MB | 3 MB | 1695 ms | 1995 ms | 1998 ms |
+| 1.07 MB list of maps (22 MB) | 9 MB | 9 MB | 685 ms | 678 ms | 705 ms |
+| 209 kB list (5 MB) | 9 MB | 9 MB | 135 ms | 135 ms | 141 ms |
+| 4 kB board (\< 1 MB) | 2 MB | 2 MB | 3.0 ms | 2.7 ms | 2.9 ms |
+
+(RssAnon of the backend after a second read, from 2 MB before the first;
+glibc returned the list's memory by itself: its large blocks were mapped
+separately.)
+
+The cost is on the transaction after a trim that needs the memory again:
+the trim itself took 30 ms at `COMMIT` (342 MB freed), and the next read
+of the same document 260 ms more (+15%): the pages are faulted in and
+zeroed again, and on this host (transparent huge pages `always`) the
+fresh heap is no longer backed by huge pages. Transactions that freed
+less than the threshold pay nothing; with `0` (trim after every
+transaction that freed anything) the medium documents pay 3 to 5%.
+Even a small call frees its temporaries, so with `0` every transaction
+that calls the library pays for a trim: `automerge_heads` of an empty
+document, one per transaction, 0.419-0.431 ms with `64MB` and
+0.468-0.491 ms with `0` (pgbench, one client, the pgrx Postgres; about
+50 µs, -11% transactions per second). Before the one-byte minimum, `0`
+also trimmed after transactions that freed nothing, those that never
+call the library included; now they pay nothing (`SELECT 1`:
+0.164-0.166 ms with either setting).
+
+Default: 64 MB. A backend then keeps at most about that much of freed
+memory between transactions, and only transactions that used more than
+64 MB of Rust heap (documents of roughly 200 kB of rich text or 1 MB of
+small maps and more) pay for the trim, about 15% of their load time when
+the next transaction needs the memory again. A backend that keeps
+reloading the same large documents (and has the memory for it) can
+disable it (`-1`) or raise it; the setting is `SUSET` like the others,
+since a session that turns it off holds memory every other session of
+the container competes for.
+
+Alternatives considered:
+
+- glibc tunables (`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=...`, or
+  `mallopt(M_MMAP_THRESHOLD)` in `_PG_init`) fix the mmap threshold, so
+  large blocks are always mapped and unmapped: the same page-fault cost on
+  every large allocation, in every transaction, and no help for the
+  holes left by blocks below the threshold.
+- Trimming after every statement that freed a lot (an `ExecutorEnd`
+  hook): more often than needed inside transactions, and statements
+  outside the executor (utility commands) are missed.
+- Trimming when a backend goes idle: the right moment, but Postgres has
+  no hook there; a timer's signal handler cannot call `malloc_trim`.
+- Only the Rust allocation is watched. `palloc` memory freed by
+  Postgres (a detoasted 1 MB value, the jsonb result) goes back to the
+  same heap and is returned by the same trim, but does not trigger one.
+- Other C libraries: `malloc_trim` is glibc's (the Docker image and the
+  supported distributions); elsewhere the setting does nothing.
+
+Tests: a pg_test (`trim_returns_freed_heap_memory_once_enough_was_freed`)
+frees 32 MB of heap blocks below a block that stays and checks that RSS
+keeps them, that `trim_if_freed` trims at 16 MB but not at 64 MB nor
+twice, and that RSS drops by the 32 MB;
+`trim_threshold_zero_trims_only_after_something_was_freed` that `0`
+trims after a 1 MB block was freed but not when nothing was; another
+checks the setting
+(`kB`, superuser, `-1`). `tests/memory.sh` reads `RssAnon` from
+`/proc/self/status` through `pg_read_file` in a real session (so also
+against the Docker image): after reads of a 400,000-character text (34
+MB peak) with `-1` the backend keeps 36 MB; with `16MB` it is back within
+a few MB of its start after each transaction, but not inside one. The
+soak test with the trim: see [Soak test](/design/benchmarks/2026-10-01#soak-test-2026-10-01).
+
+## Cluster-wide view: not provided
+
+A view over every backend would need shared memory: a slot per backend
+reserved at startup (`shmem_request_hook`), which works only with the
+library in `shared_preload_libraries`. The Docker image and ordinary
+installs load it on first use, so the view would be empty exactly where
+it is not configured, and each allocation would have to publish to shared
+memory (or each backend at the end of each statement). The alternative of
+showing the heap as a memory context (so that `pg_backend_memory_contexts`
+and `pg_log_backend_memory_contexts(pid)` report it) is not possible:
+since PostgreSQL 16 a context's methods come from the fixed
+`mcxt_methods[]` table, indexed by the 4-bit method ID in every chunk
+header (`MemoryContextMethodID`, `utils/memutils_internal.h`), so an
+extension cannot define a context type whose statistics it reports. What to do instead (see
+[Monitoring](/operations/monitoring)): sample `automerge_memory_usage()`
+from the application's own connections (a pooled backend is reached only
+through its connection), and from outside, a backend's RSS, which
+includes this heap.
+
+## Tests
+
+- Core (`tests/stats.rs`, and a unit test in `stats.rs`): the live count
+  follows `LoadedDoc`s and a `merge_agg` accumulator's document (and its
+  finished copy), reads count a load and keep nothing, failed and
+  panicking loads are counted, `reset()` zeroes only the cumulative
+  counters.
+- pg_tests (`src/tests/memory.rs`), reading the SQL function: one row,
+  labels `VOLATILE`/`PARALLEL RESTRICTED`, reset; a read of a
+  200,000-character document counts one load and time, its peak shows the
+  loaded document, and nothing stays; a PL/pgSQL variable holding a merge
+  result is one live document of more than the document's size while it
+  lives; a window `merge_agg` holds its state's document and the frame
+  result's while it runs, nothing after; a target-list
+  `automerge_changes` behind a cursor that fetched one row holds its
+  2,000 rows until `CLOSE`, and one stopped by `LIMIT` frees them; after
+  errors in the middle of operations (a reused actor id inside `merge`
+  and inside `merge_agg` with its state loaded, the jsonb nesting limit
+  part way through a walk, a division by zero while a set-returning
+  function holds its rows, malformed input, the forced failure of the
+  deferred check while flattening an expanded value in an `UPDATE`), three
+  times over, no document and no byte (within 64 kB of slack) stays;
+  and 200 rounds of in-place merges, jsonb conversion, history rows,
+  `merge_agg`, updates, a `LIMIT`ed set-returning function and caught
+  errors leave the allocation where it was (within 8 kB). That test was
+  checked against a deliberate leak: a 512-byte `mem::forget` per jsonb
+  conversion made it fail with exactly 102,400 bytes over the 200 rounds;
+  without it the drift is 0 bytes.
+- `tests/memory.sh` (`mise run memory`, part of `mise run test`, and run
+  against the Docker image by `mise run docker-test`): one session runs
+  100 rounds (after 3 of warm-up) of top-level statements: an upsert with
+  `merge`, incremental changes, a newer save through the cast, jsonb
+  reads and containment, heads, `merge_agg`, history rows, a `LIMIT`ed
+  target-list set-returning function, a cursor left open until `COMMIT`,
+  a rolled back update, PL/pgSQL in-place merges; and errors part way:
+  malformed input, changes with missing dependencies, an exception raised
+  while a PL/pgSQL variable holds a merge result, and `statement_timeout`
+  cancelling a `merge_agg` whose state holds a merged document. Every
+  expected error happens in every round and no other; afterwards the
+  allocation is where it was (measured: 123 → 123 bytes), no document is
+  alive, and at least 10 loads per round were counted. Then the reset,
+  and a new session's counters starting at zero.
+- `tests/upgrade.sh` and `tests/docker_upgrade.sh`: the functions after
+  `ALTER EXTENSION .. UPDATE` from every earlier version, relocated too,
+  and an update over a user's `automerge_memory_usage()` in the
+  extension's schema failing.

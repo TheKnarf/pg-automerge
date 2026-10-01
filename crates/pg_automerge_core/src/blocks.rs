@@ -1,5 +1,6 @@
 //! Whether a document has blocks: maps inside text objects (rich-text
-//! paragraphs, headings, embeds; see docs/DESIGN.md, "Deep blocks").
+//! paragraphs, headings, embeds; see
+//! docs/src/pages/design/deep-blocks.mdx).
 //!
 //! Automerge renders a block's value with `hydrate`, which recurses once
 //! per level of nesting inside the block, about 13 kB of stack per level

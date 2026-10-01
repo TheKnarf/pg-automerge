@@ -10,7 +10,7 @@
 //!
 //! Run once per automerge version the extension has shipped with and
 //! commit the output: the fixtures of every earlier version must keep
-//! loading (see docs/DESIGN.md, "Versioning and upgrades").
+//! loading (see docs/src/pages/design/versioning.mdx).
 
 use std::path::PathBuf;
 

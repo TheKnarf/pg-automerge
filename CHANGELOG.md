@@ -1,9 +1,10 @@
 # Changelog
 
 Versions are the extension's (`ALTER EXTENSION pg_automerge UPDATE`
-takes an installed one to the library's version; see the README's
-[Updating](README.md#updating) and
-[docs/DESIGN.md](docs/DESIGN.md#versioning-and-upgrades)). Each entry
+takes an installed one to the library's version; see
+[Updating](docs/src/pages/guide/updating.mdx) and
+[Versioning and upgrades](docs/src/pages/design/versioning.mdx) in the
+documentation). Each entry
 says whether an update needs more than recreating the container (or
 installing the package) and `ALTER EXTENSION pg_automerge UPDATE`.
 
@@ -16,8 +17,8 @@ no SQL): no `REINDEX`, no rewrite
 of generated columns, every function returns what it returned in 0.2.0,
 and the stored format is unchanged. The fixes take effect as soon as a
 backend loads the new library, before the `UPDATE`. With compose, set a
-`build:` section's `PG_AUTOMERGE_VERSION` arg to 0.3.0 (the README's
-[Updating](README.md#updating)).
+`build:` section's `PG_AUTOMERGE_VERSION` arg to 0.3.0 (see
+[Updating](docs/src/pages/guide/updating.mdx)).
 
 Added:
 
@@ -27,8 +28,8 @@ Added:
   and at peak (exact, from a counting allocator), loaded documents alive,
   and the number and total time of Automerge loads. And
   `automerge_memory_reset()`, which restarts the peak and the load
-  counters, to measure one statement. Per backend; see the README's
-  [Monitoring](README.md#monitoring). The allocator costs a few ns per
+  counters, to measure one statement. Per backend; see
+  [Monitoring](docs/src/pages/operations/monitoring.mdx). The allocator costs a few ns per
   allocation (`mise run bench-alloc`, new: +6.5 ns per allocation and
   free on an Atom C3758R): not measurable in `mise run bench-sql`
   (reads, writes, merges, `merge_agg`), and at most about 4% in the
@@ -48,12 +49,12 @@ Added:
   trims after every transaction in which anything was freed, and never
   after one that freed nothing (so other applications' transactions in
   the same backend do not pay about 50 µs each for it). See
-  the README's [Configuration](README.md#configuration).
+  [Configuration](docs/src/pages/reference/configuration.mdx).
 - **Soak test** (`mise run soak`, `tests/soak.sh`): an hour of
   concurrent writes, reads, history, `merge_agg`, notifications and
   VACUUM against the Docker image in a memory-capped container, sampled
-  and checked; its findings are in the README's new
-  [Operations](README.md#operations) section (memory sizing, WAL and
+  and checked; its findings are in the new
+  [Operations](docs/src/pages/operations/index.mdx) section (memory sizing, WAL and
   TOAST, and GIN indexes on documents: with Postgres' default
   `fastupdate = on` the planner stops using them while writes keep the
   pending list full, so create them with `fastupdate = off`, which costs
@@ -98,7 +99,8 @@ Known issue:
   while staying far below `pg_automerge.max_load_memory` (32,000 marks
   in 122 bytes: 3 s; a million: about 50 minutes, extrapolated). Saves
   are not affected. Not priced yet: the cheap bound would refuse
-  ordinary rich text (see docs/DESIGN.md, "What the limit cannot do").
+  ordinary rich text (see [What the limit cannot
+  do](docs/src/pages/design/resource-limits.mdx#what-the-limit-cannot-do)).
 
 Changed:
 
@@ -119,6 +121,11 @@ Changed:
   copy kept until the end of the call, so a large document held about
   twice its size in raw bytes while it was loaded or read (a 1 MB value:
   1,016,576 bytes left allocated in the call's memory context, now none).
+- The documentation is a static site (`docs/`: Vite, React, MDX,
+  prerendered for GitHub Pages; `mise run docs-dev`). README.md and
+  the design document were split into its pages, under `docs/src/pages`
+  (Guide, Reference, Operations, Design); README.md is now a short
+  landing page, and this changelog is the site's Changelog page.
 
 ## 0.2.0 (2026-09-30)
 

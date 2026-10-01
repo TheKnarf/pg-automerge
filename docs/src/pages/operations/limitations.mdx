@@ -1,0 +1,146 @@
+---
+title: "Limitations and gotchas"
+section: Operations
+order: 20
+description: "Costs, pitfalls and caveats to know before relying on the extension."
+---
+
+- **Each jsonb access is a load.** `SELECT doc->>'a', doc->>'b', doc->>'c'`
+  converts the document three times (1275 ms against 414 ms for one
+  access in a measurement). Convert once with
+  `FROM docs, LATERAL (SELECT doc::jsonb AS j OFFSET 0) x` and read
+  `x.j->>'a'` (the `OFFSET 0` stops the planner from inlining the cast
+  back), or keep the generated jsonb column shown above.
+- **Some writes cost two loads.** A full save, compressed
+  (`Automerge.save()`) or not (`saveNoCompress()`, `doc::bytea`), is loaded
+  once to validate it, and `merge(doc, $save)` with a newer save loads only
+  the save. Other input (a save followed by change chunks, a document saved
+  by a different Automerge implementation or version whose encoding
+  differs) and every merged result of incremental changes is loaded,
+  re-saved and loaded again to verify it; the upsert of a full save loads
+  it twice (Postgres hands `EXCLUDED` over flat).
+- **`pg_automerge.verify_writes`** is that verification load; see
+  [Configuration](/reference/configuration).
+- `merge(doc, $1)` with a parameter the driver types as `bytea` uses
+  `merge(automerge, bytea)`, which accepts full saves and bare change
+  chunks. An *untyped* literal or parameter (`merge(doc, '\x..')`) resolves
+  to `merge(automerge, automerge)` and must be a complete document; write
+  `'\x..'::bytea` for change chunks.
+- Incremental changes need an existing row: in
+  `INSERT .. VALUES ($1, $2) ON CONFLICT ..` the value is cast to
+  `automerge` on its own first, and bare changes are not a document.
+- `doc || '{"a": 1}'` means `merge`, not jsonb concatenation; write
+  `doc::jsonb || '{"a": 1}'`.
+- **No equality or btree opclass**, so no `DISTINCT`/`GROUP BY` on
+  `automerge` columns. But `a = b`, `a <> b`, `<` etc. do *not* fail:
+  through the implicit cast they become **jsonb** comparisons of the
+  current state. Two documents with different histories but the same
+  content compare equal. For "same document/history" compare
+  `automerge_heads(a) = automerge_heads(b)` (or `automerge_contains` both
+  ways).
+- `merge(a, b)` and `merge(b, a)` have the same heads and jsonb but can differ
+  in bytes when neither contains the other. Don't dedupe or cache on
+  `doc::bytea` / `md5(doc::bytea)`; use `automerge_heads(doc)`.
+- **Memory outside Postgres' accounting.** `merge_agg` keeps a fully
+  loaded document per group in backend memory (once a group needs a
+  merge; before that, the stored bytes); HashAgg cannot spill it,
+  and `work_mem`/`hash_mem_multiplier` do not limit it. The aggregate
+  declares a 1 MB state size so the planner favours sorted grouping, but
+  for a grouped `merge_agg` over many large documents check `EXPLAIN` and
+  use `SET enable_hashagg = off` if needed. In-memory merge results (the
+  PL/pgSQL example above) are likewise not counted.
+  `automerge_memory_usage()` shows this memory per session (see
+  [Monitoring](/operations/monitoring)).
+- **Small input, large load.** Automerge input is compressed and
+  run-length encoded: a 4 kB save of a 4,000,000-character text takes
+  4.3 s and 390 MB to load, and memory grows linearly with what the input
+  describes, not with its size. That memory is outside Postgres'
+  accounting, and when an allocation fails the backend aborts and the
+  postmaster restarts every session. `pg_automerge.max_load_memory`
+  refuses such input before it is loaded (see
+  [Configuration](/reference/configuration)); what it cannot do is bound several
+  sessions together, or catch a load that costs more than its measured
+  model predicts (an Automerge upgrade re-measures it). Keep memory
+  overcommit in mind, and `-1` only for trusted writers.
+- **Bundle chunks** (Automerge's experimental format that packs many
+  changes into one chunk) are refused as input (`0A000`).
+- **A load is not interruptible.** The jsonb conversion and the history
+  functions check for interrupts as they go (and `merge_agg` between
+  rows), but a single Automerge load, merge or save runs to the end
+  before a cancel or `statement_timeout` takes effect: 2.5 s for a 3 MB
+  document, longer for documents of tens of MB (at most about 16 s for
+  input within the default `pg_automerge.max_load_memory`). One known
+  exception: changes carrying many rich-text marks that overlap (open at
+  the same point of a text) take time that grows with the square of
+  their number when they are applied (`merge(doc, $changes)`, `||`, and
+  merges of documents with such histories); 32,000 of them in a
+  122-byte change take 3 s, a million would take most of an hour, and
+  the memory limit does not catch it (the memory stays small). If
+  clients' change bytes reach the database, consider refusing changes
+  with an implausible number of marks in the application. Saves are not
+  affected. See [What the limit cannot do](/design/resource-limits#what-the-limit-cannot-do).
+- **Every writer needs its own actor id.** Two writers (or two copies of
+  a document) that commit with the same actor id produce different changes
+  with the same sequence number, and Automerge cannot merge them. Every
+  path that meets both histories fails with SQLSTATE `22000` (data_exception,
+  not `22P02`; `conflicting automerge changes: actor ... has two different
+  changes with seq N`, with a HINT): `merge` / `||` of two documents,
+  `merge_agg`, `merge(doc, changes)` / `doc || changes`,
+  `automerge_contains(doc, changes)` when it has to load the document, and
+  text input or the `bytea → automerge` cast of bytes that hold both
+  histories (a save followed by the other writer's change chunk).
+  Retrying does not help; the fix is in the writer. Automerge picks a
+  random actor id per document instance unless you set one.
+- Malformed input is SQLSTATE `22P02` (`invalid automerge document`),
+  including input that passes Automerge's checksums but panics its decoder;
+  input that is well formed but holds two conflicting histories of one
+  actor is `22000` (above), input (or a merge result) over
+  `pg_automerge.max_load_memory` is `53400`.
+  One rare case is reported late: a result of `merge(doc, bytea)` is checked
+  to survive a save and load when it is first stored, sent or cast, not
+  inside `merge` (a `BEGIN .. EXCEPTION` around just the `merge` does not
+  catch it). Nothing that fails the check is ever stored.
+- In `since_heads`, hashes the document does not have are **ignored** (as
+  in Automerge's `getChanges`): a replica that is ahead of the stored row
+  gets every change that is not an ancestor of the heads the row knows,
+  which is more than it needs but never less. A mistyped hash therefore
+  returns more changes, not an error. `automerge_to_jsonb(doc, heads)`
+  instead fails with `22023` for an unknown hash. Malformed hashes (not 64
+  hex digits) are `22P02` everywhere.
+- `time` is Automerge's commit time in Unix seconds, NULL when unset.
+- `automerge_notify()` checks its arguments when it fires, not at
+  `CREATE TRIGGER`: a wrong key column or a BEFORE / statement-level
+  trigger fails the first write. A virtual generated column cannot be a
+  key (a trigger sees NULL in it, so it is refused with `22023`); use a
+  STORED generated column or the columns it is computed from. Its channel is used verbatim, like
+  `pg_notify`, while `LISTEN` lower-cases unquoted names: use a lower-case
+  channel. On a partitioned table, `table` is the partition.
+- `automerge_changes`, `automerge_changes_bytes` and `automerge_get_change`
+  rebuild change bytes from the document; prefer `automerge_changes_meta`
+  for listings. The set-returning functions compute all rows up front, so
+  `LIMIT` does not make them cheaper.
+- **Replication.** Physical replication and backups carry the values as
+  ordinary bytes, and a hot standby answers every read, but `LISTEN` is not
+  available on a standby: listeners connect to the primary. Logical
+  replication works in text and binary mode (`tests/replication.sh`) with
+  these caveats:
+  - The subscriber needs the extension, and validates every replicated
+    value again on the way in: one load per row and column (2.5 s for a 3
+    MB document), whichever mode, within the subscriber's
+    `pg_automerge.max_load_memory` (set it for the subscription's owner
+    at least as high as on the publisher, or the apply worker fails on a
+    larger row and retries).
+  - Use a primary key (or unique index) as the replica identity. With
+    `REPLICA IDENTITY FULL` the subscriber cannot match rows for `UPDATE`
+    and `DELETE` ("could not identify an equality operator for type
+    automerge": the type has none), and the apply worker fails and retries
+    until the subscription is fixed.
+  - `automerge_notify()` does not fire on the subscriber for replicated
+    rows unless the trigger is enabled with `ALTER TABLE .. ENABLE ALWAYS
+    TRIGGER` (or `ENABLE REPLICA`).
+- **Dump and restore** (`tests/dump.sh`): plain and custom-format dumps
+  restore with the extension in any schema; a restore and `COPY FROM`
+  validate every value (one load each, within
+  `pg_automerge.max_load_memory`: raise it for a restore into a server
+  with a lower limit) and recompute stored generated columns (one more
+  conversion each).

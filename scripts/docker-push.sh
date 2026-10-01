@@ -2,7 +2,9 @@
 # Push image archives made by scripts/docker-archive.sh (one per
 # architecture) to a registry as one multi-architecture image. Used by the
 # CI publish job, which runs only on version tags and only once a registry
-# is configured (see README.md, "Publishing the image"). Nothing in this
+# is configured (see
+# docs/src/pages/operations/docker-ci.mdx, "Publishing the image").
+# Nothing in this
 # repository calls it otherwise.
 #
 # For each archive: `docker load`, check that the image's version label is

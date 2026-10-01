@@ -1,0 +1,189 @@
+---
+title: "The automerge type"
+section: Reference
+order: 10
+description: "What a stored automerge value is: its invariants, verification of writes, casts, equality, and errors."
+---
+
+- Variable-length (`varlena`), `STORAGE = extended`, alignment `int4`.
+- Payload: the raw bytes of `Automerge::save_nocompress()`, no extra header.
+  Stored uncompressed so TOAST compression (pglz, or `lz4` via
+  `ALTER TABLE .. ALTER COLUMN .. SET COMPRESSION lz4`) is effective, instead of
+  compressing Automerge's already-deflated columns.
+- Text I/O is **lossless**, because `pg_dump`/`COPY` use it: output is `\x`
+  followed by lowercase hex of the stored bytes (same shape as `bytea`); input
+  accepts the same form, hex digits in either case. (No JSON text input: that
+  would create history.)
+- Binary I/O (`send`/`recv`): the raw bytes (recv validates and normalizes).
+
+## Invariants
+
+- **Normalized.** Every value entering the type (text input, binary
+  receive, the `bytea` cast) is loaded with `Automerge::load` (which accepts
+  a document chunk plus trailing change chunks, compressed or not) and
+  re-saved with `save_nocompress()`. A stored value is therefore always a
+  single uncompressed document chunk, whatever the producer sent. Empty
+  input (`''::bytea`, `'\x'`) is the empty document, whose jsonb is `{}`.
+- **Validated.** Input that does not load is rejected (`22P02`; `22000`
+  when it is well formed but holds two conflicting histories of one actor,
+  see [Error codes](/reference/error-codes)), and so is
+  input whose changes have missing dependencies: no orphaned changes are
+  stored.
+- **Nothing unloadable is stored** (while `pg_automerge.verify_writes` is
+  on, the default; see [The `pg_automerge.verify_writes`
+  setting](/reference/automerge-type#the-pg_automergeverify_writes-setting)). The normalized result
+  is loaded back once and must have the same heads, unless that load
+  provably reads the bytes the first load already accepted:
+  - the input already was the canonical encoding, or
+  - the input is one document chunk with deflated columns (a compressed
+    `save()`) and inflating it gives exactly the canonical encoding.
+    Automerge inflates such a chunk before it parses it (copying the
+    actors and heads, rewriting the column metadata with the deflate bit
+    cleared, inflating each column with `flate2`, copying the head
+    indices); `header::inflate_document` does the same with the same
+    `flate2` crate and backend (Cargo unifies them) and adds the chunk
+    header. If that equals `save_nocompress()` of the loaded document,
+    loading the save parses the very bytes that `Automerge::load(input)`
+    already parsed with `VerificationMode::Check`, so it cannot fail or
+    change the heads. With a load memory limit (the default), the scan
+    that prices the input (see [The scan](/design/resource-limits#the-scan)) has already inflated
+    those columns with the same decoder, and keeps them through the load:
+    `header::inflated_document_is` compares the save with the input's
+    layout and those columns in place, without inflating the input again
+    or hashing the result (the save's checksum is Automerge's hash of its
+    own data, so equal data means an equal checksum). The core tests
+    compare this path with the full load-save-load on generated
+    documents, trailing changes, corrupt and non-canonical deflate
+    streams, with and without a limit, and the fuzz harness checks it on
+    every input.
+
+  Malformed input with valid checksums can load into a document whose
+  re-save does not load ("mismatching heads", found by the fuzz harness);
+  storing it would leave an unreadable value, so it is rejected as invalid
+  input.
+  Such input never takes the shortcut (its re-save differs from what was
+  loaded). Anything else (bare change chunks, a document plus trailing
+  changes, a document encoded by another implementation) pays the second
+  load. The same check applies to results of `merge(automerge, bytea)`,
+  when they are first flattened (see
+  [The deferred verification](/design/expanded-values#the-deferred-verification)); a full save
+  merged that way takes the same shortcut when it is the result.
+- **Fit the limit when written.** Every value built from client bytes,
+  and every merge result, was priced before it was built and stored
+  within `pg_automerge.max_load_memory` as it was set at that time (see
+  [Resource limits](/design/resource-limits)). Loading a stored value is never
+  checked, so a lower limit later never makes data unreadable.
+- **Immutable.** Nothing modifies a stored value in place: `merge` returns
+  a new value, and an expanded value's document is only ever replaced as a
+  whole, and only through a read-write pointer.
+
+## The `pg_automerge.verify_writes` setting
+
+A boolean, `on` by default, superuser-only (`PGC_SUSET`; `GRANT SET ON
+PARAMETER pg_automerge.verify_writes TO role` lets a role change it). It
+switches the save-and-load check of the invariant above: when `off`,
+values built from client bytes (text input, binary receive, the `bytea`
+cast, results of `merge(automerge, bytea)`) are normalized as always but
+their save is not loaded back. That removes one load from every write that
+needs the check: incremental changes (`merge(doc, $changes)`: 2 loads → 1),
+a save followed by change chunks, a save encoded by another
+implementation, a save merged with a document neither contains. Writes
+that take the shortcut (canonical bytes, a compressed save, a newer full
+save merged into its older version) cost the same either way.
+
+The risk it takes: input that passes Automerge's checksums and loads, but
+whose re-save does not load (so far seen only as fuzzed input with
+recomputed checksums; `tests/corpus/reload-b-*.bin`), is stored, and every
+later read of that value fails with `XX000` ("corrupt stored automerge
+value") until it is overwritten. With the check on, the write fails with
+`22P02` instead. Turn it off only for trusted writers (a backend sending
+what its own Automerge produced).
+
+Why `PGC_SUSET` and not `PGC_USERSET`: the check protects every reader of
+a table, not only the writer. A session that turned it off could store a
+value that makes every later read of that row fail, for all roles, until
+someone overwrites it; that is a denial of service against other users, so
+only a superuser (directly, through `ALTER ROLE/DATABASE .. SET`, or by
+`GRANT SET ON PARAMETER`) may decide which writers are trusted.
+`PGC_SIGHUP`/`PGC_POSTMASTER` would be needlessly coarse: the typical use
+is one trusted backend role alongside untrusted ones.
+
+What stays when it is off: panic guards around every Automerge call,
+Automerge's own parsing and checksum verification (`VerificationMode::Check`
+on load), the missing-dependencies check of change chunks, and the
+structural header parsing. Only the second load of the re-saved bytes is
+skipped.
+
+One setting covers both places the check runs: `normalize` (text input,
+binary receive, the `bytea` cast, for input that is not its own canonical
+or compressed encoding) and the deferred check of merge results. Both
+guard the same invariant against the same failure (a re-save that does not
+load), and the cost is the same load in both; a separate switch for one of
+them would leave the other path open to the very value the first one lets
+through (such bytes can be sent as a change chunk or as a save followed by
+changes alike), so splitting it would buy no safety and add a
+configuration trap. The default keeps both on.
+
+The setting only decides whether an extra check can reject input; it never
+changes a result's bytes, so the functions stay `IMMUTABLE`: for a given
+input, the result is either the one value or an error, and which one does
+not depend on anything but the input and this setting (like
+`statement_timeout` can turn a result into an error without making a
+function volatile). The deferred
+check of a merge result reads the setting when the value is flattened,
+not when `merge` runs. Only the extension's library defines it: set it
+after the library is loaded (any use of the type loads it) or in
+`postgresql.conf`/`ALTER ROLE .. SET`, where Postgres keeps the value until
+the library defines the setting.
+
+## Casts
+
+| From → To | Context | Notes |
+|---|---|---|
+| `bytea → automerge` | assignment | validates + normalizes; lets drivers bind `bytea` params directly; the result is an expanded value (the loaded document and its stored bytes, see [Expanded values](/design/expanded-values)) |
+| `automerge → bytea` | explicit | `WITHOUT FUNCTION` (same varlena layout); stored bytes, loadable by any Automerge implementation |
+| `automerge → jsonb` | **implicit** | so every jsonb operator/function applies to `automerge` directly |
+
+No `jsonb → automerge` cast (out of scope, and it would silently fabricate
+history).
+
+The implicit `jsonb` cast is deliberate. It is the only implicit cast from
+`automerge`, so operator resolution is unambiguous. Do not add an implicit cast
+to `json` or `text`.
+
+## Equality and identity
+
+There is no equality or btree opclass. `=`, `<>`, `<` etc. on two
+`automerge` values still resolve, via the implicit cast, to jsonb
+comparisons of the current state (not history); history equality is
+`automerge_heads(a) = automerge_heads(b)`.
+
+`merge` is commutative in state only: when neither input contains the other
+the re-saved bytes depend on argument order, so `doc::bytea` is not an
+identity; `automerge_heads` is.
+
+## Errors and panics
+
+Errors are raised with `ereport(ERROR)` and a SQLSTATE (see
+[Error codes](/reference/error-codes)); nothing panics across FFI. Client input that
+is malformed (bytes, text, hashes) is always `22P02`; well-formed input
+whose history conflicts with the document it meets, or that holds two
+conflicting histories itself (a reused actor id), is `22000`; stored values that fail are `XX000`.
+
+The automerge decoder is not panic-free: input whose chunk checksums are
+valid but whose column data is malformed can hit `unwrap`s, index panics
+and assertions inside `Automerge::load` (found by fuzzing with recomputed
+checksums; `crates/pg_automerge_core/tests/fuzz.rs` finds about one per 60
+mutated inputs, and `tests/corpus/` keeps one of each kind). The core crate
+therefore runs every Automerge call under `catch_unwind` and maps a panic
+to `22P02` for external input and `XX000` for stored values. Only panics
+with a string payload (what `panic!` and failed assertions raise) are
+converted; any other payload is resumed untouched. In a backend that is a
+Postgres ERROR raised inside the guarded code (a query cancel from the
+interrupt checks, an error from a jsonb function the walk calls), which
+pgrx carries as a panic with its own payload type and must re-raise as
+is, not relabel as `22P02`/`XX000`.
+
+Messages follow PostgreSQL's error message style guide (see [Error
+codes](/reference/error-codes)). The LOCATION of an error (shown with `\set
+VERBOSITY verbose`) is the source file and line that raised it.

@@ -127,8 +127,8 @@ thread_local! {
 // automerge_notify('channel', 'key_column' [, ...]): `NOTIFY channel` with a
 // JSON payload naming the row and the new/old heads of its `automerge`
 // columns, for INSERT and DELETE always, for UPDATE only when the heads of
-// some `automerge` column (or the key) changed. See docs/DESIGN.md,
-// "Change notifications".
+// some `automerge` column (or the key) changed. See
+// docs/src/pages/reference/change-notifications.mdx.
 //
 // Written like pgrx's `#[pg_trigger]` expansion (V1 info record, guarded
 // entry point, SQL below), except that a call outside a trigger is a clean

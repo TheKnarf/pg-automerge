@@ -1,8 +1,8 @@
 //! Values stored by earlier releases keep working: the documents in
 //! `tests/fixtures/automerge-<version>/` were saved by the automerge crate
 //! version the extension shipped with (written by the
-//! `gen_format_fixtures` example; see docs/DESIGN.md, "Versioning and
-//! upgrades").
+//! `gen_format_fixtures` example; see
+//! docs/src/pages/design/versioning.mdx).
 //!
 //! For every fixture set:
 //!

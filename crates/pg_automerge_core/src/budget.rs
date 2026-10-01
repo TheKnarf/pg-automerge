@@ -1,5 +1,6 @@
 //! Bounding the memory a load of client bytes can take, before Automerge
-//! allocates anything (see docs/DESIGN.md, "Resource limits").
+//! allocates anything (see
+//! docs/src/pages/design/resource-limits.mdx).
 //!
 //! Automerge input is run-length encoded and deflated, so a few bytes can
 //! describe millions of operations, changes or dependencies, and a load
@@ -13,7 +14,8 @@
 //!
 //! The estimate ([`doc_estimate`], [`changes_estimate`]) is linear in what
 //! the input describes, with the worst cost per unit measured for Automerge
-//! 0.12 (docs/DESIGN.md, "Input amplification measurements"). The core test
+//! 0.12 (docs/src/pages/design/benchmarks/2026-09-29.mdx,
+//! "Input amplification measurements"). The core test
 //! `tests/memory_bounds.rs` measures real peaks with a counting allocator
 //! and checks that they stay below the estimate; it must be re-run (and the
 //! constants revisited) whenever Automerge is upgraded.
@@ -171,8 +173,8 @@ const FIXED: u128 = 64 << 10;
 
 /// The Automerge version the constants above were measured for. A test
 /// (`tests/memory_bounds.rs`) fails when the lock file has another one:
-/// an upgrade means re-measuring the cost model first (docs/DESIGN.md,
-/// "The estimate").
+/// an upgrade means re-measuring the cost model first
+/// (docs/src/pages/design/resource-limits.mdx, "The estimate").
 pub const MEASURED_AUTOMERGE: &str = "0.12.0";
 /// The version of hexane, Automerge's column store, the constants were
 /// measured with: Automerge 0.12.0 requires `^1.0.0-alpha.5`, which a
@@ -223,7 +225,8 @@ pub struct DocCounts {
     /// Successor entries (the sum of the succ group column).
     pub succ: u64,
     /// The largest number of successor entries in one (object, key) group
-    /// of rows (see [`DocCounts`] docs in DESIGN.md: a key overwritten or
+    /// of rows (see [`DocCounts`] in
+    /// docs/src/pages/design/resource-limits.mdx: a key overwritten or
     /// deleted many times).
     pub gmax: u64,
     /// Changes.
@@ -387,7 +390,8 @@ fn sat(value: u128) -> u64 {
 
 /// Estimated peak bytes of loading a document chunk with these counts
 /// (`Automerge::load` of a save, or turning a later document chunk into
-/// changes). Worst measured cost per unit (docs/DESIGN.md): 450 per op
+/// changes). Worst measured cost per unit
+/// (docs/src/pages/design/resource-limits.mdx): 450 per op
 /// (out-of-order ops; appended text costs about 90), 30 per successor, 600
 /// per successor pending on one key, 1600 per change plus up to 130 per
 /// op or successor for rebuilding the changes, 200 per dependency and per

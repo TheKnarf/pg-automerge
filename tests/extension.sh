@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The extension's control-file flags (run via `mise run extension`, also
-# part of `mise run test`). See docs/DESIGN.md, "Installation, schema and
-# privileges".
+# part of `mise run test`). See
+# docs/src/pages/design/installation.mdx.
 #
 # relocatable = true:
 #   - CREATE EXTENSION .. SCHEMA ext1 puts every member object there;

@@ -1,7 +1,7 @@
 //! The cost of the extension's counting allocator (`src/alloc.rs`,
 //! included here as it is) over the system allocator it wraps
-//! (`mise run bench-alloc`, release build; docs/DESIGN.md, "Memory
-//! observability").
+//! (`mise run bench-alloc`, release build;
+//! docs/src/pages/design/memory-observability.mdx).
 //!
 //! The binary's global allocator is a switch between the two (one
 //! predictable branch, the same for both), so allocations take the path

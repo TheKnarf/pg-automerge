@@ -138,6 +138,10 @@ export function PageView({ page }: { page: Page }) {
 			<div className="page">
 				<article className="content">
 					<h1>{page.title}</h1>
+					{/* Lazy (src/pages.ts), with no Suspense boundary of its own: the
+					    prerender inlines it in the page's HTML (a boundary would
+					    stream it into a hidden element, swapped in by script), and
+					    a navigation keeps the previous page until it has loaded. */}
 					<page.Content components={mdxComponents} />
 					<PrevNext page={page} />
 				</article>

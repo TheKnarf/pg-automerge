@@ -1,8 +1,14 @@
 // The page registry: every src/pages/**/*.mdx is a page. Its route comes
 // from its file path (page-path.ts), its title, section and position in
 // the sidebar from its frontmatter. Adding a page = adding one .mdx file.
+//
+// Every page's meta (frontmatter and table of contents, from the `?meta`
+// query of plugins/page-meta.ts) is in the main bundle; its content is a
+// chunk of its own, loaded when the page is shown (React.lazy: the
+// prerender waits for it, hydration waits for the page's chunk).
 import type { MDXContent } from "mdx/types";
-import type { TocEntry } from "../plugins/rehype-export-toc.ts";
+import { type LazyExoticComponent, lazy } from "react";
+import type { PageMeta, TocEntry } from "../plugins/page-meta.ts";
 import { pagePath, type Section, sections } from "./page-path.ts";
 
 export type { TocEntry };
@@ -14,11 +20,7 @@ type Frontmatter = {
 	description?: unknown;
 };
 
-type MdxModule = {
-	default: MDXContent;
-	frontmatter?: Frontmatter;
-	toc: TocEntry[];
-};
+type MdxModule = { default: MDXContent };
 
 export type Page = {
 	path: string;
@@ -28,15 +30,17 @@ export type Page = {
 	order: number;
 	description?: string;
 	toc: TocEntry[];
-	Content: MDXContent;
+	Content: LazyExoticComponent<MDXContent>;
 };
 
-const modules = import.meta.glob<MdxModule>("./pages/**/*.mdx", {
+const metas = import.meta.glob<PageMeta>("./pages/**/*.mdx", {
 	eager: true,
+	query: "?meta",
 });
+const contents = import.meta.glob<MdxModule>("./pages/**/*.mdx");
 
-function toPage(file: string, mod: MdxModule): Page {
-	const fm = mod.frontmatter ?? {};
+function toPage(file: string, meta: PageMeta): Page {
+	const fm: Frontmatter = meta.frontmatter;
 	const fail = (msg: string) => {
 		throw new Error(`${file}: frontmatter ${msg}`);
 	};
@@ -57,15 +61,15 @@ function toPage(file: string, mod: MdxModule): Page {
 		section: fm.section as Section,
 		order: (fm.order as number | undefined) ?? 0,
 		description: fm.description as string | undefined,
-		toc: mod.toc,
-		Content: mod.default,
+		toc: meta.toc,
+		Content: lazy(contents[file]),
 	};
 }
 
 // In sidebar order: by section, then order, then title. Prev/next links
 // follow this order too.
-export const pages: Page[] = Object.entries(modules)
-	.map(([file, mod]) => toPage(file, mod))
+export const pages: Page[] = Object.entries(metas)
+	.map(([file, meta]) => toPage(file, meta))
 	.sort(
 		(a, b) =>
 			sections.indexOf(a.section) - sections.indexOf(b.section) ||

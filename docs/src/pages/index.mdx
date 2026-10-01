@@ -1,8 +1,8 @@
 ---
-title: Introduction
+title: "Introduction"
 section: Guide
 order: 0
-description: pg_automerge stores Automerge documents in Postgres 18, queries them as jsonb and merges concurrent writes.
+description: "pg_automerge stores Automerge documents in Postgres 18, queries them as jsonb and merges concurrent writes."
 ---
 
 A Postgres 18 extension that stores [Automerge](https://automerge.org)
@@ -16,17 +16,30 @@ and notifies listening backends when a document changes.
 The extension does not edit documents and never creates changes. Your
 backend syncs with its frontends, owns the actor IDs, and persists
 Automerge saves; Postgres stores them, merges them and makes them
-queryable.
+queryable. The [Design](/design) pages are the full specification.
 
 ## Where to start
 
-| If you want to                       | Read                                            |
-| ------------------------------------ | ----------------------------------------------- |
-| Store and query your first documents | [Quick start](/guide/quick-start)               |
-| Index documents for read-heavy loads | [Indexing reads](/guide/quick-start#indexing-reads) |
+| If you want to                                  | Read                                                        |
+| ----------------------------------------------- | ----------------------------------------------------------- |
+| Install the extension, or run the Docker image  | [Install](/guide/install), [Docker](/guide/docker)          |
+| Store and query your first documents            | [Quick start](/guide/quick-start)                           |
+| Keep several backends' replicas up to date      | [Keeping backends in sync](/guide/keeping-backends-in-sync) |
+| Look up a function, setting or error code       | [SQL API](/reference), [Configuration](/reference/configuration), [Error codes](/reference/error-codes) |
+| Size memory, WAL and indexes for production     | [Operations](/operations), [Monitoring](/operations/monitoring) |
+| Know the costs and pitfalls first               | [Limitations and gotchas](/operations/limitations)          |
+| Update a running deployment                     | [Updating](/guide/updating), [Changelog](/changelog)        |
+| Understand how it works, and why                | [Design overview](/design)                                  |
 
-<Callout type="note" title="Work in progress">
-  This site is being assembled from the repository's README.md,
-  docs/DESIGN.md and CHANGELOG.md; until then those files remain the
-  complete reference.
-</Callout>
+## Requirements
+
+- PostgreSQL 18 (the only supported version).
+- To build: Rust 1.98 and `cargo-pgrx` 0.19.3 (the exact version of the
+  `pgrx` crate), both pinned in `mise.toml`, plus what pgrx needs to build
+  against Postgres (a C toolchain, libclang).
+- `CREATE EXTENSION` needs a superuser: the extension is not trusted, see
+  [Install](/guide/install).
+
+## License
+
+MIT — see LICENSE.

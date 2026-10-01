@@ -14,12 +14,12 @@ From the repository root:
 mise run docs-install   # pnpm install --frozen-lockfile
 mise run docs-dev       # dev server with hot reload (client-rendered)
 mise run docs-build     # static site into docs/dist
-mise run docs-check     # typecheck, biome, build, check-site
+mise run docs-check     # typecheck, biome, build, check-site, check-coverage
 ```
 
 or, in `docs/`, `pnpm install` then `pnpm dev`, `pnpm build`,
 `pnpm check`, `pnpm preview` (serves `dist/`; give it the `DOCS_BASE` the
-build had).
+build had), `pnpm check-site`, `pnpm check-coverage`.
 
 `DOCS_BASE` sets the path the site is served under (default `/`; GitHub
 Pages serves a project site under `/<repo>/`, and `mise run docs-check`
@@ -47,6 +47,17 @@ dockerfile, diff, js, ts), [links](/guide/quick-start#indexing-reads).
 <Callout type="warning" title="Optional title">note, tip, warning or danger</Callout>
 ```
 
+MDX is not Markdown: `<` and `{` outside code start JSX and expressions,
+so write `\<` and `\{` (or put them in backticks), and comments are
+`{/* ... */}`.
+
+Pages are also read on GitHub, from code comments
+(`docs/src/pages/design/resource-limits.mdx, "The estimate"`) and from
+CHANGELOG.md, so keep a page's file name and its headings stable, or
+update what refers to them (`tests/check_ci.sh` fails on a reference to a
+page that does not exist). `tests/docker_upgrade.sh` runs the compose
+commands of `guide/updating.mdx`.
+
 The page's title is its `<h1>`, so content starts at `##`. `##` and `###`
 headings form the page's table of contents; every heading gets a stable
 id (GitHub's slug rules) and an anchor link. Link to other pages with
@@ -54,22 +65,51 @@ absolute paths (`/section/page#anchor`, without the base path) and within
 the page with `#anchor`; `pnpm check-site` fails on links that do not
 resolve.
 
+## Where the content came from
+
+The pages were ported from the repository's README.md and docs/DESIGN.md
+(which was then removed); CHANGELOG.md stays at the repository root and is
+spliced into the changelog page at build time
+(`<Include file="../../../CHANGELOG.md" />`, see below), so it is edited
+in one place. Its links point at page sources
+(`docs/src/pages/guide/updating.mdx`), which work on GitHub and become
+routes on the site.
+
+`scripts/check-coverage.ts` (part of `pnpm check`) proves nothing was
+lost: it reads README.md, docs/DESIGN.md and CHANGELOG.md as they were
+before the port (from git, commit `SOURCE_REV`), and checks that every
+heading, paragraph, list item, table cell and code block of them appears,
+whitespace-normalized, in the text of some built page. The intentional
+differences (links that were titled "DESIGN.md" now name their page, and
+prose that said "the README" names the page it meant) are listed with
+their reasons in `scripts/coverage-deviations.json`. When you change a
+ported sentence on purpose, add a deviation for it:
+`node scripts/check-coverage.ts --suggest` proposes one per block it no
+longer finds. It needs the git history (CI checks out with
+`fetch-depth: 0`).
+
 ## How it fits together
 
-- `src/pages.ts`: the page registry (`import.meta.glob` of the MDX files),
-  validating frontmatter; `src/page-path.ts`: file path to route, and the
-  section order.
+- `src/pages.ts`: the page registry, validating frontmatter. Every page's
+  frontmatter and table of contents (`page.mdx?meta`, from
+  `plugins/page-meta.ts`) is in the main bundle; its content is a chunk of
+  its own, loaded with `React.lazy` (the prerender waits for it, so the
+  HTML has the full page). `src/page-path.ts`: file path to route, and
+  the section order.
 - `src/routes.tsx`: routes shared by the dev SPA (`src/main.tsx`), the
   prerender (`ssg-for-vite.tsx`) and hydration (`src/ssg-main.tsx`).
 - `src/Layout.tsx`: sidebar, table of contents, previous/next links;
   `src/mdx-components.tsx`: links, tables, code blocks, `<Callout>`;
   `src/styles.css`: all styling (light/dark from `prefers-color-scheme`).
-- `vite.config.ts`: MDX with remark-gfm, frontmatter, rehype-slug,
-  autolinked headings, `plugins/rehype-export-toc.ts` and shiki
+- `vite.config.ts`: MDX with remark-gfm, frontmatter,
+  `plugins/remark-include.ts` (`<Include file="..." />` splices a Markdown
+  file into a page), rehype-slug, autolinked headings and shiki
   (highlighting happens at build time; no highlighter in the browser).
+  `plugins/page-meta.ts` runs the same remark plugins and rehype-slug to
+  compute each page's table of contents.
 - `scripts/copy-404.ts`: `dist/404.html` for GitHub Pages;
   `scripts/check-site.ts`: every page emitted, every internal link and
-  anchor resolves.
+  anchor resolves; `scripts/check-coverage.ts`: see above.
 
 `ssg.tsx`, `ssg-for-vite.tsx`, `src/ssg-main.tsx` and `src/main.tsx` are
 copied unchanged from

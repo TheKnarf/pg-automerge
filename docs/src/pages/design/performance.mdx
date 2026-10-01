@@ -1,0 +1,150 @@
+---
+title: "Performance"
+section: Design
+order: 60
+description: "What each function loads, and what it costs."
+---
+
+Loading dominates: `Automerge::load` rebuilds and hashes every change,
+while saving, cloning and applying small changes are cheap. Cost of the
+primitives (Rust, release build; `load` is `Automerge::load` of the stored
+bytes, `apply` one small change set to a clone, `walk` the jsonb walk of a
+loaded document into a sink that discards the events; `mise run
+bench-core` measures load, normalize, save and walk):
+
+| Document | Stored | load | save_nocompress | clone | clone + apply | walk |
+|---|---|---|---|---|---|---|
+| 3,000,000-character text, 1 change | 3.0 MB | 2465 ms | 7.1 ms | 0.7 ms | 1.6 ms | 247 ms |
+| 20,000 list items, 401 changes | 877 kB | 161 ms | 3.5 ms | 1.3 ms | 1.8 ms | 72 ms |
+| 2,000 list items, 41 changes | 83 kB | 16 ms | 0.3 ms | 0.1 ms | 0.3 ms | 6.4 ms |
+
+Building the jsonb value from the walk's events adds about 30 ms on the
+877 kB list document (see [the appendix](/design/benchmarks/2026-09-29#jsonb-built-in-rust-memory-2026-09-29));
+a `serde_json::Value`, for comparison, takes 89 ms and 8 ms in total with
+the walk on the two list documents.
+
+Since 0.3.0 every Rust allocation is counted (for
+`automerge_memory_usage()`): about 1 ns per allocation, within noise on
+loads and at most a few percent on the allocation-heavy per-object walk
+(see [Memory observability](/design/memory-observability)); the numbers above
+were measured before.
+
+What costs a load, per call:
+
+- Every `automerge → jsonb` evaluation loads the document. Several
+  accessors on one column in one statement (`doc->>'a', doc->>'b',
+  doc->>'c'`) are several casts, so several loads: three accessors took
+  1275 ms against 414 ms for one. Convert once instead, with a `LATERAL`
+  subquery (`FROM docs, LATERAL (SELECT doc::jsonb AS j OFFSET 0) x`, then
+  `x.j->>'a'`; the `OFFSET 0` keeps the planner from inlining the cast
+  back into every reference) or, for read-heavy tables, a stored generated
+  column, which the IMMUTABLE cast allows:
+
+  ```sql
+  ALTER TABLE docs ADD COLUMN data jsonb GENERATED ALWAYS AS (doc::jsonb) STORED;
+  CREATE INDEX ON docs USING gin (data jsonb_path_ops);
+  ```
+
+  Expression indexes also work: `CREATE INDEX ON docs USING gin ((doc::jsonb));`
+- `automerge_heads`, `automerge_change_count` and `automerge_notify()`
+  never load a stored document; `merge`, `merge_agg`, `automerge_contains`
+  and the since-functions skip loads where the headers decide. On a 3 MB
+  stored document (one head; release build, warm cache), where a load
+  takes about 2.7 s: `automerge_heads` 0.3 ms;
+  `automerge_contains(doc, ''::bytea::automerge)` 0.5 ms;
+  `merge(doc, ''::bytea::automerge)` 1 ms (only a prefix of the 3 MB
+  argument is detoasted);
+  `merge` with a newer version of it, in either argument order, one load
+  (2.6 s), as is a `merge_agg` over both. `merge_agg` over a single row
+  loads nothing (22 ms, reading the 3 MB value).
+- Writing a value: a full save, canonical (what `doc::bytea` or another
+  stored value give) or compressed (`Automerge.save()`, when it inflates
+  to the canonical encoding, which it does for saves by this Automerge
+  version) is loaded once to validate it (3 MB: 2.6 s; 877 kB: 180 ms;
+  83 kB: 20 ms). Any other input (a save plus trailing change chunks, a
+  save by an implementation whose encoding differs) costs two loads
+  (validate, then verify the normalized re-save; one with
+  `pg_automerge.verify_writes` off).
+- `merge(doc, $changes::bytea)` sends and parses only the new changes, but
+  on a stored `doc` still loads it, saves the result and loads it once more
+  to verify it (on the 3 MB document: 5.2 s for a one-change update; 2.7 s
+  with `pg_automerge.verify_writes` off). Changes that are already there
+  are usually seen from the chunk hashes without a load (185 ms, the
+  detoast and the row rewrite).
+- A newer full save of the stored document, `merge(doc, $save::bytea)` or
+  `merge(doc, $save::automerge)` with a cast in the query, costs one load
+  (of the save; 2.8 s on the 3 MB document), and the stored document is
+  never loaded. The upsert (`INSERT .. ON CONFLICT DO UPDATE SET doc =
+  merge(docs.doc, EXCLUDED.doc)`) and a typed `automerge` parameter in a
+  custom plan cost two (see [Expanded values](/design/expanded-values)). A
+  concurrent save (neither contains the other) costs a load of each side
+  and the verification load.
+- `automerge_contains(doc, changes bytea)` and the no-op check of
+  `merge(doc, changes bytea)` need no load for re-sent latest changes, a
+  re-sent save of the document, and (for `automerge_contains`) new changes
+  on top of the current heads, and a newer or concurrent save (its header
+  lists at least as many changes as the document has); for an older save
+  `automerge_contains` loads the stored document, never the save.
+  `automerge_contains(a, b)` of two `automerge` values likewise answers
+  `false` without a load when `b` has at least as many changes as `a` and
+  other heads (bench-sql C1/C2, 877 kB list / 3 MB text: 167 / 2568 ms →
+  1.2 / 9 ms for a newer save as `bytea`, where 9 ms is the save's
+  checksum; 164 / 2549 ms → 1.2 / 1.1 ms for a newer stored version).
+- History (the 3 MB document plus 200 small changes, 201 changes):
+  `automerge_change_count` 2 ms; `automerge_changes_meta` 2.8 s (one load);
+  `automerge_changes` and `automerge_changes_bytes` for all changes 5.1 s
+  (load plus rebuilding 3 MB of changes); since the 100th change, or one
+  `automerge_get_change`, 2.7-2.8 s; `automerge_to_jsonb(doc, old heads)`
+  3.5 s against 3.0 s for the current state; any since-function given the
+  current heads 1 ms.
+- `automerge_notify()` on 20,000 small rows (release build):
+  `UPDATE t SET n = n + 1` 451 ms without the trigger, 746 ms with it (no
+  notifications); merging a new change into every row 7.2 s without, 7.8 s
+  with (20,000 notifications); re-sending that change 709 ms with a plain
+  `merge` (a no-op rewrite of every row, no notifications) and 46 ms with
+  the `WHERE NOT automerge_contains` pattern.
+- TOAST compression: stored values are uncompressed saves, which
+  Postgres compresses (`pglz` stores the 877 kB list in 190 kB; the 3 MB
+  text of random letters stays uncompressed, `pglz` gains nothing on it).
+  With the default `pglz`, profiles of the release build on the 877 kB
+  list put about 9% of an `INSERT` of a save and 5% of a `merge` of new
+  changes in `pglz_compress`, and about 1% of a jsonb read in
+  decompression; the rest is Automerge. `lz4` (`ALTER TABLE .. ALTER
+  COLUMN doc SET COMPRESSION lz4`, or `default_toast_compression`, on a
+  server built with it) compresses and decompresses much faster than
+  `pglz`, so it can trim that part of writes; it is not measured here (the
+  pgrx-managed Postgres is built without lz4) and the default is left
+  alone.
+- Pricing a write (see [Resource limits](/design/resource-limits)) costs a scan
+  of the input and, for a merge, of the stored target: 1.7 ms for the
+  877 kB list document stored, 3.7 ms for its compressed save, 0.2 / 0.4
+  ms at 83 kB; the 3 MB text document scans in under 0.1 ms stored and
+  22 ms compressed (inflating its columns, which the load does again).
+  Against a load of 160 ms and 2.5 s, about 1 to 2%.
+- Merge results are expanded values: nested merges, `merge(...)::jsonb`,
+  `merge_agg(...)::jsonb` and PL/pgSQL loops doing `d := merge(d, x)` keep
+  the document loaded between steps. Measured with `mise run
+  bench-expanded` (release build, warm cache, mean of three runs,
+  milliseconds; change sets are one small commit each, `merge_agg` over
+  the document and 8 concurrent forks; the first rows are writes and a
+  plain read for comparison):
+
+  | Workload | 3.0 MB | 877 kB | 83 kB |
+  |---|---|---|---|
+  | `bytea` → `automerge` of a compressed save | 2617 | 182 | 20 |
+  | `bytea` → `automerge` of stored bytes | 2581 | 178 | 21 |
+  | `doc->>'status'` (a stored row) | 2816 | 314 | 33 |
+  | `UPDATE .. SET doc = merge(doc, c1)` | 5246 | 377 | 41 |
+  | `automerge_heads(merge(doc, c1))` | 2543 | 178 | 21 |
+  | `merge(doc, c1)::jsonb->>'status'` | 2827 | 320 | 34 |
+  | `automerge_heads(merge(merge(merge(doc, c1), c2), c3))` | 2552 | 181 | 22 |
+  | PL/pgSQL `d := merge(d, c)`, 20 change sets | 2584 | 217 | 28 |
+  | the same, each merge in a `BEGIN .. EXCEPTION` block | 2596 | 216 | 28 |
+  | the same, then `UPDATE .. SET doc = d` | 5356 | 413 | 50 |
+  | 2 merges into `d`, then 10 reads `d->>'status'` | 5209 | 1541 | 153 |
+  | `merge_agg(doc)::jsonb` over 9 versions | 23136 | 1629 | 168 |
+
+  A loop costs one load in total (plus one save and one verification load
+  when the result is stored). A per-backend cache of documents loaded
+  from tables (and of converted jsonb) is future work: a table column
+  always arrives flat.

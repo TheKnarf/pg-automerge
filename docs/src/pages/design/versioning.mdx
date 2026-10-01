@@ -1,0 +1,184 @@
+---
+title: "Versioning and upgrades"
+section: Design
+order: 110
+description: "Extension versions, upgrade scripts, and the upgrade tests."
+---
+
+The extension version is the crate version (`default_version =
+'@CARGO_VERSION@'` in `pg_automerge.control`; both crates carry it),
+currently 0.3.0; pgrx generates the install script
+`pg_automerge--X.Y.Z.sql` for the build, and the Docker image's version
+label and tag come from it (`scripts/versions.sh`). Released: 0.1.0 and
+0.2.0 (see the [Changelog](/changelog)).
+
+Policy:
+
+- A release's generated script is committed as
+  `sql/snapshots/pg_automerge--X.Y.Z.sql` (`cargo pgrx schema pg18 -o
+  ...`) and never edited again.
+- Any change to the SQL surface afterwards bumps the version, and comes
+  with a hand-written `sql/pg_automerge--A--B.sql` from the previous
+  version (`cargo pgrx install` and `package` ship every
+  `sql/pg_automerge--*--*.sql`, so the Docker image does too; the
+  snapshots below `sql/snapshots/` are not shipped). C symbols that an
+  older version's script references stay exported: the new library
+  serves the old catalog from the moment it is installed until the
+  `ALTER EXTENSION .. UPDATE`.
+- A library-only change (a bug fix, a faster path) needs no new version
+  as long as no result changes; one that changes a result of an
+  `IMMUTABLE` function (the jsonb view) is called out in the changelog
+  with the `REINDEX`/rewrite it needs (see below).
+
+## What 0.1.0 shipped
+
+The version was 0.1.0 for the whole development up to the bump, and
+`sql/snapshots/pg_automerge--0.1.0.sql` was regenerated when
+`automerge_spans` was added (720c5f0), which the policy above forbids once
+a version is out. It had been: the Docker image of 0.1.0 (built from
+f061a3b plus uncommitted changes that did not touch the SQL surface)
+installs a script without `automerge_spans`. The snapshot is now that
+image's `/usr/share/postgresql/18/extension/pg_automerge--0.1.0.sql`,
+byte for byte (read from the image with a throwaway container). It has
+the same statements as the snapshot committed at 0918f56 (the last
+commit before `automerge_spans`); only pgrx's order differs, the
+`automerge_notify()` block sitting before instead of after the one
+of the history types `automerge_change` and `automerge_change_meta` (pgrx does not order unrelated objects
+deterministically across builds). Its library exports every symbol of
+that script, and so does 0.2.0's.
+
+Images built from the tree after 720c5f0 and before the bump were still
+labelled 0.1.0, but their install script created `automerge_spans`
+(identical to 0.2.0's, statement for statement). Their library has the
+deep-block crash ([Deep blocks](/design/deep-blocks)) if it was built from a
+commit up to 555110e (the last commit before the fix, ee574e1), but not
+necessarily if it was built from a working tree: the fix was made
+uncommitted on top of 555110e, and an image built from that tree is
+labelled revision `555110e-dirty` and has it (7c6d11f23a6f, skjera's
+`pg-automerge:0.1.0` at the time of the bump: the 2,000-level deep block
+of the regress fixtures reads as jsonb there, and crashes the backend of
+the released b946069dce9a). A `-dirty` label cannot tell which, so the
+docs do not promise either for such images; reading that document as
+jsonb in a throwaway container does. Databases created by these images
+exist, and their catalog is the same whatever the library, so it is kept
+as `sql/snapshots/variants/pg_automerge--0.1.0+spans.sql` (the script of
+555110e; ee574e1, the one commit after it before the bump, changed only
+the library), a variant of 0.1.0 that the tests update with 0.1.0's
+upgrade scripts like the release.
+
+## 0.2.0 to 0.3.0
+
+The install scripts differ only by `automerge_memory_usage()`,
+`automerge_memory_reset()` and their comments (see
+[Memory observability](/design/memory-observability)); no 0.2.0 object's
+definition, labels, symbol or comment changed, and the library's other
+changes (the altered-change-types check, the reserved settings prefix,
+the virtual key column refusal, detoasting in place) return the same
+results, so `sql/pg_automerge--0.2.0--0.3.0.sql` creates the two
+functions and nothing else. Plain `CREATE FUNCTION`: no 0.2.0 catalog
+(nor 0.1.0 or its variant) has them, and a function of the same
+signature that someone put into the extension's schema makes the update
+fail ("already exists") rather than being replaced; `tests/upgrade.sh`
+checks that for every older snapshot. From 0.1.0, `ALTER EXTENSION ..
+UPDATE` runs 0.1.0 → 0.2.0 → 0.3.0 in one transaction.
+
+## 0.1.0 to 0.2.0
+
+The install scripts differ only by the two `automerge_spans` functions
+and their comments: no 0.1.0 object's definition, labels, symbol or
+comment changed (the deep-block fix is inside the library and returns
+the same jsonb), so `sql/pg_automerge--0.1.0--0.2.0.sql` creates those
+and nothing else, and no dependent object (index, generated column,
+trigger, view) is touched. It uses `CREATE OR REPLACE FUNCTION`: it
+creates the functions on a released 0.1.0, and redefines them identically
+in place (same signature, same OID, so views on them survive) on the
+`0.1.0+spans` variant. That is safe in an extension script because
+PostgreSQL refuses to replace an object the extension does not own ("is
+not a member of extension"): a function of the same signature that
+someone else put into the extension's schema makes the update fail
+rather than being adopted. Names stay unqualified, as in pgrx's install
+script, so the extension stays relocatable: `ALTER EXTENSION .. UPDATE`
+runs the script with `search_path` set to the extension's current schema
+and then `pg_temp`, with `pg_catalog` searched first, so `jsonb` and
+`text` are the built-in types and `automerge` the extension's own. The
+script starts with the usual `\echo .. \quit` guard against running it
+with `psql`.
+
+## Upgrade tests
+
+- `tests/upgrade.sh` (part of `mise run test`) installs every snapshot
+  and variant under a scratch version name (with the first hop of each
+  of its version's upgrade paths, which must be installed byte for byte as
+  in `sql/`), creates what a deployed database has on it (a STORED
+  generated `doc::jsonb` column, GIN and B-tree expression indexes, a
+  view and a SQL function over the extension's functions, an
+  `automerge_notify()` trigger, documents including rich text and a
+  2,000-level deep block, and on a catalog with `automerge_spans` a view
+  on it), reads them all before the update (the old catalog on the new
+  library), runs `ALTER EXTENSION pg_automerge UPDATE`, and compares the
+  extension's catalog with a fresh `CREATE EXTENSION` (`tests/catalog.sql`:
+  member objects and their comments, the members' dependencies, function
+  definitions with their labels, symbols and ACLs, aggregates, types,
+  casts, operators, the extension row). Then the documents' fingerprints
+  (bytes, heads, the cast, the generated column, the view, the SQL
+  function), the indexes (valid, used, and agreeing with a sequential
+  scan), the trigger's notification and `automerge_spans`. It repeats the
+  update on an extension relocated with `SET SCHEMA` first (every member
+  ends up in that schema), and, from a version without `automerge_spans`,
+  over a user's `automerge_spans` in the extension's schema (the update
+  fails and the version stays). A snapshot of the current version is
+  required and compared as is, so an SQL change without a version bump
+  fails.
+- `tests/docker.sh` does the snapshot part again with the image's own
+  scripts and library (see [Docker image](/design/docker-image)).
+- `tests/docker_upgrade.sh` (`mise run docker-upgrade-test`, not part of
+  `docker-test`) upgrades a real 0.1.0 deployment: a container of the 0.1.0
+  image (`PG_AUTOMERGE_OLD_IMAGE`, a tag or an image ID, or by default
+  built from 0918f56 with that commit's own `scripts/docker-build.sh`;
+  its install script must be the 0.1.0 snapshot or a variant) creates
+  tables with a generated `doc::jsonb` column, GIN and B-tree expression
+  indexes, a view, a notify trigger and documents; it is stopped and the
+  new image started on the same volume (init not re-run, still 0.1.0, the
+  same data, and the deep block, which crashes the released 0.1.0 library in the
+  generated column, stored fine); `ALTER EXTENSION pg_automerge UPDATE`;
+  then the same data, the indexes valid, used and agreeing with a
+  sequential scan, the trigger's notification, `automerge_spans` (54000
+  on the deep block), the catalog equal to a fresh install's in the same
+  container, and clean server logs. It follows the compose steps of
+  [Updating](/guide/updating) as written: the cluster's superuser is an app's own
+  `POSTGRES_USER`, not `postgres` (as in skjera, which has no `postgres`
+  role), the dump of step 1 and the `ALTER EXTENSION` and version check
+  of step 5 are that page's commands (read from its MDX source, `docker compose
+  exec` run as `docker exec`, `<user>` and `<db>` filled in), and a
+  service with `image:` and a `build:` section with `args:
+  PG_AUTOMERGE_VERSION` (skjera's shape) fails to build with the old
+  version (the Dockerfile's version guard) and builds after step 3's
+  edit. Run against the released image
+  (b946069dce9a), against an image of the `0.1.0+spans` variant, and with
+  the image built from 0918f56: all pass. With
+  `PG_AUTOMERGE_OLD_VERSION=0.2.0` it does the same from a 0.2.0
+  deployment (by default an image built from 356a2f9; its install script
+  must be the 0.2.0 snapshot), the path of an app already on 0.2.0 such
+  as skjera.
+
+Data compatibility:
+
+- Stored values are Automerge's `save_nocompress()` format, which any
+  later Automerge must load. `crates/pg_automerge_core/tests/fixtures/
+  automerge-<version>/` holds documents saved by each automerge version
+  the extension shipped with (written by `examples/gen_format_fixtures.rs`;
+  0.12.0 now), and `tests/format_fixtures.rs` checks that they still load
+  with the same heads and jsonb, and that normalizing them still gives the
+  same bytes.
+- The automerge crate is pinned (`=0.12.0`). Upgrading it, or changing the
+  jsonb mapping, must be called out in the release notes:
+  - A different jsonb result for the same document changes what the
+    `IMMUTABLE` cast returns, so expression indexes on `doc::jsonb` must
+    be rebuilt (`REINDEX`) and stored generated columns rewritten (e.g.
+    `UPDATE t SET doc = doc`), or they disagree with fresh computations.
+  - A different canonical encoding (the format fixture test fails) means
+    re-saved values differ from stored ones: `doc::bytea` of old rows
+    stops matching new saves of the same history (heads do not change),
+    and each row is re-encoded on its next write.
+- Text output (`\x` + hex of the stored bytes) is the dump format and is
+  stable, so dump and restore works across versions.

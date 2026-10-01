@@ -1,0 +1,76 @@
+---
+title: "Reading"
+section: Reference
+order: 30
+description: "Reading documents: the jsonb cast and what each read loads."
+---
+
+- `automerge_to_jsonb(automerge) → jsonb`: the cast function (see
+  [jsonb mapping](/reference/jsonb-mapping)). Each call loads the document (an
+  expanded value is used in place).
+- `automerge_spans(doc automerge, path text[] [, heads text[]]) → jsonb`:
+  the structure of the text object at `path` (text runs with their marks,
+  and blocks), as Automerge's JavaScript `spans()` returns it; see
+  [Rich text spans](/reference/rich-text-spans).
+- `automerge_heads(automerge) → text[]`: current heads as sorted lowercase hex
+  change hashes. Read from the header without loading the document (see
+  [Heads fast path](/reference/merging#heads-fast-path)).
+- `automerge_contains(a automerge, b automerge) → bool`: whether every change
+  in `b` is already in `a`, meaning `merge(a, b)` would be a no-op. Decided
+  from the two headers when `heads(b) ⊆ heads(a)` (true) or
+  `heads(a) ⊊ heads(b)` (false: a head of `b` missing from `a`'s heads has
+  no successor in `b`, so it cannot be an ancestor of a head of `a`);
+  otherwise, for a stored `a`, from the two change counts (see below);
+  otherwise `a` is loaded and `b` never is.
+  - Change counts: when the heads do not decide and `b` has at least as
+    many changes as `a`, the answer is `false`. Containment means
+    `changes(b) ⊆ changes(a)`; with `|b| ≥ |a|` the two sets would be
+    equal, and equal histories have equal heads, which the first test
+    would have seen. Both counts come from a prefix of each value (the
+    change actor column, as for `automerge_change_count`; see
+    [Heads fast path](/reference/merging#heads-fast-path)), or from the change graph of an
+    expanded value. This decides the two common `false` cases without a
+    load: an older version asked whether it contains a newer one, and two
+    concurrent versions with as many changes each (the same edit count on
+    both sides of a fork). A stored count is exact: stored values are
+    saves of a loaded document, one change actor entry per change.
+- `automerge_contains(doc automerge, changes bytea) → bool` (`doc` is
+  `a` below): whether `a` already has every change in `changes` (the same inputs as
+  `merge(automerge, bytea)`), i.e. whether `merge(a, changes)` returns `a`
+  unchanged. Empty `changes` is contained. Changes whose dependencies are
+  in neither `a` nor `changes` are not in `a`: `false` (where `merge`
+  raises `22P02`). Malformed bytes are `22P02` when they have to be
+  loaded, and changes that conflict with `a`'s (a reused actor id) are
+  `22000` when `a ++ changes` has to be loaded, as in `merge`.
+  - No-load path, when `changes` is only uncompressed change chunks: each
+    chunk's hash is `sha256(type ‖ uleb128 length ‖ data)` (its checksum
+    is the first 4 bytes, and must match) and its data starts with its
+    dependency hashes (`header::change_chunks`). `a` is a complete
+    document, so a chunk whose hash is a head of `a` is in `a`, and a chunk
+    with a dependency that is a head of `a` (or a chunk of the input
+    already known to be missing) is not in `a`: a head has no successor in
+    `a`. Any change known missing gives `false`, all known present `true`.
+    That decides the two cases a backend produces: new changes made on top
+    of the heads it last saw (false), and a re-send of the changes that
+    made the current heads (true).
+  - For an expanded `a` and bare change chunks, each chunk's hash is looked
+    up in the loaded document.
+  - For exactly one document chunk (a save) with a valid checksum:
+    `false` when the save's header lists other heads and at least as many
+    changes as a stored `a` has (by the change-count argument above: a
+    save that loads has exactly the changes of its heads' history, one
+    change actor entry each, and a save whose header disagrees with its
+    content, or does not parse, is rejected by `merge`). Otherwise, when
+    the chunk passes Automerge's chunk parse (as in `merge`'s case 1),
+    whether `a` has the heads its header lists: from `a`'s heads, else
+    from `a`'s history (a stored `a` is loaded; the save never is). That
+    is what the no-op check of `merge(automerge, bytea)`, and a load of
+    `a ++ changes`, decide. A save that does not parse is loaded as
+    `a ++ changes`, which rejects it (`22P02`).
+  - Otherwise (older changes, a save plus change chunks, compressed chunks)
+    `a ++ changes` is loaded once (no save) and the heads compared.
+  - On the no-load path only the framing, checksums and dependency lists
+    are read, and a save's `false` comes from its header alone, so `false`
+    does not promise that `merge` accepts the input. `true` does: a
+    header `true` needs the chunk to parse, which is all a load of
+    `a ++ changes` checks of it.

@@ -4,8 +4,8 @@
 //! - `text.bin`: `Automerge.save()` of a document holding one text of
 //!   `LIMITS_TEXT_CHARS` (default 12,000,000) repeated characters. About
 //!   12 kB compressed; loading it takes over a gigabyte (the input that
-//!   aborted a memory-capped backend, docs/DESIGN.md "Why the extension is
-//!   not trusted").
+//!   aborted a memory-capped backend, docs/src/pages/design/installation.mdx,
+//!   "Why the extension is not trusted").
 //! - `ops.bin`: a crafted change chunk of about 100 bytes whose
 //!   run-length encoded columns describe `LIMITS_OPS` (default 20,000,000)
 //!   list inserts, which Automerge loads (several GB).
@@ -30,7 +30,7 @@
 //! - `deep_block.bin`: `Automerge.save()` of {status: "deep", body: a
 //!   text "x" after a block whose map holds maps and lists nested 5,000
 //!   levels deep} (under 30 kB): Automerge's recursive rendering of that
-//!   block needs about 65 MB of stack (docs/DESIGN.md, "Deep blocks").
+//!   block needs about 65 MB of stack (docs/src/pages/design/deep-blocks.mdx).
 //!   `deep_changes.bin`: the same document as change chunks
 //!   (`save_after([])`), for merges into an existing value.
 //! - `small.bin`: an ordinary small document.

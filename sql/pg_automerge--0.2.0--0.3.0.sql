@@ -1,8 +1,9 @@
--- pg_automerge 0.2.0 -> 0.3.0 (hand-written; see docs/DESIGN.md,
--- "Versioning and upgrades", and CHANGELOG.md).
+-- pg_automerge 0.2.0 -> 0.3.0 (hand-written; see
+-- docs/src/pages/design/versioning.mdx, and CHANGELOG.md).
 --
 -- The SQL surface of 0.3.0 is 0.2.0's plus automerge_memory_usage() and
--- automerge_memory_reset() (see docs/DESIGN.md, "Memory observability").
+-- automerge_memory_reset() (see
+-- docs/src/pages/design/memory-observability.mdx).
 -- Every 0.2.0 object is unchanged (definition, labels, symbol, comment),
 -- and every C symbol 0.2.0's objects name is still exported by the 0.3.0
 -- library, so nothing else is redefined here and no dependent object

@@ -1,0 +1,67 @@
+---
+title: "Monitoring"
+section: Operations
+order: 10
+description: "automerge_memory_usage(): the memory pg_automerge holds outside Postgres' accounting."
+---
+
+Automerge documents live in the Rust heap of the backend that loaded
+them, which Postgres does not see: not in `pg_backend_memory_contexts`,
+not in `work_mem`. `automerge_memory_usage()` shows it for the current
+session:
+
+```sql
+-- A new session, after reading one value of a 3 MB text document and of
+-- an 877 kB document of 20,000 list items (doc->>'status'):
+SELECT * FROM automerge_memory_usage();
+--  allocated_bytes | peak_allocated_bytes | live_documents | loads |  load_time
+-- -----------------+----------------------+----------------+-------+-------------
+--               16 |            273014612 |              0 |     2 | 2812.470245
+```
+
+The 3 MB document took 273 MB while it was loaded, and nothing stays
+afterwards.
+
+- `allocated_bytes`: bytes pg_automerge's Rust code holds now: loaded
+  documents, the buffers around them, set-returning functions' rows,
+  `merge_agg` states. Between statements it should be near zero (a few
+  hundred bytes); anything that stays is a leak worth reporting.
+- `peak_allocated_bytes`: the most it held since the session started (or
+  the last `automerge_memory_reset()`), including the documents a read
+  loads and drops within one call. This is the number to compare with
+  `pg_automerge.max_load_memory` and with the memory of the server.
+- `live_documents`: loaded documents alive now: in-memory values (PL/pgSQL
+  variables holding a `merge` result, the `bytea` cast's), and `merge_agg`
+  states. 0 between statements.
+- `loads`, `load_time`: how many times Automerge loaded a document (every
+  read that converts a document, every write's validation, the
+  verification loads), and the total time in milliseconds.
+
+The counts are exact (a counting allocator; its cost is a few ns per
+allocation, `mise run bench-alloc`: a few percent at most in the Rust
+benchmarks, not measurable in `mise run bench-sql`), in the bytes Rust
+asks for: the process uses somewhat more (`malloc`'s own overhead), and
+after a large document is freed `malloc` keeps the memory for reuse until
+the end of the transaction (see `pg_automerge.trim_threshold` in
+[Configuration](/reference/configuration)), so the backend's RSS can stay high for
+a while after `allocated_bytes` is back at zero.
+
+To measure one statement, reset first:
+
+```sql
+SELECT automerge_memory_reset();
+SELECT doc->>'title' FROM docs WHERE id = $1;
+SELECT peak_allocated_bytes, loads, load_time FROM automerge_memory_usage();
+```
+
+The counters are per backend (per connection); nothing is shared between
+sessions, so there is no cluster-wide view. To watch a pooled backend,
+sample it from its own connections: have the app run
+`SELECT * FROM automerge_memory_usage()` on each connection now and then
+(or after large operations) and export the numbers as metrics. From
+outside, a backend's RSS (`ps -o rss -p <pid>`, with the pids from
+`pg_stat_activity`) includes this memory. Inside a query, call it in the
+target list (`SELECT (automerge_memory_usage()).live_documents FROM ...`)
+to see it per row: in a `FROM` clause that does not depend on the outer
+row, Postgres calls it once. Details in
+[Memory observability](/design/memory-observability).

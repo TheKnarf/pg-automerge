@@ -1,5 +1,6 @@
-// The load memory limit, pg_automerge.max_load_memory (see docs/DESIGN.md,
-// "Resource limits"): its default and privileges, 53400 with DETAIL and
+// The load memory limit, pg_automerge.max_load_memory (see
+// docs/src/pages/design/resource-limits.mdx): its default and privileges,
+// 53400 with DETAIL and
 // HINT on every SQL path that takes client bytes or builds a merge
 // result, stored values that stay readable when the limit is lowered,
 // -1, and bundle chunks.

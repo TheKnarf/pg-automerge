@@ -1,0 +1,34 @@
+---
+title: "Performance"
+section: Operations
+order: 30
+description: "What the everyday SQL paths cost on a 3 MB document."
+---
+
+Loading a document dominates everything; the rest is cheap. On a 3 MB
+document (3,000,000-character text; release build, warm cache):
+
+| Operation | Time |
+|---|---|
+| `Automerge::load` (what `doc::jsonb`, history and most merges pay) | 2.5 s |
+| Writing a save, compressed or not (`$1::automerge`: validation) | 2.6 s (one load) |
+| `doc->>'status'` (load, then jsonb) | 2.8 s |
+| `automerge_heads`, `automerge_change_count` (header only) | 0.3 ms, 2 ms |
+| `merge(doc, x)` when `x` adds nothing | 1 ms (heads from a prefix; an `UPDATE` keeps the TOAST value) |
+| `automerge_contains(doc, newer save or version)` (false) | 1-9 ms (heads and change counts from a prefix; the other way round, one load) |
+| `UPDATE .. SET doc = merge(doc, one change set)` | 5.2 s (load, save, verification load); 2.7 s with `pg_automerge.verify_writes = off` |
+| `UPDATE .. SET doc = merge(doc, newer full save)` | 2.8 s (one load, of the save) |
+| `INSERT .. ON CONFLICT DO UPDATE SET doc = merge(docs.doc, EXCLUDED.doc)`, newer save | 5.3 s (two loads) |
+| PL/pgSQL: merge 20 change sets into a variable, then store | 5.4 s |
+| `automerge_changes_meta(doc)` / `automerge_changes(doc)` (201 changes) | 2.8 s / 5.1 s |
+
+On an 83 kB document (2,000 list items) the same single-change `UPDATE`
+takes 41 ms, and `doc->>'status'` 33 ms. More numbers, and what each function loads, in
+[Performance](/design/performance).
+
+These were measured on pgrx's development Postgres (assertions on). On
+the [Docker image](/guide/docker) (PGDG Postgres 18, `mise run
+docker-bench-sql`) the paths that load a document take the same time
+(within a few percent: the time is Automerge's), and the millisecond
+paths (heads, no-op merges, containment checks) about half
+([comparison](/design/benchmarks/2026-09-30#the-docker-image-against-the-pgrx-postgres-2026-09-30)).

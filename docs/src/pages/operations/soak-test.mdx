@@ -1,0 +1,100 @@
+---
+title: "Soak test"
+section: Operations
+order: 50
+description: "The long concurrent load against a memory-capped container, and what it checks."
+---
+
+What the other tests cannot show is what builds up over many thousands
+of statements in long-lived connections: memory that grows (in the Rust
+heap, in Postgres' memory contexts, or only in RSS), latency that
+drifts, tables and TOAST that bloat. `tests/soak.sh` runs a realistic
+load for as long as asked and samples all of it.
+
+```sh
+mise run soak                                   # 60 minutes, 8 clients, documents up to 1 MB
+SOAK_DURATION=2h SOAK_CLIENTS=16 mise run soak  # longer, more connections
+SOAK_DOC_SIZE=200 SOAK_DURATION=10m mise run soak
+SOAK_SMOKE=1 bash tests/soak.sh                 # 60 s, 4 clients, 200 kB (docker-test runs this)
+```
+
+Other knobs (`tests/soak.sh` lists them all): `SOAK_ROWS` (rows before
+the run, default 200), `SOAK_LANE_CHANGES` (250), `SOAK_MEMORY` (the
+container's limit, 4g), `SOAK_MAX_LOAD_MEMORY` (512MB),
+`SOAK_SHARED_BUFFERS` (256MB), `SOAK_TRIM_THRESHOLD`,
+`SOAK_SAMPLE_INTERVAL` (30 s), `SOAK_VACUUM_INTERVAL` (600 s),
+`SOAK_WEIGHTS` (`"write=30 spans=0"`), `SOAK_OUT` (default
+`target/soak/<UTC time>`), `SOAK_KEEP=1` (keep the container to look
+around afterwards).
+
+Setup: one container of the image (labelled `pg-automerge-test`) with
+`--memory` and no swap, `default_toast_compression=lz4`,
+`log_autovacuum_min_duration=0`. Fixtures
+(`examples/gen_soak.rs`, deterministic): 20 template documents, from
+1 kB boards (a map with a list of small maps, a counter, a status) and
+2-8 k-character notes (paragraphs, headings, bold and link marks) to
+lists of small maps of a twentieth to a fifth of `SOAK_DOC_SIZE`, a rich
+text of a tenth, and a list and a rich text of about `SOAK_DOC_SIZE`. Row
+`id` of `soak_docs` is a copy of template `id % 20`; each row has three
+writer "lanes", each a chain of single-change edits by its own actor
+(`save_after` of the change, so change `k` depends on change `k - 1`),
+plus the compressed full save every 25 changes. `soak_cursor` holds each
+lane's position, so a write applies exactly the next change and the
+lanes of a row are concurrent writers. The table has a generated
+`data jsonb` column with a GIN (`jsonb_path_ops`) index (`fastupdate =
+off`, see the results) and an `automerge_notify` trigger.
+
+Load: pgbench (the image's own, in a second container sharing the
+server's network namespace, so the host needs only `psql`) with
+long-lived connections and prepared statements (`-M prepared`), a
+weighted mix of one-transaction scripts
+(`tests/soak/*.sql`): incremental writes (`UPDATE .. SET doc = merge(doc,
+changes)`, `write` for the small and medium rows, `write_big` for the big
+ones), the same from every client to the four newest rows
+(`write_hot`: writers of different lanes wait for the row lock and merge
+into the committed version), upserts of full saves (`upsert`), new rows
+(`create`, so the table grows through the run), re-sent changes skipped
+by `WHERE NOT automerge_contains` (`resend`), jsonb operators
+(`read_ops`, `read_big`), the stored bytes (`fetch`), GIN containment
+queries and reads of the generated column (`read_gin`),
+`automerge_spans` (`spans`), the history functions (`history`),
+`merge_agg` over four copies of a template (`merge_agg`), and
+self-sampling (`monitor`: the backend inserts its own
+`automerge_memory_usage()` and `pg_backend_memory_contexts` totals, as
+[Monitoring](/operations/monitoring) suggests for pooled connections). A `psql` session `LISTEN`s
+throughout; `VACUUM (ANALYZE)` runs every 10 minutes on top of
+autovacuum.
+
+Samples every 30 seconds: every postgres process's RSS (anonymous, file,
+shared; `/proc` in the container), the container's cgroup memory, table
+heap/TOAST/index sizes, live and dead tuples, `pgstattuple_approx` free
+and dead space of the heap and the TOAST table, autovacuum counts, WAL
+bytes, the notification queue, commits, rollbacks and deadlocks, the
+average stored size and change count of each size class, and the
+notifications received. pgbench logs every transaction.
+`tests/soak_report.py` turns it into `report.txt`: latency percentiles
+per script for each sixth of the run (and their drift), transactions per
+second, each backend's anonymous RSS over time (the high of each half,
+slopes), the counters and memory contexts per window and per backend, the
+container's memory, the table, TOAST, bloat and WAL per window.
+
+Checks (the exit status): no failed transaction or aborted client; no
+`ERROR` (but an autovacuum cancelled by the manual `VACUUM`), crash,
+panic or restart in the server log, and no OOM kill; every
+row has exactly the changes its lanes wrote (`automerge_change_count` =
+the template's + the lane positions: no write lost or applied twice under
+concurrency); the generated column equals `doc::jsonb`; at most three
+heads per row; exactly one well-formed notification per write that
+changed a document (none for the re-sends); no live document and at most
+64 kB allocated between statements in every memory sample; no backend's
+memory contexts more than 1 MB higher in the second half of its samples
+than in the first; and, for runs of 20 minutes or more, no backend's
+anonymous RSS reaching a new high in the second half more than 64 MB
+above its high in the first (after a 5-minute warm-up): a leak keeps
+raising the high-water mark, memory `malloc` keeps for reuse moves below
+it (and a sample can catch a load's Rust peak and its `palloc` memory at
+once). Don't query the server while it
+runs (an `ERROR` of your own fails the log check); `SOAK_KEEP=1` keeps it
+for afterwards.
+
+Results: [Soak test (2026-10-01)](/design/benchmarks/2026-10-01#soak-test-2026-10-01).

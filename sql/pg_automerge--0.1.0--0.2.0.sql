@@ -1,5 +1,5 @@
--- pg_automerge 0.1.0 -> 0.2.0 (hand-written; see docs/DESIGN.md,
--- "Versioning and upgrades", and CHANGELOG.md).
+-- pg_automerge 0.1.0 -> 0.2.0 (hand-written; see
+-- docs/src/pages/design/versioning.mdx, and CHANGELOG.md).
 --
 -- The SQL surface of 0.2.0 is 0.1.0's plus automerge_spans (two
 -- overloads). Every 0.1.0 object is unchanged (definition, labels,

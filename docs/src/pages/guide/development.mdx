@@ -1,0 +1,40 @@
+---
+title: "Development"
+section: Guide
+order: 80
+description: "The mise tasks that build, test, lint and benchmark the extension."
+---
+
+Tooling runs through [mise](https://mise.jdx.dev):
+
+```sh
+mise run pgrx-init   # once: build the Postgres pgrx develops against
+mise run test        # core tests + #[pg_test] tests + the concurrency, notify, dump, upgrade, extension, limits and memory scripts
+mise run regress     # pg_regress examples in tests/pg_regress (checks their fixtures first)
+mise run lint        # CI/packaging checks (actionlint, shellcheck, workflow invariants), rustfmt, clippy -D warnings (all build configurations), rustdoc
+mise run ci          # lint + test + regress: what CI's ci job runs (its docker job: docker-test)
+mise run concurrency # only: two real psql sessions merging into one row
+mise run notify      # only: a real LISTEN session receiving automerge_notify() payloads
+mise run dump        # only: pg_dump/pg_restore and COPY round trips of every object kind
+mise run upgrade     # only: ALTER EXTENSION UPDATE from every released version
+mise run extension   # only: relocation (SCHEMA, SET SCHEMA, dump), install and setting privileges
+mise run limits      # only: the load memory limit against real crashes in a memory-capped scratch cluster
+mise run memory      # only: automerge_memory_usage() over many statements, transactions and errors (no leaks)
+mise run replication # logical replication in a scratch cluster (not part of test)
+mise run fuzz        # a long mutation-fuzzing session of the core (not part of test)
+mise run bench-sql   # median timings of the everyday SQL paths on a release build (minutes)
+mise run bench-expanded  # SQL timings of merge chains and PL/pgSQL loops on a release build (minutes)
+mise run bench-core  # Rust timings of load, normalize and the jsonb walk
+mise run bench-alloc # cost per allocation of the counting allocator (pin it: taskset -c 2 mise run bench-alloc)
+mise run package     # release package for the Postgres of $PG_CONFIG (required)
+mise run docker-build   # the Docker image (see Docker)
+mise run docker-test    # build it, then test it against containers: SQL, dump/restore, suites, memory limit, a soak smoke run, compose.yaml (not part of test)
+mise run soak           # build it, then a 60-minute concurrent load against a memory-capped container, sampled and checked (see Operations)
+mise run docker-bench-sql  # bench-sql against the image (release build on PGDG Postgres, no assertions)
+mise run docker-up      # compose.yaml's development Postgres; docker-down stops it
+# scripts/docker-archive.sh and scripts/docker-push.sh: release archives and pushing (see Publishing the image)
+mise run run         # install and open psql against the pgrx-managed Postgres
+```
+
+`crates/pg_automerge_core` holds all Automerge logic as plain Rust; `src/`
+is the pgrx glue. See [Architecture](/design/architecture).

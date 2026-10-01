@@ -1,0 +1,44 @@
+---
+title: "Rich text"
+section: Guide
+order: 50
+description: "Read the marks and blocks of a rich text object as jsonb spans, in the shape of Automerge's spans()."
+---
+
+The jsonb view shows a text object as a plain string: marks (bold, links,
+...) are not in it, and each block marker (a paragraph, heading or list
+item inserted with `splitBlock`) is a U+FFFC character. `automerge_spans`
+returns the structure, in the shape of `Automerge.spans(doc, path)` in
+JavaScript, so a frontend can render it or a backend index it:
+
+```sql
+SELECT automerge_spans(doc, '{body}') FROM notes WHERE id = $1;
+-- [{"type": "block", "value": {"type": "heading", "parents": [], "attrs": {"level": 1}}},
+--  {"type": "text", "value": "Shopping tips"},
+--  {"type": "block", "value": {"type": "paragraph", "parents": [], "attrs": {}}},
+--  {"type": "text", "value": "Buy "},
+--  {"type": "text", "value": "fresh milk", "marks": {"bold": true}},
+--  {"type": "text", "value": "."}]
+
+-- One row per span; every link in a document; the text as of earlier heads.
+SELECT s->>'type', s->>'value', s->'marks' FROM jsonb_array_elements(automerge_spans(doc, '{body}')) s;
+SELECT s->'marks'->>'link' FROM notes, jsonb_array_elements(automerge_spans(doc, '{body}')) s
+WHERE s->'marks' ? 'link';
+SELECT automerge_spans(doc, '{body}', $2) FROM notes WHERE id = $1;  -- $2: heads (text[])
+```
+
+The path works like `#>` (map keys, list indices, NULL when nothing is
+there); a path to anything but a text object is an error (22023). Block
+values are the maps the writer stored (the `type`/`parents`/`attrs`
+fields above are the convention of editors such as automerge-prosemirror).
+Mark values and block contents use the jsonb mapping above (timestamps as
+ISO strings, bytes as base64, integers and counters as exact numbers),
+where JavaScript gives `Date`, `Uint8Array`, a `number` or a `BigInt`
+(beyond ±(2^53−1), and always for unsigned integers), and a `Counter` for
+a counter in a block. There are no positions in the result;
+a block counts as one character in the text's indices. Blocks nested more
+than 32 levels deep are refused (54000) by `automerge_spans`, whose
+rendering of them would overflow the stack; the jsonb view and every
+other function read such documents as usual (the jsonb view never renders
+blocks). Details in [Rich text spans](/reference/rich-text-spans) and
+[Deep blocks](/design/deep-blocks).

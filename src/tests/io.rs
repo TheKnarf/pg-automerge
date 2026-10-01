@@ -536,7 +536,8 @@ fn garbage_input_is_a_clean_error() {
 
 #[pg_test]
 fn comparison_operators_compare_jsonb_not_history() {
-    // Documented in README/DESIGN: there is no automerge equality, so
+    // Documented (Limitations and gotchas; The automerge type): there is
+    // no automerge equality, so
     // `=` resolves through the implicit cast to jsonb equality of the
     // current state. Same content, different histories: equal as jsonb,
     // different heads.

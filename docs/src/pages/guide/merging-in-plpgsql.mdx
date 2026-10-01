@@ -1,0 +1,31 @@
+---
+title: "Merging in PL/pgSQL and nested merges"
+section: Guide
+order: 40
+description: "Chains of merges keep the document loaded in memory instead of saving and re-loading it at every step."
+---
+
+A merge result stays loaded in memory (an expanded value) until it is
+stored, sent or cast to `bytea`, so chains of merges do not save and
+re-load the document at every step:
+
+```sql
+-- d is merged into in place; the document is saved once, at the UPDATE.
+DECLARE d automerge; ch bytea;
+BEGIN
+    SELECT doc INTO d FROM docs WHERE id = $1 FOR UPDATE;
+    FOREACH ch IN ARRAY change_sets LOOP
+        d := merge(d, ch);
+    END LOOP;
+    UPDATE docs SET doc = d WHERE id = $1;
+END;
+```
+
+On a 3 MB document, merging 20 change sets this way and storing the result
+takes 5.4 s, about two loads of the document in total;
+`merge(merge(merge(doc, a), b), c)`, `merge(...)::jsonb` and
+`merge_agg(...)::jsonb` also skip the intermediate saves and loads. A
+single `UPDATE .. SET doc = merge(doc, $1)` gains nothing (the column
+arrives flat). A failed `merge` leaves the variable unchanged, also inside
+a `BEGIN .. EXCEPTION` block. Details in
+[Expanded values](/design/expanded-values).

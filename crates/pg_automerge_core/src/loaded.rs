@@ -1,6 +1,6 @@
 //! Documents kept loaded in memory between calls: the Rust side of the
-//! extension's expanded `automerge` values (see docs/DESIGN.md, "Expanded
-//! values").
+//! extension's expanded `automerge` values (see
+//! docs/src/pages/design/expanded-values.mdx).
 //!
 //! A [`LoadedDoc`] is an [`Automerge`] document plus its stored bytes
 //! (`save_nocompress()`), computed on first request and cached. It is

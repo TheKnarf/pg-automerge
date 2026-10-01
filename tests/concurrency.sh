@@ -165,7 +165,7 @@ A_DOC="$NEW_A" B_DOC="$NEW_B" run_pair "INSERT ... ON CONFLICT DO UPDATE (new ro
 assert_both 4 new_a new_b
 
 # 5. REPEATABLE READ: B cannot re-evaluate against a newer version and fails
-#    with a serialization error (DESIGN.md); retrying it then merges.
+#    with a serialization error (docs/src/pages/design/index.mdx); retrying it then merges.
 A_DOC="$RR_A" B_DOC="$RR_B" run_pair "REPEATABLE READ raises a serialization failure" \
     "UPDATE docs SET doc = merge(doc, :'a'::bytea::automerge) WHERE id = 5" \
     "BEGIN ISOLATION LEVEL REPEATABLE READ;

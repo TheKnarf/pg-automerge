@@ -10,7 +10,7 @@
 #     amd64 and a native arm64 runner and uploads each image as a workflow
 #     artifact.
 # On tags, publish pushes those images to a registry, but only once one is
-# configured (README.md, "Publishing the image"); until then it skips.
+# configured (docs/src/pages/operations/docker-ci.mdx, "Publishing the image"); until then it skips.
 name: CI
 
 on:
@@ -44,7 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      # Full history: docs-check (in mise run ci) compares the docs pages
+      # with the documents they were ported from, read from git.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Postgres build dependencies
         run: |
@@ -111,7 +115,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package
 
-      # Install the tarball the way the README says and create the
+      # Install the tarball the way docs/src/pages/guide/install.mdx says and create the
       # extension in the PGDG server.
       - name: Check the package installs (tags only)
         if: startsWith(github.ref, 'refs/tags/')
@@ -132,14 +136,19 @@ jobs:
           path: target/release/pg_automerge-pg18.tar.gz
 
   # The documentation site (docs/): typecheck, biome, the static build
-  # under /pg-automerge/ and the link/route check, as `mise run docs-check`
-  # (also part of `mise run ci`). A job of its own so docs feedback does not
-  # wait for pgrx; deploy-docs.yml publishes the site from main.
+  # under /pg-automerge/, the link/route check and the coverage check, as
+  # `mise run docs-check` (also part of `mise run ci`). A job of its own so
+  # docs feedback does not wait for pgrx; deploy-docs.yml publishes the
+  # site from main.
   docs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      # Full history: the coverage check reads the documents the pages were
+      # ported from out of git (docs/scripts/check-coverage.ts).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Node and pnpm as pinned in mise.toml; nothing else.
       - uses: jdx/mise-action@v2
@@ -163,8 +172,9 @@ jobs:
       fail-fast: false
       matrix:
         # amd64 always; on tags also arm64, on GitHub's native arm64 runner
-        # (no QEMU, no cross-compilation; see docs/DESIGN.md, "Docker image
-        # in CI"). Set the repository variable PG_AUTOMERGE_ARM64=false
+        # (no QEMU, no cross-compilation; see
+        # docs/src/pages/design/docker-image.mdx, "Docker image in CI"). Set
+        # the repository variable PG_AUTOMERGE_ARM64=false
         # where that runner is not available.
         arch: ${{ fromJSON((startsWith(github.ref, 'refs/tags/') && vars.PG_AUTOMERGE_ARM64 != 'false') && '["amd64", "arm64"]' || '["amd64"]') }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
@@ -269,7 +279,8 @@ jobs:
   # Prepared, not enabled: it does nothing until the repository has the
   # secret PG_AUTOMERGE_REGISTRY_TOKEN and the variables
   # PG_AUTOMERGE_REGISTRY_IMAGE (e.g. ghcr.io/you/pg-automerge) and
-  # PG_AUTOMERGE_REGISTRY_USERNAME. See README.md, "Publishing the image".
+  # PG_AUTOMERGE_REGISTRY_USERNAME. See
+  # docs/src/pages/operations/docker-ci.mdx, "Publishing the image".
   publish:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [ci, docker]

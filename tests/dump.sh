@@ -151,8 +151,9 @@ check_restored "$DB_CUSTOM" "custom dump"
 log "restore into a database with a lower pg_automerge.max_load_memory"
 # Every value restored is new input to the restoring server: under a
 # limit below what the documents take to load, the restore fails with
-# 53400; raising the limit for the restore session, as DESIGN.md
-# documents, restores them unchanged. The dump does not mention it.
+# 53400; raising the limit for the restore session, as
+# docs/src/pages/design/resource-limits.mdx documents, restores them
+# unchanged. The dump does not mention it.
 sql_on postgres -c "DROP DATABASE IF EXISTS $DB_LOW WITH (FORCE)" -c "CREATE DATABASE $DB_LOW" \
     -c "ALTER DATABASE $DB_LOW SET pg_automerge.max_load_memory = '64kB'"
 if out="$("$BINDIR/pg_restore" "${CONN[@]}" -d "$DB_LOW" --exit-on-error "$WORK/dump.custom" 2>&1)"; then

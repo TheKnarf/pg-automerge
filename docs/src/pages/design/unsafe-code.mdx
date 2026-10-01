@@ -1,0 +1,48 @@
+---
+title: "Unsafe code"
+section: Design
+order: 80
+description: "Where the unsafe code is, and why it is sound."
+---
+
+All `unsafe` is in the pgrx glue (`src/`); the core crate has none of its
+own. Every Postgres function called from Rust goes through pgrx's
+`pg_guard_ffi_boundary` (the generated `pg_sys` bindings, and explicitly
+for the two hand-declared `jsonfuncs.h` functions), so an ERROR inside
+becomes a Rust panic that unwinds through Rust frames (destructors run)
+and is re-raised at the function's `#[pg_guard]` boundary; every callback
+Postgres calls (the expanded-object methods, the memory-context reset
+callback, the trigger entry point, the transaction callback) is `#[pg_guard]` or wrapped in
+`pgrx_extern_c_guard`. Automerge calls run under the core's
+`catch_unwind` guard, which turns Automerge's panics into errors and
+passes pgrx's ERROR panics on untouched (they have a non-`String`
+payload). Each area and the invariant it relies on:
+
+| Area | What is unsafe | Invariant relied on |
+|---|---|---|
+| `datum.rs`: `AutomergeArg` | Reading a `Datum` as a varlena or expanded pointer | pgrx calls it with a non-null datum of type `automerge` (functions are `STRICT`; the trigger passes only non-null column values). The 1B_E tag is read before anything else, and an expanded object counts as ours only if its `eoh_methods` pointer is our method table; any other is flat (flattened by its own methods). |
+| `datum.rs`: `flat_prefix`, `flat_len` | `pg_detoast_datum_slice`, `toast_raw_datum_size` | Only on flat (non-expanded) datums. The slice is always a fresh palloc'd copy in PG18 (`detoast_attr_slice`), copied out and freed only when it is not the input. |
+| `datum.rs`: `Detoasted` | A `&[u8]` into a detoasted varlena | `pg_detoast_datum_packed` returns the datum itself or a fresh palloc'd copy; the slice borrows the guard, which frees the copy (not the datum) when dropped, after every borrow has ended. While unwinding it leaves the copy to the context reset. |
+| `datum.rs`: `automerge_type_in` | `GetSysCacheOid(TYPENAMENSP, ..)` with a C-string key | The same call pattern as PG's `TypenameGetTypid`; a NUL-terminated literal. |
+| `expanded.rs` | Creating, reading, replacing and flattening the expanded object | The object lives in its own memory context; the `Box<LoadedDoc>` is moved in only after every fallible allocation, and the reset callback (in the object's own chunk) drops it exactly once. The document is replaced only through a read-write pointer (`with_result`), after the caller's last read of it, with a document built completely beforehand, so a failure leaves it untouched. `get_flat_size` and `flatten_into` agree because the save is cached only on success and re-checked. |
+| `merge.rs`: support function | Walking the planner's `SupportRequestModifyInPlace` node | Node tags are checked before each cast; only a top-level `PARAM_EXTERN` with the requested `paramid` is returned (PG18 `List` layout). |
+| `merge.rs`: `merge_agg` state | `Internal` state as a `MergeAccumulator` | The state is created only by the transition function, in `AggCheckCallContext`'s context, with a drop-on-reset callback; `internal` cannot be built from SQL, so no other value reaches these functions. |
+| `jsonb.rs` | Building a `JsonbValue` tree and `JsonbValueToJsonb` | Arrays are boxed slices (addresses stable when the vectors grow) and strings live in an arena whose chunks never reallocate; all of it outlives `JsonbValueToJsonb`, which copies everything. Counts are bounded by jsonb's own limits before they are built. |
+| `history.rs`: `change_tuple` | `heap_form_tuple` via `PgHeapTuple::from_datums` | The descriptor the row is built with is checked first: exactly the attributes created by the extension, none dropped, each of exactly its type (`XX000` otherwise). pgrx checks only the count, and an owner can `ALTER TYPE .. ALTER ATTRIBUTE`. |
+| `notify.rs`: trigger | `TriggerData`, the relation's `TupleDesc`, `heap_getattr`, raw datum comparisons | `PgTrigger::from_fcinfo` checks `CALLED_AS_TRIGGER`; the relation is open and locked for the call; dropped columns are skipped; raw comparisons are only between non-null values of the same attribute (by value, fixed length, or varlena bytes / TOAST pointer). Virtual generated columns are not stored and are refused as keys. |
+| `notify.rs`: `json_categorize_type`, `datum_to_json`, `Async_Notify` | Hand-declared C functions | Signatures match PG 18.6's `utils/jsonfuncs.h` (the enum passed as `c_int`); called inside `pg_guard_ffi_boundary`. Channel and payload are NUL-free `CString`s within `NAMEDATALEN` and the 8000-byte payload limit. |
+| `io.rs`: `automerge_recv` | Reading the `StringInfo` | Postgres passes a valid buffer; the rest of it is consumed and copied before it is used. |
+| `lib.rs`: `_PG_init` | `MarkGUCPrefixReserved`, `RegisterXactCallback` | A NUL-terminated literal, copied by Postgres; a `#[pg_guard]` callback with Postgres' signature, registered once per backend (`_PG_init` runs once), which reads a setting and calls `alloc::trim_if_freed`, nothing that can raise an error at commit or abort. |
+| `alloc.rs`: `malloc_trim` | A hand-declared glibc function (`target_env = "gnu"` only) | Takes no pointer; called from the transaction callback, between allocator calls, never inside one, so malloc's lock is not held and nothing re-enters it. |
+| `alloc.rs`: the global allocator | `GlobalAlloc` for the counting allocator | Every method passes its arguments to `System` and returns its result unchanged; the counters are atomics, which never allocate, panic or re-enter the allocator (see [Memory observability](/design/memory-observability)). |
+
+What `unsafe` cannot protect against, by design: a Rust stack overflow or
+a failed Rust allocation aborts the backend, and Postgres then restarts
+every session. They are prevented, not caught: the jsonb walk is iterative
+with a 1000-level limit, Automerge never renders blocks (see
+[Deep blocks](/design/deep-blocks)), and client input is priced before it is
+loaded (see [Resource limits](/design/resource-limits)). A new use of a recursive
+Automerge API needs the same gating. pgrx internals relied on
+(`pgrx_extern_c_guard`, the callconv traits, ERROR panics with a
+non-`String` payload, `SetOfIterator`'s memory context) are re-checked
+whenever the pinned pgrx version changes.

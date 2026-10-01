@@ -1,0 +1,235 @@
+---
+title: "Merging"
+section: Reference
+order: 20
+description: "The semantics of merge, merge_agg and automerge_contains, and the heads fast path."
+---
+
+- `merge(automerge, automerge) → automerge`: the state after applying every
+  change of `b` missing from `a`. Commutative and idempotent in state
+  (`merge(a,b)` and `merge(b,a)` have identical heads and jsonb).
+  - No-op fast path: if `b`'s history is already in `a`, return `a`
+    unchanged, with no re-save; symmetrically, if `b` already contains all
+    of `a`, return `b` unchanged (the state is the same; this is the common
+    case of a backend sending a full, newer save). Checked cheapest first:
+    the same expanded object; the heads read from a prefix of each value
+    (no load, and nothing else detoasted, see
+    [Heads fast path](/reference/merging#heads-fast-path)): `heads(b) ⊆ heads(a)` → `a`,
+    `heads(a) ⊊ heads(b)` → `b`; the history
+    of an input that is already loaded; then the larger stored input is
+    loaded and checked against the other's heads (a containing document is
+    usually the larger one, so one load decides the common linear case);
+    only then the other.
+  - An unchanged input is returned as the datum it arrived as, not a copy:
+    a stored value stays compressed or a TOAST pointer, so `UPDATE docs
+    SET doc = merge(doc, x)` with nothing new keeps the row's TOAST value
+    (Postgres reuses an identical TOAST pointer) instead of detoasting,
+    compressing and writing the document again. On the 3 MB document such
+    an update takes about 1 ms instead of 185 ms.
+  - A new document is returned as an expanded value (see
+    [Expanded values](/design/expanded-values)): kept loaded in memory and saved
+    only when it is stored, sent or cast to `bytea`. When `a` is a
+    read-write expanded pointer (a PL/pgSQL variable in `d := merge(d, x)`,
+    or the result of an inner `merge`), the merge happens in place.
+  - Merging two valid stored documents cannot fail except for a reused
+    actor id (two histories with different changes for the same (actor,
+    seq)): `22000` "conflicting automerge changes", with a HINT (see
+    [Error codes](/reference/error-codes)).
+  - `merge` is an unreserved keyword since PG15; unqualified
+    `SELECT merge(a, b)` and `SET doc = merge(doc, ...)` work on PG18
+    (tested), so the function keeps the name `merge`.
+- `merge(doc automerge, changes bytea) → automerge` (`doc` is called `a`
+  below, as in `merge(a, b)`): applies external bytes on top of `a`, like Automerge's `load_incremental`. `changes` may be a full
+  save (compressed or not, optionally followed by change chunks) or bare
+  change chunks (`save_incremental()` / `save_after()` output, several may
+  be concatenated) whose dependencies are in `a` or earlier in `changes`.
+  - Strict, unlike `load_incremental`: a chunk that fails to parse or has
+    a bad checksum fails the whole call instead of being skipped.
+  - Bare uncompressed change chunks (the usual input) are split and
+    checksum-checked by `header::change_chunks`, each parsed with
+    `Change::try_from` (the parser `Automerge::load` uses for change
+    chunks) and applied to `a`'s document with `apply_changes`: the same
+    steps as a load of `a ++ changes`, without re-loading `a` when it is
+    already loaded (an expanded value).
+  - A save (input starting with a document chunk, compressed or not,
+    optionally followed by change chunks) is merged like
+    `merge(a, b::automerge)`, cheapest check first:
+    1. exactly one document chunk that passes Automerge's chunk parse
+       (below) with a valid checksum, whose header heads are heads of `a`
+       (or changes of an expanded `a`): `a` unchanged, nothing loaded. A
+       load of `a ++ changes` decides the same: for a document chunk whose
+       heads it has, Automerge 0.12 (`storage/load.rs`) still parses the
+       chunk (`Chunk::parse` / `Document::parse`: header, actors, heads,
+       column metadata, column data, head indices, inflating deflated
+       columns, the column layout) and checks its checksum, and skips only
+       reconstructing its changes. `header::document_parses` checks the
+       same, without reconstructing, before this answer (conservatively:
+       every LEB128 canonical, everything in bounds, the
+       head indices absent or complete with nothing after them, deflated
+       columns inflating, and each column block a subsequence of the specs
+       Automerge writes with value columns right after their metadata;
+       anything it does not recognize takes the loading path, where
+       Automerge decides). So a chunk with known heads and a malformed
+       body is `22P02`, as that load would make it. The check is part of
+       the load memory scan of the input (see
+       [Resource limits](/design/resource-limits)), which also prices this
+       answer at what parsing the chunk takes (its inflated columns,
+       nothing for an uncompressed save).
+    2. When the headers say the save has no more changes than a stored `a`
+       (an older save) and the chunk parses, `a` is loaded first and
+       checked for those heads, again as that load would.
+    3. The save is loaded on its own (strictly, and complete: if trailing
+       change chunks depend on changes only `a` has, the input takes the
+       `a ++ changes` path below). If it contains `a` (by the heads, or its
+       history has `a`'s heads), it is the result: an expanded value whose
+       stored bytes are its `save_nocompress()`, which needs no
+       save-and-load check when it is the input's own encoding (canonical
+       bytes, or a compressed save that inflates to them: the shortcut of
+       normalization). So a newer full save of the stored document costs
+       one load, and the stored document is never loaded.
+    4. Otherwise `a` (loaded, or a clone of an expanded `a`) gets the
+       save's missing changes; the result is unverified.
+
+    The result of case 3 is the save's normalized bytes, as `merge(a, b)`
+    returns `b` when `b` contains `a`; the state is the same as a load of
+    `a ++ changes` would give, the change order in the bytes may differ.
+  - Anything else (compressed change chunks, a save whose trailing changes
+    depend on `a`) is loaded as `a ++ changes` (for an expanded `a`, a
+    fresh save of it ++ `changes`).
+  - Changes whose dependencies are in neither `a` nor `changes` raise
+    `22P02` (`invalid automerge changes: missing 1 dependency that neither
+    the document nor the input contains`), with the hashes in the DETAIL
+    (`Missing changes: <hash>.`; at most five, then "and N more"). Nothing
+    orphaned is ever stored.
+  - Empty `changes`, or nothing new (heads unchanged): returns `a` unchanged
+    (the datum as it arrived, as above), no re-save. When `changes` is bare
+    change chunks that are all heads of `a` (a re-send of the latest
+    changes), this is seen from the chunks' hashes and `a`'s heads, read
+    from a prefix, without detoasting or loading `a` (see
+    `automerge_contains(a, bytea)`); a re-sent save of `a`, from its
+    header (case 1 above).
+  - Malformed input, including decoder panics, is `22P02`. A changed result
+    is marked unverified (unless it is a save's own encoding, case 3
+    above): it gets the save-and-load check of normalization when it is
+    first flattened (see
+    [The deferred verification](/design/expanded-values#the-deferred-verification)).
+  - A document chunk after the first chunk of `changes` whose heads `a`
+    already has is parsed and checksum-checked by Automerge (as in case 1),
+    and its changes are not reconstructed.
+- Operators `automerge || automerge` and `automerge || bytea` → `automerge`
+  are the two `merge`s. There is no `bytea || automerge`, so the second has
+  no commutator.
+- Aggregate `merge_agg(automerge) → automerge`: merges all non-null inputs;
+  NULL when there are none. The state (`internal`, a `MergeAccumulator`)
+  loads documents only when a merge needs them, each at most once, and
+  saves the result at most once:
+  - The first stored input is kept as bytes with its header heads, not
+    loaded. A group of one row, or of rows it contains or is contained in
+    by their heads (identical values, say), loads nothing, and that row is
+    the result as stored.
+  - When a later input cannot be decided by the heads (an older or newer
+    version of a linear history, a concurrent one), the larger of the two
+    is loaded first, since it usually contains the other, as a newer
+    version contains an older one. Only if it does not is the other one
+    loaded too and merged into the first input's document. A version and
+    a newer one cost one load in either order.
+  - Once a document is loaded, a later input is checked against it by its
+    heads, read from a prefix of the value (`AutomergeArg::heads`) before
+    it is detoasted, so an input that adds nothing is neither detoasted
+    nor loaded. An input that is loaded and contains the whole state
+    replaces it (no merge); otherwise its missing changes are applied.
+    Expanded inputs are used without a load.
+
+  While the state equals one input's stored value, that value is the
+  result: no save. Like `merge`, the result is the same state (heads and
+  jsonb) for any input order, but its bytes can depend on the order.
+  There is no combine function, so it never runs as a
+  parallel partial aggregate. The loaded document lives in the Rust heap,
+  outside memory-context accounting, and without a serialfunc HashAgg
+  cannot spill it; the aggregate declares `SSPACE = 1048576` so the
+  planner's per-group estimate is realistic and it prefers sorted grouping.
+  The transition function (`automerge_merge_agg_trans`) runs
+  `CHECK_FOR_INTERRUPTS` before each input. When no
+  single input contains all others, the result is an expanded value
+  holding a copy of the state (the final function may run more than once,
+  e.g. as a window function), so `merge_agg(doc)::jsonb` needs no save and
+  re-load.
+
+## Overload resolution
+
+`merge(automerge, bytea)` / `automerge || bytea` and
+`automerge_contains(automerge, bytea)` keep every form unambiguous
+(verified per expression in the `merge_overloads_resolve_unambiguously` and
+`contains_bytea_overload` pg_tests, through the view dependencies and
+result type):
+
+| Expression | Resolves to |
+|---|---|
+| `merge(doc, doc)`, `doc \|\| doc` | `(automerge, automerge)` |
+| `merge(doc, $1::bytea)`, `doc \|\| $1::bytea`, typed bytea parameter `$1` | `(automerge, bytea)` |
+| `merge(doc, '\x..')`, `doc \|\| '\x..'` (untyped literal) | `(automerge, automerge)` |
+| `merge(doc, NULL)`, untyped parameter (`PREPARE p AS ... merge(doc, $1)`) | `(automerge, automerge)` |
+| `doc::jsonb \|\| '{..}'` | `jsonb \|\| jsonb` |
+| `automerge_contains(doc, doc)`, `automerge_contains(doc, '\x..')`, `automerge_contains(doc, NULL)` | `(automerge, automerge)` |
+| `automerge_contains(doc, $1::bytea)`, typed bytea parameter `$1` | `(automerge, bytea)` |
+
+An untyped literal is assumed to have the type of the other, known argument
+(function resolution step 4.f; for operators, the exact-match check with the
+unknown side taking the other side's type); `automerge` and `bytea` are both
+in type category `U`, so no category preference applies earlier. A
+consequence: bare change chunks written as a literal need `'\x..'::bytea`,
+otherwise the automerge input function rejects them as orphaned.
+`doc || '{"a": 1}'` means merge (and fails to parse the literal as hex);
+write `doc::jsonb || '{"a": 1}'` for jsonb concatenation. `merge($1, $2)`
+with two typed bytea parameters matches nothing (bytea → automerge is not
+implicit).
+
+## Heads fast path
+
+A stored value is one uncompressed document chunk, whose header lists the
+heads (automerge `src/storage/document.rs`):
+
+```text
+magic 85 6f 4a 83 | checksum (4) | chunk type (1, 0 = document) | uleb128 data length
+data: uleb128 actor count, per actor uleb128 length + bytes
+      uleb128 head count, 32 bytes per head
+      change/op column metadata and data, head indices
+```
+
+`pg_automerge_core::header` parses just that far. It is exact for stored
+values: loading a document chunk (`VerificationMode::Check`, the default)
+fails with "mismatching heads" unless the listed heads equal the ones
+derived from its changes, and every stored value was loaded that way on its
+way in. The checksum is not recomputed (that would hash the whole value):
+stored values were checksum-verified when written. Anything that is not
+exactly one document chunk (wrong magic or type, trailing chunks, lengths
+that do not add up to the value's size) falls back to a full load.
+
+The change count comes from the same place: after the heads come the
+change and op column metadata (uleb128 count, then uleb128 spec and
+length per column) and then the column data, change columns first. The
+change actor column (spec `0x01`) has one RLE-encoded entry per change
+(signed LEB128 run count: `n > 0` repeats the next value `n` times, `n < 0`
+is followed by `-n` literal values, `0` is a null run), and Automerge's
+loader takes the number of changes from its length and rejects documents
+whose other change columns disagree. `header::change_count_from_prefix`
+counts it; an absent column means no changes; a deflated or repeated
+actor column, a null run, or anything that does not add up falls back to
+a load.
+
+`automerge_heads`, `automerge_contains`, `automerge_change_count`, the
+since-functions of [History](/reference/history) and the notification
+trigger take their document without detoasting it (`AutomergeArg`; an
+expanded value is read in memory): they read the value's size with
+`toast_raw_datum_size` and fetch only a prefix (4 kB, grown as needed) with
+`pg_detoast_datum_slice`, which for an out-of-line value reads only the
+TOAST chunks covering it and for a compressed value decompresses only that
+far. `merge` and `merge_agg` also decide their no-op cases from such a
+prefix before they detoast a value (see [Merging](/reference/merging)).
+
+Deciding containment for a linear history (newer contains older) still
+needs a load of the newer document: the headers only list heads, and
+change hashes are only available after reconstructing the changes. The
+opposite answer (an older or a concurrent version does not contain the
+other) usually needs none: `automerge_contains` compares the two change
+counts, read from the same prefix (see [Reading](/reference/reading)).

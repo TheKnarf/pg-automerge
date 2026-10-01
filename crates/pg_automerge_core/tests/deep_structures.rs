@@ -6,7 +6,8 @@
 //! bytes per level overflows (aborting the test process). Automerge's own
 //! recursive rendering of a block (`hydrate`, about 13 kB per level in a
 //! release build) is only reached by `automerge_spans`, after its depth
-//! check, and never by the JSON walks (see docs/DESIGN.md, "Deep blocks").
+//! check, and never by the JSON walks (see
+//! docs/src/pages/design/deep-blocks.mdx).
 //!
 //! The results are checked too: the jsonb views of deep maps and lists
 //! stop at the nesting cap (54000), those of deep blocks are the text with

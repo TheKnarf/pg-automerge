@@ -1,0 +1,246 @@
+---
+title: "Benchmarks, 2026-09-30"
+section: Design
+order: 143
+description: "Benchmarks recorded on 2026-09-30."
+---
+
+## Rebuilt copies and column metadata (2026-09-30)
+
+A defensive test round against the load limit (release build, counting
+allocator) found four kinds of input whose peak the estimate did not
+bound, because Automerge copies something the input holds once, per
+change or per op, or keeps per-entry structures the estimate did not
+price. Peak and estimate in MB (2^20 bytes), before and after the terms
+of [The estimate](/design/resource-limits#the-estimate) that price them:
+
+| Input (bytes) | Peak | Estimate before | after |
+|---|---|---|---|
+| Document chunk, 2,000 empty changes sharing one 100 kB message (a repeat run; 100 kB, or 209 bytes deflated) | 766 | 4.6 (167x) | 958 (0.80) |
+| Document chunk, 3 changes sharing one 30 MB message (30 MB) | 372 | 286 (1.30x) | 572 (0.65) |
+| Document chunk, 2,000 empty changes by a 100 kB actor (100 kB) | 766 | 4.6 (167x) | 958 (0.80) |
+| Document chunk, 2,000 changes of a 16-byte actor, each putting a key in a map a 100 kB actor made (100 kB) | 766 | 5.7 (135x) | 960 (0.80) |
+| Document chunk, 2,000 changes sharing one 100 kB key (100 kB) | 384 | 5.7 (68x) | 578 (0.67; 959 before keys were priced below messages, below) |
+| Change chunk, 2,000 puts of one 100 kB key (100 kB) | 192 | 3.1 (63x) | 1,528 (0.13) |
+| Change chunk, 2,000 marks with one 100 kB name (100 kB) | 383 | 3.1 (125x) | 1,528 (0.25) |
+| Change chunk, 500 maps each given one 50 kB key between two others (52 kB; `normalize`, with its save) | 141 | 2.1 (67x) | 239 (0.59) |
+| Document chunk, 2,100,000 / 4,200,000 empty columns (4.2 / 8.4 MB) | 240 / 480 | 40 / 80 (6.0x) | 441 / 881 (0.54) |
+| Change chunk, 2,100,000 / 4,200,000 empty columns (4.2 / 8.4 MB) | 336 / 672 | 40 / 80 (8.4x) | 441 / 881 (0.76) |
+| The same compressed (4 / 8 kB) | 348 / 696 | 40 / 80 (8.7x) | 441 / 881 (0.79) |
+
+Where Automerge 0.12 copies:
+
+- Messages: `ChangeCollector::collect` rebuilds every change of a
+  document as a `StoredChange` whose bytes hold the message and whose
+  `message` is a `String` copy of it (`op_set2/change/collector.rs`,
+  `finish`); `Document::verify_changes` clones every rebuilt change into
+  `MismatchedHeads` when the heads do not match. 4.0 bytes per byte of
+  the expanded run.
+- Actor ids: `ActorId` is a `TinyVec<[u8; 16]>`, so a longer id is a heap
+  copy wherever it is cloned; every rebuilt change holds its own actor
+  and the other actors its ops refer to in its bytes and as `ActorId`s
+  (`ChangeCols::actor`, `other_actors`), cloned again into the error.
+  4.0 bytes per byte.
+- Keys and mark names: a document's rebuilt changes hold their ops' keys
+  in their bytes (2.0 bytes per byte with the error's clone); applying a
+  change (`import_ops` in `op_set2/change/batch.rs`) makes an owned
+  `String` of every op's key (`Key::map`) and mark name, all held until
+  the batch is applied (1.0 and 2.0 bytes per byte), and the document's
+  key column holds a key literally where other keys come between its
+  rows (4.0 with the `String`s, 5.9 with `normalize`'s save).
+- Column metadata: `RawColumns::parse` collects the entries with
+  `parse::apply_n` into a vector that doubles as it grows, collects them
+  again into `RawColumn`s, and the change and document paths copy the
+  list once more (`uncompressed()`, `ChangeOpsColumns`,
+  `OpSet::validate`): up to 120 bytes per entry (document), 168 (change
+  chunk), 174 (compressed), at counts just past a power of two.
+
+The scan computes the expanded sizes from run headers (a repeat run of
+`n` strings of `len` bytes: `(n - 1) × len`; an actor column's run:
+its length, at most the changes, times the actor's length), so it stays
+proportional to the input. It no longer allocates per metadata entry:
+before, it kept two vectors per entry (48 bytes per two input bytes),
+so refusing such input cost about a third of its estimate; a block whose
+extra entries alone exceed the limit now stops the scan before they are
+read (12,000,000 entries in 24 kB: refused at the default limit with a
+peak under 72 MB, in under 2 s).
+
+Saves written by Automerge of the same shapes load (2,000 commits
+sharing one 100 kB message 0.40, one 100 kB key 0.33, by a 100 kB actor
+0.40, one 100 kB mark name, whose rows text characters come between,
+so the document holds it literally, 0.60), and so do they after another
+save, where they are rebuilt and applied as changes (0.15, 0.18, 0.31,
+0.60), and through `merge_changes` (0.15, 0.18, 0.31, 0.70). The
+crafted document chunks list no heads, so a load after another save,
+or `merge_changes`, skips them as already contained (a peak of 32
+bytes); with one made-up head they are rebuilt and applied (Automerge
+does not check a later chunk's changes against its heads): 0.15 to
+0.46 after a save, 0.18 to 0.36 through `merge_changes`.
+
+These terms raise the estimate of ordinary documents too, where they
+repeat keys longer than a few bytes or have actor ids longer than 16
+bytes (their other inputs moved by at most +1%: map keys repeated by a
+run, one key overwritten 40,000 times +0.3%, 400 actors × 400 changes
+of 16 keys +0.6%; worst ratio still 0.80). An overwritten key is a
+repeat run of the document's key column, and every overwrite a rebuilt
+copy; a long actor id is counted per change and per successor. Measured
+against the commit before these terms (`save_nocompress`, MB; the
+"apply" estimate is of `merge_changes` of the save into another
+document), with keys and mark names first priced like messages (5 per
+byte), then at 3:
+
+| Document | Estimate before | 5 per key byte | 3 per key byte | Peak (ratio) | Apply estimate before | 5 | 3 | Peak (ratio) |
+|---|---|---|---|---|---|---|---|---|
+| 8 actors × 2,000 rounds, 20 keys of 64 bytes each round | 28.1 | 40.3 (+43%) | 35.5 (+26%) | 14.1 (0.40) | 74.9 | 106.6 (+42%) | 101.8 (+36%) | 26.9 (0.26) |
+| The same, keys of 36 bytes (UUIDs) | 28.1 | 35.0 (+24%) | 32.2 (+15%) | 12.3 (0.38) | 74.9 | 92.7 (+24%) | 90.0 (+20%) | 24.8 (0.28) |
+| The same, keys of 4 bytes | 28.1 | 28.9 (+3%) | 28.6 (+2%) | 10.2 (0.36) | 74.9 | 76.9 (+3%) | 76.6 (+2%) | 22.3 (0.29) |
+| One 32-byte actor, 20,000 rounds, 20 keys of 64 bytes | 269.5 | 397.7 (+48%) | 345.8 (+28%) | 138.3 (0.40) | 733.0 | 1,066.3 (+45%) | 1,009.5 (+38%) | 295.8 (0.29) |
+| Text, 4 actors with 32-byte ids × 5,000 characters, half deleted | 18.2 | 20.5 (+13%) | 20.0 (+10%) | 7.6 (0.38) | 45.8 | 51.8 (+13%) | 50.5 (+10%) | 23.5 (0.46) |
+| The same, 64-byte ids | 18.2 | 22.8 (+25%) | 21.9 (+20%) | 7.6 (0.35) | 45.8 | 57.7 (+26%) | 55.3 (+21%) | 23.8 (0.43) |
+
+(The "3" column also caps a change's own and other long actors
+together at every long actor once, where before only the others were
+capped.) The real cost of the overwritten 64-byte keys is 1.6-1.7 bytes
+per expanded byte (`normalize` +4.1 MB for 2.6 MB expanded), under the
+3 charged; applied to another document they cost about 1.9 per byte
+against 11 charged (3 rebuilt + 8 applied), because the applied keys
+are priced for the worst case, where the document they are applied to
+has rows between theirs and holds every copy literally (4.0 per byte
+measured, 5.9 with `normalize`'s save). So a document whose keys of
+tens of bytes are overwritten many times, or whose actor ids are long,
+is priced 10-40% higher than before, and one near the limit before
+(1.4-1.6 GB at the default 2 GB) can now exceed it on a merge, an
+`INSERT` or a restore. The battery holds two such documents now
+(`long_keys`: the first row, `long_actors`: the fifth; 0.40 and 0.38 as
+saves). A 200,000-
+input release fuzz session found no violation. `tests/limits.sh` with
+the four inputs (a 1 kB compressed save of 6,000 changes sharing a
+100 kB message, a 100 kB document chunk of 6,000 changes by a 100 kB
+actor, a 100 kB change chunk of 16,000 puts of one 100 kB key, and a
+24 kB compressed change chunk listing 12,000,000 empty columns): each
+aborts the capped cluster without the limit, and gets `53400` with it
+through every path, with no restart.
+
+Cost, interleaved (the previous commit and this one alternating, five
+pairs; median of the per-run medians of five repetitions; release). The
+scan alone (`budget::scan_input`, median of seven batches of 2,000):
+83 kB list stored 66.4 → 64.2 µs, compressed 293 → 292 µs; 877 kB list
+stored 673 → 647 µs, compressed 2,476 → 2,470 µs (no per-entry vectors).
+`bench-core` normalize, ms:
+
+| document | stored before | after | compressed before | after |
+|---|---|---|---|---|
+| 83 kB list | 16.5 | 16.2 | 16.9 | 16.6 |
+| 877 kB list | 166.9 | 165.2 | 170.2 | 169.8 |
+| 3 MB text | 2488.8 | 2480.9 | 2525.9 | 2528.4 |
+| 5,000 typed characters | 22.4 | 22.6 | 22.4 | 22.6 |
+
+`bench-sql`, ms:
+
+| case | 83 kB before | after | 877 kB before | after | 3 MB before | after |
+|---|---|---|---|---|---|---|
+| R1 read (unchanged code) | 25.7 | 25.6 | 261.6 | 256.0 | 2796 | 2807 |
+| I1 insert of a compressed save | 21.1 | 21.7 | 204.5 | 199.8 | 2762 | 2764 |
+| W1 merge(doc, changes) | 38.1 | 37.7 | 368.1 | 361.9 | 5275 | 5213 |
+| W2 merge(doc, newer save) | 22.5 | 23.0 | 208.2 | 207.1 | 2791 | 2781 |
+| W3 merge(doc, save::automerge) | 22.1 | 22.6 | 209.7 | 209.5 | 2776 | 2783 |
+| W4 upsert | 38.6 | 38.2 | 372.5 | 368.1 | 5337 | 5302 |
+| W6 W3 as a text parameter | 38.7 | 38.7 | 381.2 | 373.6 | 5362 | 5374 |
+| A2 merge_agg of two versions | 18.8 | 18.2 | 175.0 | 174.4 | 2566 | 2562 |
+
+All within ±3.1% (at 83 kB, ±0.6 ms either way), about the drift of R1,
+whose code did not change (−2.2% at 877 kB); the scan, the only code on
+these paths that changed, got faster, by 2 to 26 µs.
+
+## The Docker image against the pgrx Postgres (2026-09-30)
+
+The numbers above were all measured on the pgrx-managed Postgres 18.6,
+which pgrx builds with `--enable-cassert` and
+`RANDOMIZE_ALLOCATED_MEMORY` (every `palloc` filled with noise). The
+Docker image runs the same extension (a release build, the same profile)
+on the PGDG Postgres 18.6 without either. `mise run bench-sql` and
+`mise run docker-bench-sql` (a throwaway container, default settings like
+the pgrx cluster's, over TCP on 127.0.0.1 like the pgrx runs), alternated
+two rounds each, `BENCH_REPS=5`, the mean of the two runs' medians, ms:
+
+| case | 83 kB pgrx | image | 877 kB pgrx | image | 3 MB pgrx | image |
+|---|---:|---:|---:|---:|---:|---:|
+| R1 read | 26 | 25 (−6%) | 258 | 252 (−2%) | 2783 | 2784 (+0%) |
+| R2 three reads | 77 | 74 (−3%) | 782 | 760 (−3%) | 8298 | 8343 (+1%) |
+| R3 heads | 0.4 | 0.3 | 0.4 | 0.3 | 0.4 | 0.3 |
+| I1 insert of a save | 22 | 22 (−2%) | 204 | 200 (−2%) | 2760 | 2728 (−1%) |
+| W1 merge(doc, changes) | 37 | 36 (−3%) | 366 | 353 (−4%) | 5211 | 5170 (−1%) |
+| W2 merge(doc, newer save) | 24 | 21 (−11%) | 206 | 198 (−4%) | 2760 | 2740 (−1%) |
+| W3 the same, cast first | 22 | 21 (−5%) | 206 | 199 (−4%) | 2758 | 2730 (−1%) |
+| W4 upsert | 40 | 36 (−10%) | 367 | 364 (−1%) | 5248 | 5244 (−0%) |
+| W5 no-op merge | 0.8 | 0.6 | 0.9 | 0.7 | 0.9 | 0.6 |
+| W6 W3 as a text parameter | 38 | 37 (−4%) | 372 | 370 (−1%) | 5325 | 5302 (−0%) |
+| A1 merge_agg of one row | 1.4 | 0.7 | 8.7 | 4.3 | 24 | 9.8 |
+| A2 merge_agg of two versions | 18 | 17 (−6%) | 173 | 170 (−2%) | 2548 | 2518 (−1%) |
+| C1 contains(doc, newer save) | 0.9 | 0.4 | 1.2 | 0.7 | 9.1 | 5.2 |
+| C2 contains(doc, stored newer) | 1.2 | 0.6 | 1.2 | 0.8 | 1.1 | 0.6 |
+
+Everything that loads a document is within 0 to 6% (up to 11% at 83 kB,
+where a run is 20 ms and the noise ±1 ms): the time is Automerge's, in
+Rust, and identical code. The paths that avoid the load (heads, no-op
+merges, `merge_agg` of one row, containment by heads and change counts)
+take about half the time on the image: what is left there is Postgres'
+own work (detoasting, `palloc`, the executor), which the assertions and
+the memory randomization slow down. The earlier sections' conclusions
+hold on a production build; their millisecond-scale absolute numbers
+are about twice what a production server shows.
+
+## Deep blocks (2026-09-30)
+
+The jsonb walk before and after it skips Automerge's document iterator
+for documents with blocks (see [Deep blocks](/design/deep-blocks)); release
+builds of the previous commit (555110e) and this one, interleaved.
+
+The crash: the Docker image of 0.1.0 built before `automerge_spans`
+(the one the reported crash came from) segfaults on
+`INSERT INTO t (doc) VALUES (:'deep_block')` into a table with a stored
+generated `doc::jsonb` column (the regress fixture: 2,000 levels, 4 kB);
+so did `tests/limits.sh` step 3 with the previous commit's library, on
+its 5,000-level input. With this commit both pass.
+
+`mise run bench-core` (five rounds, each binary's median of 5; the
+median of the rounds, ms; "walk" is the sweep before and the checked
+walk, block check included, after):
+
+| doc | load (untouched) | block check | walk before | walk after | per-object walk |
+|---|---|---|---|---|---|
+| text3mb | 2498 / 2670 | 0.0 | 252.8 | 249.9 | 193.0 |
+| items20k | 157.6 / 159.6 | 1.1 | 64.4 | 66.4 | 146.7 |
+| items2k | 15.4 / 15.6 | 0.1 | 5.6 | 5.8 | 13.5 |
+| typed5k | 21.6 / 22.7 | 0.0 | 0.4 | 0.4 | 0.3 |
+| rich20k | 368.4 / 381.1 | 0.0 | 917.2 | 15.1 | 15.1 |
+
+The load, which this commit does not touch, differs by up to 7% between
+the two binaries: code layout. The walk after costs the sweep plus the
+check (items20k: 65.5 ms for the new binary's own sweep, 66.4 ms checked).
+
+`mise run bench-sql` read paths (R1: `doc->>'status'`, R2: three
+accessors, R3: `automerge_heads`; five interleaved rounds of 5, the
+median of the rounds, ms), and R1 again (six rounds of 9):
+
+| case | doc | before | after |
+|---|---|---|---|
+| R1 | items20k (877 kB) | 263 | 262 (-0.4%); again 266 → 264.5 (-0.6%) |
+| R1 | text3mb (3 MB) | 2839 | 2902 (+2.2%); again 2878.5 → 2887 (+0.3%) |
+| R1 | items2k (83 kB) | 28 | 28 |
+| R1 | rich20k (1.7 MB) | 1332 | 424 (-68%) |
+| R2 | items20k | 796 | 776 (-2.5%) |
+| R2 | text3mb | 8567 | 8625 (+0.7%) |
+| R2 | items2k | 78 | 77 |
+| R2 | rich20k | 4004 | 1235 (-69%) |
+| R3 | all | 0.4-0.5 | 0.4-0.6 (no load, no walk) |
+
+Merge results read as jsonb (expanded values without stored bytes, which
+are saved once for the check; five interleaved rounds, each the median of
+7, ms): `merge(doc, c1)::jsonb->>'status'` items20k 263.5 → 260.9, items2k
+26.1 → 26.3, text3mb 2846 → 2896 (+1.8%); two merges into a PL/pgSQL
+variable and ten reads of it items20k 1074 → 1046, items2k 100.9 → 98.1,
+text3mb 5196 → 5256 (+1.2%). The added work there is one
+`save_nocompress` (7.3 ms on text3mb, kept for when the value is stored)
+and the check; the rest of the difference on text3mb is of the size and
+sign of the untouched load's above.

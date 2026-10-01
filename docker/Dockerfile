@@ -12,8 +12,8 @@
 #
 # Toolchain versions are not repeated here: the `versions` stage reads Rust
 # and cargo-pgrx from mise.toml (and checks cargo-pgrx against the pgrx in
-# Cargo.lock) with scripts/versions.sh. See the Docker section of README.md
-# and "Docker image" in docs/DESIGN.md.
+# Cargo.lock) with scripts/versions.sh. See docs/src/pages/guide/docker.mdx
+# and docs/src/pages/design/docker-image.mdx.
 
 # The base of both the builder and the runtime stage, so the Debian release,
 # glibc and the Postgres headers the extension is compiled against are the
@@ -146,6 +146,6 @@ COPY --from=builder --chmod=0644 /out/extension/ /usr/share/postgresql/18/extens
 COPY --from=versions --chmod=0644 /version /usr/share/doc/pg_automerge/VERSION
 COPY --chmod=0644 LICENSE /usr/share/doc/pg_automerge/copyright
 # The init script, and a copy outside /docker-entrypoint-initdb.d that
-# survives a bind mount over that directory (README.md, Docker).
+# survives a bind mount over that directory (docs/src/pages/guide/docker.mdx).
 COPY --chmod=0755 docker/initdb-pg-automerge.sh /docker-entrypoint-initdb.d/10-pg-automerge.sh
 COPY --chmod=0755 docker/initdb-pg-automerge.sh /usr/local/bin/pg-automerge-initdb

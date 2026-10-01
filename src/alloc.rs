@@ -1,7 +1,7 @@
 //! The library's global allocator: the system allocator (`malloc`), plus
 //! counters of the bytes this library's Rust code holds, for
-//! `automerge_memory_usage()` (see docs/DESIGN.md, "Memory
-//! observability").
+//! `automerge_memory_usage()` (see
+//! docs/src/pages/design/memory-observability.mdx).
 //!
 //! Everything Rust allocates in a backend goes through it: Automerge's
 //! documents, the core's buffers, pgrx's own Rust allocations. Postgres'
@@ -12,13 +12,14 @@
 //!
 //! Plain Rust with no pgrx dependency, so a benchmark can include it: the
 //! core crate's `bench_alloc` example (`mise run bench-alloc`) measures
-//! its overhead (docs/DESIGN.md, "Memory observability").
+//! its overhead (docs/src/pages/design/memory-observability.mdx).
 //!
 //! Counts are the sizes Rust asks for (`Layout::size`), not what `malloc`
 //! uses for them (its chunk headers and rounding, and freed memory it
 //! keeps for reuse, are not included). A third counter, the high point
 //! since the last trim, decides when [`trim_if_freed`] hands that freed
-//! memory back to the system (docs/DESIGN.md, "Returning freed memory").
+//! memory back to the system (docs/src/pages/design/memory-observability.mdx,
+//! "Returning freed memory").
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};

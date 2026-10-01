@@ -1,6 +1,7 @@
 //! Hand-built chunks whose run-length encoded columns describe far more
 //! than they hold: the inputs of `tests/memory_bounds.rs` (from the
-//! measurements in docs/DESIGN.md, "Input amplification measurements").
+//! measurements in docs/src/pages/design/benchmarks/2026-09-29.mdx,
+//! "Input amplification measurements").
 //!
 //! Include with `#[path = "common/craft.rs"] mod craft;`.
 

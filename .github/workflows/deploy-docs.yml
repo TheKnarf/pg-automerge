@@ -9,6 +9,8 @@ on:
       - main
     paths:
       - "docs/**"
+      # Spliced into the changelog page.
+      - CHANGELOG.md
       # The site shows the crate's version.
       - Cargo.toml
       - mise.toml

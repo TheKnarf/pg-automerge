@@ -1,0 +1,73 @@
+---
+title: "Implementation notes"
+section: Design
+order: 70
+description: "Details of the implementation worth knowing."
+---
+
+- `automerge` is a custom varlena type, not a `#[derive(PostgresType)]`
+  (whose serde/CBOR storage we don't want). It is defined in SQL in an
+  `extension_sql!` block (shell type, I/O functions declared by hand with
+  `#[pg_extern(sql = false)]`, `CREATE TYPE`). Three Rust types map to SQL
+  `automerge` with `TypeOrigin::ThisExtension`, all listed in that block's
+  `creates`, so pgrx orders every other function after the type:
+  `AutomergeDatum` (a new flat value: the input and receive functions),
+  `AutomergeArg` (an argument, flat or expanded) and `AutomergeValue`
+  (other results: new flat bytes, or a datum passed through, i.e. an
+  unchanged argument or a new expanded object, e.g. the `bytea` cast's).
+- `AutomergeArg` is not detoasted up front: the heads fast path fetches a
+  prefix with `pg_detoast_datum_slice`, and `AutomergeArg::detoast()`
+  returns a `Detoasted` guard holding either the datum and its detoasted
+  varlena (`pg_detoast_datum_packed`: the datum itself when inline and
+  uncompressed, else a palloc'd copy the guard frees when dropped; its
+  bytes are the core `Input`, read in place; an unchanged result is the
+  original datum) or the loaded document of an expanded one. Neither
+  outlives the call. (Until 0.2.0 the bytes were copied again into a Rust
+  `Vec` and the palloc'd copy stayed until the per-call context reset, so
+  a flat argument held about twice its size; a pg_test measures the
+  context before and after.)
+  `merge`, `merge(automerge, bytea)` and `automerge_contains` first decide
+  what they can from the heads (a prefix of a flat value), before
+  anything is detoasted.
+- Errors go through one `raise()` (`src/error.rs`) taking a core `Error`
+  or a `PgError` (code, message, optional DETAIL and HINT). `raise` and
+  `or_raise()` are `#[track_caller]`, so the error's LOCATION is the line
+  that raised it.
+- Interrupts: the core's long loops (the jsonb walk, building history rows
+  and ordering them, the load memory scan) call an interrupt check every
+  1024 steps, which the
+  extension registers in `_PG_init` as `CHECK_FOR_INTERRUPTS()`
+  (`set_interrupt_check`); `automerge_merge_agg_trans` checks between inputs. A
+  cancel or `statement_timeout` raises its ERROR there, which unwinds
+  through the core's guard untouched. Single Automerge calls (a load, a
+  merge, a save, `text()`) have no hook, so a cancel waits for the one
+  running to return (for a 3 MB document, a load takes 2.5 s). Running
+  them on a helper thread would make them abandonable, but that is a
+  larger design change and not done.
+- Release profile: `panic = "unwind"` is mandatory (pgrx turns panics into
+  ERRORs by unwinding, and the guard catches decoder panics); `strip =
+  "debuginfo"` keeps the symbol table for backtraces and profiles.
+- Extension objects that pgrx does not generate (the type, casts,
+  operators, aggregate, trigger function and every `COMMENT`) are written
+  in `extension_sql!` blocks next to the Rust code they belong to; the
+  blocks' names (`automerge_type`, `automerge_casts`,
+  `automerge_merge_operator`, `automerge_merge_agg`,
+  `automerge_change_types`, `automerge_notify`, ...) are what other blocks
+  `require`.
+- Build profile: dev builds compile dependencies optimized and Automerge
+  without debug assertions or overflow checks (Cargo.toml). Its debug
+  assertions make large documents quadratic, and its overflow checks turned a
+  counter past i64::MAX into a panic on read in dev builds only.
+- Test instrumentation (a counter of in-place merges, the list of sent
+  notifications, the core's per-thread count of `Automerge::load` calls,
+  the forced failure of the save-and-load check and an override of
+  `pg_automerge.verify_writes`, behind the `test-hooks` feature) is
+  compiled only into test builds. The count of live documents
+  (`loaded::live_count`, which the pg_tests use for leak checks) is the
+  always-on counter of `stats` since 0.3.0.
+- `pg_automerge.verify_writes` is defined in `_PG_init` and registered with
+  the core (`set_verification_check`), which asks it whenever it would run
+  the save-and-load check (`verification_enabled`).
+  `pg_automerge.max_load_memory` likewise (`budget::set_limit_source`,
+  read as bytes by `budget::limit` at every check; the core alone, as in
+  its tests, uses the 2 GB default).

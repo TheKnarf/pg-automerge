@@ -1,7 +1,8 @@
 //! pg_automerge: Automerge CRDT documents as a native Postgres type.
 //!
 //! This crate is the pgrx glue; all Automerge logic lives in
-//! `pg_automerge_core`. See docs/DESIGN.md for the SQL surface and semantics.
+//! `pg_automerge_core`. See docs/src/pages/reference/ for the SQL surface and
+//! semantics.
 //!
 //! - `datum`: the Rust types of `automerge` arguments and results.
 //! - `expanded`: expanded (in-memory) `automerge` values.
@@ -37,14 +38,15 @@ mod spans;
 ::pgrx::pg_module_magic!(name, version);
 
 /// Every Rust allocation of the library goes through the system allocator
-/// and is counted, for `automerge_memory_usage()` (docs/DESIGN.md, "Memory
-/// observability").
+/// and is counted, for `automerge_memory_usage()`
+/// (docs/src/pages/design/memory-observability.mdx).
 #[global_allocator]
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
 /// `pg_automerge.verify_writes`: whether values built from client input
 /// are loaded back once before they are stored or sent (see
-/// docs/DESIGN.md, "Invariants" and "The deferred verification").
+/// docs/src/pages/reference/automerge-type.mdx, "Invariants", and
+/// docs/src/pages/design/expanded-values.mdx, "The deferred verification").
 static VERIFY_WRITES: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 
 /// The default of `pg_automerge.max_load_memory`, in kB: 2 GB.
@@ -52,7 +54,7 @@ const MAX_LOAD_MEMORY_DEFAULT_KB: i32 = 2 * 1024 * 1024;
 
 /// `pg_automerge.max_load_memory`: the largest estimated memory, in kB, a
 /// load of client input (or a merge result) may take; -1 for no limit
-/// (see docs/DESIGN.md, "Resource limits").
+/// (see docs/src/pages/design/resource-limits.mdx).
 static MAX_LOAD_MEMORY: pgrx::GucSetting<i32> =
     pgrx::GucSetting::<i32>::new(MAX_LOAD_MEMORY_DEFAULT_KB);
 
@@ -62,8 +64,8 @@ const TRIM_THRESHOLD_DEFAULT_KB: i32 = 64 * 1024;
 /// `pg_automerge.trim_threshold`: at the end of a transaction, return the
 /// memory `malloc` keeps for reuse to the operating system when the
 /// library's Rust allocation fell by at least this many kB from its high
-/// point since the last time; -1: never (see docs/DESIGN.md, "Returning
-/// freed memory").
+/// point since the last time; -1: never (see
+/// docs/src/pages/design/memory-observability.mdx, "Returning freed memory").
 static TRIM_THRESHOLD: pgrx::GucSetting<i32> =
     pgrx::GucSetting::<i32>::new(TRIM_THRESHOLD_DEFAULT_KB);
 

@@ -27,7 +27,7 @@ services:
       # first initialized; 0: leave it to your migrations.
       PG_AUTOMERGE_CREATE_EXTENSION: "1"
     # Suggested settings, passed on the command line so the image keeps
-    # Postgres' defaults (see the Docker section of README.md):
+    # Postgres' defaults (see docs/src/pages/guide/docker.mdx):
     # - lz4 TOAST compression: stored documents are uncompressed Automerge
     #   saves, and lz4 compresses them much faster than the default pglz.
     # - the load memory limit, sized to this container's memory (each

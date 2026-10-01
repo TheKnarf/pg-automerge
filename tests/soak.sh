@@ -5,7 +5,7 @@
 # contexts, RSS), latency that drifts, tables and TOAST that bloat.
 # `mise run soak` (builds the image first); `SOAK_SMOKE=1` is a short run
 # with small documents that tests/docker.sh includes. Results and usage:
-# docs/DESIGN.md, "Soak test".
+# docs/src/pages/operations/soak-test.mdx.
 #
 # Setup: one container of the image (labelled pg-automerge-test, removed
 # afterwards with its volume unless SOAK_KEEP=1) with a memory limit
@@ -18,8 +18,8 @@
 # automerge_notify trigger); soak_cursor holds each (row, lane)'s position.
 # The GIN index has fastupdate off (SOAK_GIN_FASTUPDATE): with the pending
 # list, the planner stops using the index while writes keep it full, and
-# the sequential scan detoasts every row's jsonb (docs/DESIGN.md, "Soak
-# test (2026-10-01)").
+# the sequential scan detoasts every row's jsonb
+# (docs/src/pages/design/benchmarks/2026-10-01.mdx, "Soak test (2026-10-01)").
 #
 # Load: pgbench (the image's own, in a second container sharing the
 # server's network, so the host needs no pgbench) with SOAK_CLIENTS
@@ -81,8 +81,9 @@
 #                        (default 600; smoke 20)
 #   SOAK_WEIGHTS         override script weights, e.g. "write=30 spans=0"
 #   SOAK_TRIM_THRESHOLD  pg_automerge.trim_threshold (default: the server's)
-#   SOAK_GIN_FASTUPDATE  the GIN index's fastupdate (default off, as the
-#                        README recommends; on: Postgres' default)
+#   SOAK_GIN_FASTUPDATE  the GIN index's fastupdate (default off, as
+#                        docs/src/pages/operations/index.mdx recommends;
+#                        on: Postgres' default)
 #   SOAK_ALLOC_SLACK     bytes allowed in allocated_bytes (default 65536)
 #   SOAK_OUT             output directory (default target/soak/<UTC time>)
 #   SOAK_KEEP=1          keep the container (and its volume) afterwards

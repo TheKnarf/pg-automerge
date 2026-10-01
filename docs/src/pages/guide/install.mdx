@@ -1,0 +1,67 @@
+---
+title: "Install"
+section: Guide
+order: 10
+description: "Build and install the extension from source, or build a package for another server."
+---
+
+To self-host, the [Docker image](/guide/docker) is `postgres:18` with the
+extension built in. From source, with [mise](https://mise.jdx.dev):
+
+```sh
+mise install                 # Rust and cargo-pgrx as pinned in mise.toml
+mise run pgrx-init           # once: download and build the Postgres 18 pgrx develops against
+# into your Postgres 18 (the one whose pg_config you pass):
+cargo pgrx install --release --pg-config /usr/lib/postgresql/18/bin/pg_config
+```
+
+Without mise, install Rust 1.98 and `cargo install --locked cargo-pgrx
+--version 0.19.3`, run `cargo pgrx init --pg18 /path/to/pg_config`, then
+the same `cargo pgrx install`. No `shared_preload_libraries` entry is
+needed. Then, in each database:
+
+```sql
+CREATE EXTENSION pg_automerge;               -- as a superuser
+-- or into a schema of its own (then qualify, or add it to search_path):
+CREATE EXTENSION pg_automerge SCHEMA automerge;
+```
+
+The extension is relocatable: `ALTER EXTENSION pg_automerge SET SCHEMA x`
+moves it, and tables, domains, views, indexes, generated columns, check
+constraints, triggers and `BEGIN ATOMIC` SQL functions that use it keep
+working (they refer to it by OID). What resolves names at run time does
+not follow: queries, string-bodied SQL and PL/pgSQL functions, and
+`search_path` settings must name the new schema. The `||` operator is
+found only through `search_path` (or as `OPERATOR(x.||)`); the casts work
+regardless.
+
+It is **not trusted** (`trusted = false`): only a superuser can install
+it, not a database owner. A few kB of crafted (or merely compressed,
+highly repetitive) Automerge input can describe a document that takes
+gigabytes to load, and a failed Rust allocation aborts the backend, which
+restarts the whole cluster. Every write is priced before it is loaded and
+refused over [`pg_automerge.max_load_memory`](/reference/configuration), but that
+bound rests on measured costs, memory stays outside Postgres' accounting
+and a load cannot be cancelled, so installing it into a database remains
+a superuser's decision. Details in
+[Installation, schema and privileges](/design/installation).
+
+There are no published packages yet (tag builds in CI attach a tarball,
+built against the PGDG Postgres 18 on Ubuntu, to the workflow run as an
+artifact; they are not GitHub releases). To build one for another
+machine, use that server's `pg_config` (same Postgres major version, same
+platform). `PG_CONFIG` is required, and pgrx's own development Postgres
+(under `~/.pgrx`) is refused: a package built for it would unpack into
+`~/.pgrx/...` where no real server looks.
+
+```sh
+PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package
+# target/release/pg_automerge-pg18.tar.gz mirrors that server's paths
+# (pg_config --pkglibdir and --sharedir/extension), so on the server:
+sudo tar -C / -xzf pg_automerge-pg18.tar.gz
+```
+
+The tarball holds `pg_automerge.so`, `pg_automerge.control`, the install
+script `pg_automerge--<version>.sql` and any upgrade scripts. After
+installing a newer version, run `ALTER EXTENSION pg_automerge UPDATE` in
+each database.
