@@ -52,9 +52,12 @@ images on a best-effort basis only.
 
 ## A cluster with pg_automerge
 
-Push the image to a registry your cluster can pull from (see
-[publishing](../operations/docker-ci.mdx#publishing-the-image)), then
-list it in the `Cluster`. A `Database` resource can create the extension
+Push the image to a registry your cluster can pull from. A tag's CI run
+can push both images, multi-architecture, to
+`ghcr.io/<owner>/pg-automerge-cnpg` (see
+[publishing](../operations/docker-ci.mdx#publishing-the-images)); by hand,
+`scripts/docker-push.sh --cnpg` does the same. Then list it in the
+`Cluster`. A `Database` resource can create the extension
 for you:
 
 ```yaml
@@ -67,13 +70,20 @@ spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie   # trixie, like the extension image
   storage:
     size: 10Gi
+  resources:                                  # see Memory and pod limits
+    requests:
+      memory: 4Gi
+    limits:
+      memory: 4Gi
   postgresql:
     parameters:
-      pg_automerge.max_load_memory: "1GB"     # optional; see Configuration
+      shared_buffers: "1GB"
+      max_connections: "20"            # a Pooler in front keeps this small
+      pg_automerge.max_load_memory: "512MB"   # optional; see Configuration
     extensions:
       - name: pg-automerge                    # mounted at /extensions/pg-automerge
         image:
-          reference: ghcr.io/you/pg-automerge-cnpg:0.3.0-18-trixie
+          reference: ghcr.io/<owner>/pg-automerge-cnpg:0.3.0-18-trixie
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Database
@@ -113,12 +123,6 @@ The `app` owner cannot. To check that the image was resolved:
 kubectl get cluster automerge -o jsonpath='{.status.pgDataImageInfo.extensions}'
 ```
 
-The settings of [Configuration](../reference/configuration.mdx) go in
-`spec.postgresql.parameters`. CNPG accepts custom names with a dot, and a
-value set before the library loads applies once it loads. Size
-`pg_automerge.max_load_memory` to the pod's memory limit, as for a
-container ([Sizing memory](../operations/index.mdx#sizing-memory)).
-
 Pick the `name` once (`pg-automerge` above) and keep it. Renaming it moves
 the mount, which triggers a rolling update.
 
@@ -126,6 +130,59 @@ the mount, which triggers a rolling update.
 registry. Run `kind load docker-image pg-automerge-cnpg:0.3.0-18-trixie`
 and set `pullPolicy: IfNotPresent` (already the default for any tag but
 `latest`) or `Never` on the image. `tests/cnpg_e2e.sh` does exactly that.
+
+## Configuration
+
+The three settings of [Configuration](../reference/configuration.mdx)
+(`pg_automerge.max_load_memory`, `pg_automerge.verify_writes`,
+`pg_automerge.trim_threshold`) go in `spec.postgresql.parameters`, like
+any other PostgreSQL setting. CNPG passes custom names with a dot through
+to `postgresql.conf` (it only fixes or refuses a known list of its own),
+and PostgreSQL keeps such a value as a placeholder until a backend loads
+the library, which then applies it. All three can be changed at runtime:
+CNPG reloads the configuration without a restart. To check:
+
+```sh
+kubectl cnpg psql automerge -- -d app -c 'SHOW pg_automerge.max_load_memory'
+```
+
+A per-role or per-database value (`ALTER ROLE app SET
+pg_automerge.verify_writes = off`, say) works as on any server; run it as
+the superuser.
+
+## Memory and pod limits
+
+Loading a document takes memory outside `shared_buffers` and `work_mem`,
+and pg_automerge's memory is not counted by PostgreSQL. In a pod, the
+container's memory limit is what the kernel enforces: a backend that goes
+over it is OOM-killed, and PostgreSQL then restarts every session of that
+instance (CNPG does not fail over for it, but every client reconnects).
+So size the pod as [Sizing memory](../operations/index.mdx#sizing-memory)
+describes for a container, with `resources.limits.memory` as the limit:
+
+```text
+limits.memory ≥ shared_buffers
+              + max_connections × (20 MB + pg_automerge.trim_threshold)
+              + concurrent loads × largest document's peak
+              + room for the page cache
+```
+
+and set `pg_automerge.max_load_memory` above the estimate of the largest
+document you accept and below `(limits.memory − shared_buffers −
+max_connections × (20 MB + trim_threshold)) / concurrent writers`. The
+example above (4 GiB, 1 GB of `shared_buffers`, 20 connections, the
+default 64 MB trim threshold) leaves about 3 GB − 20 × 84 MB ≈ 1.3 GB:
+room for two concurrent loads at its 512 MB `max_load_memory`, before the
+page cache. Connections are the expensive term: with 100 (PostgreSQL's
+default) the same pod would have nothing left, so keep `max_connections`
+small (CNPG's `Pooler` in front helps), lower `trim_threshold`, or raise
+the limit. Measure your own largest documents with
+`automerge_memory_usage()` ([Monitoring](../operations/monitoring.mdx))
+rather than trusting these numbers.
+
+Set `requests.memory` equal to `limits.memory` (CNPG's recommendation,
+for the Guaranteed QoS class), so the node does not overcommit the memory
+a large load relies on.
 
 ## Updating
 
@@ -145,6 +202,31 @@ exactly as after recreating a container ([Updating](./updating.mdx)). The
 To remove the extension, first set `ensure: absent` in the `Database`
 resource (or run `DROP EXTENSION`), then delete the `extensions` entry,
 which triggers a rolling update.
+
+## Limitations
+
+- **Superuser only.** The extension is not trusted, so only the superuser
+  (the `Database` resource's reconciler, or `kubectl cnpg psql`) can
+  create, update or drop it. A database owner cannot.
+- **Trixie, PostgreSQL 18, amd64 or arm64.** No bookworm image (see
+  Requirements), no other PostgreSQL major. A major upgrade to a future
+  PostgreSQL 19 with image volume extensions needs CNPG 1.29 or later and
+  a PostgreSQL 19 build of the extension, which does not exist yet.
+- **No image catalog of ours.** With CNPG 1.29 or later you can list the
+  image in your own `ClusterImageCatalog` (`spec.images[].extensions`,
+  then just `- name: pg-automerge` in each `Cluster`). The official CNPG
+  catalogs only carry extensions packaged by PGDG, which pg_automerge is
+  not.
+- **Kubernetes image volumes.** Clusters older than 1.33, or whose nodes
+  run an older containerd or CRI-O, cannot mount the image. There, build
+  your own operand image instead: `FROM
+  ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie`, then copy the
+  image's `/lib/pg_automerge.so` to `/usr/lib/postgresql/18/lib/` and
+  `/share/extension/*` to `/usr/share/postgresql/18/extension/`, and tag
+  it starting with `18` so CNPG detects the major version. This repository
+  does not build or test that variant.
+- **Memory outside PostgreSQL's accounting**, as everywhere: see Memory
+  and pod limits, and [Limitations](../operations/limitations.mdx).
 
 ## What is tested
 
@@ -167,7 +249,7 @@ the operator writes them. It checks:
   path;
 - that the server log shows no crash.
 
-`tests/cnpg_e2e.sh` (`mise run cnpg-e2e`, and the CI `cnpg-e2e` job on
+`tests/cnpg_e2e.sh` (`mise run cnpg-e2e`, and the CI `cnpg-e2e` job on tags, nightly and on manual runs, on
 the image the `docker` job built) covers the operator itself. It takes a
 few minutes and needs kind, so it is not part of `mise run ci` or
 `docker-test`. It creates a throwaway kind cluster (pinned kind and

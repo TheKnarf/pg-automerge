@@ -6,24 +6,35 @@ description: "The postgres:18 image with pg_automerge built in: building, runnin
 ---
 
 Managed Postgres services do not load custom C extensions, so for
-self-hosting there is an image: the official `postgres:18` image, untouched
+self-hosting the repository builds two images from one compile of the
+extension:
+
+| Image | What it is | Use it for |
+|---|---|---|
+| **Full image**, `pg-automerge:<version>` (and `:dev`) | the official `postgres:18` image plus the extension: a complete server | `docker run`, compose, local development, CI services, small deployments on one host, any orchestrator that runs a plain container |
+| **CloudNativePG extension image**, `pg-automerge-cnpg:<version>-18-trixie` | only the extension's files, `FROM scratch`; it cannot be run | Kubernetes with [CloudNativePG](./cloudnativepg.mdx), which mounts it into its own PostgreSQL 18 image |
+
+Both hold the same `pg_automerge.so`, control file and SQL scripts, so a
+version behaves the same in either. This page is about the full image;
+[CloudNativePG](./cloudnativepg.mdx) covers the other.
+
+The full image is the official `postgres:18` image, untouched
 (entrypoint, environment variables, volume, signals), plus
 `pg_automerge.so`, its control file and SQL scripts, and one init script.
 The extension is compiled in a builder stage from the same base image,
 against that image's own PGDG Postgres 18 (release build, no assertions),
 with Rust and cargo-pgrx as pinned in `mise.toml`. Nothing is pushed
-anywhere; the image lives in your local Docker until you push it to a
-registry of your own (CI can do that for tags once you
-[configure it](../operations/docker-ci.mdx#publishing-the-image)).
+anywhere; the images live in your local Docker until you push them to a
+registry of your own (CI can push both, multi-architecture, for tags once
+you [configure it](../operations/docker-ci.mdx#publishing-the-images)).
 
 ```sh
-mise run docker-build        # pg-automerge:0.2.0 and pg-automerge:dev (and the CNPG image)
-mise run docker-test         # builds, then tests the image and compose.yaml (about 6 minutes once built)
+mise run docker-build        # both: pg-automerge:0.3.0 + :dev, and pg-automerge-cnpg:0.3.0-18-trixie
+mise run docker-test         # builds, then tests both images and compose.yaml (about 6 minutes once built)
 ```
 
-On Kubernetes with CloudNativePG, use the extension-only image that the
-same build produces, `pg-automerge-cnpg:<version>-18-trixie`, instead of
-this one: see [CloudNativePG](./cloudnativepg.mdx).
+`bash scripts/docker-build.sh --full` builds only the full image (`--cnpg`
+only the extension image).
 
 The image is 3.5 MB larger than `postgres:18`. A first build takes about
 8 minutes (Rust, cargo-pgrx and a fat-LTO release build); BuildKit cache

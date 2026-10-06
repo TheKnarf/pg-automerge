@@ -3,7 +3,7 @@
 # architecture) to a registry as one multi-architecture image. Used by the
 # CI publish job, which runs only on version tags and only once a registry
 # is configured (see
-# docs/src/pages/operations/docker-ci.mdx, "Publishing the image").
+# docs/src/pages/operations/docker-ci.mdx, "Publishing the images").
 # Nothing in this
 # repository calls it otherwise.
 #

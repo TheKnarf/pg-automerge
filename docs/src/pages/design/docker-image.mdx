@@ -2,14 +2,35 @@
 title: "Docker image"
 section: Design
 order: 120
-description: "Packaging decisions of the Docker image, and how CI builds it."
+description: "Packaging decisions of the full Docker image and the CloudNativePG extension image, and how CI builds and publishes them."
 ---
 
 `docker/Dockerfile` builds the official `postgres:18` image plus the
 extension (the default target); `compose.yaml` runs it for local
 development. Usage is in [Docker](../guide/docker.mdx). The same Dockerfile
 also builds the [CloudNativePG extension image](#cloudnativepg-extension-image)
-from the same builder stage. Packaging decisions:
+from the same builder stage. The build targets:
+
+| Stage (target) | `FROM` | Holds | Image, tag |
+|---|---|---|---|
+| `versions` | `PG_IMAGE` | `/toolchain.env` (Rust, cargo-pgrx, crate version) | internal |
+| `builder` | `PG_IMAGE` | the toolchain; `/out`: library, control file, SQL scripts | internal |
+| `cnpg-files` | `PG_IMAGE` | `/out` rearranged into CNPG's layout, checked | internal |
+| `cnpg-extension` | `scratch` | `/lib`, `/share/extension`, `/licenses` only | `pg-automerge-cnpg:<version>-18-trixie` |
+| `runtime` (default, last) | `PG_IMAGE` | official `postgres:18` + `/out` + the init script | `pg-automerge:<version>`, `:dev` |
+
+Both images carry the same compiled files, so they are compatible with
+the same servers: PostgreSQL 18 (any minor release; the server checks the
+magic block), glibc 2.38 or later, amd64 or arm64.
+
+| Runs on | Full image | CNPG extension image |
+|---|---|---|
+| Docker, compose, any container runtime | yes (it is the server) | no (`FROM scratch`, nothing to run) |
+| CloudNativePG, trixie operand (`18-minimal-trixie`, `18-standard-trixie`) | not as an operand (uid 999, and its tag names no PostgreSQL major) | yes, CNPG 1.27+ with Kubernetes image volumes |
+| CloudNativePG, bookworm operand | no | no (`GLIBC_2.38` not found) |
+| Another Kubernetes operator or a plain StatefulSet | yes, as an ordinary container | no |
+
+Packaging decisions:
 
 - **One pinned base for every stage.** The `versions`, `builder` and
   `runtime` stages are all `FROM ${PG_IMAGE}`, by default
@@ -273,7 +294,8 @@ builds it after the full image (`--all`, the default of
   license, the labels are there, and the smoke test's operand is pinned by
   digest and its settings are CNPG's.
 - **Tested with the operator on kind.** `tests/cnpg_e2e.sh`
-  (`mise run cnpg-e2e`, the CI `cnpg-e2e` job) runs the real CNPG operator
+  (`mise run cnpg-e2e`, the CI `cnpg-e2e` job on tags, nightly and on
+  manual runs) runs the real CNPG operator
   (a pinned release, its manifest checked by sha256) in a throwaway kind
   cluster (a digest-pinned Kubernetes 1.36 node, where image volumes are
   stable) with the smoke test's operand. The images reach the node with
@@ -354,22 +376,31 @@ suites' fixture generators. The nightly run also benchmarks the image.
     cost is the dependency on GitHub's arm64 runner and a second cold
     build per tag, in parallel.
 - **Publishing is prepared, not enabled.** The `publish` job runs on tags
-  after both `ci` and `docker` passed, downloads the tested archives and
+  after `ci`, `docker` and `cnpg-e2e` passed, downloads the tested archives and
   pushes them with `scripts/docker-push.sh`: each archive is loaded (the
   local tags it carries are put back afterwards, so a by-hand run with
   the arm64 archive on an amd64 host does not repoint
   `pg-automerge:<version>`), checked (version label equals the crate version, architecture equals
   the file name's), tagged `<image>:<version>-<arch>` and pushed, then
   `docker buildx imagetools create` makes `<image>:<version>` and
-  `<image>:latest` an index of them. Pushing the tested bytes rather than
-  rebuilding for the registry means what is published is what passed.
-  Every step after the first is gated on the secret
-  `PG_AUTOMERGE_REGISTRY_TOKEN` (plus the variables for the image and
-  user): without it the job logs a notice and succeeds. The workflow's
-  token is `contents: read`; `tests/check_ci.sh` fails if any step outside
-  `publish` logs in or pushes, if a `publish` step is not gated, if
-  anything asks for write permissions or `push: true`, or if the job stops
-  depending on both test jobs. The repository name must start with a
+  `<image>:latest` an index of them. The CNPG archives go through the
+  same script with `--cnpg` to `<cnpg image>:<version>-18-trixie`. Pushing
+  the tested bytes rather than rebuilding for the registry means what is
+  published is what passed. Every step after the first is gated on an
+  explicit opt-in: the variable `PG_AUTOMERGE_PUBLISH=ghcr` (ghcr.io with
+  the workflow's `GITHUB_TOKEN`, images defaulting to
+  `ghcr.io/<owner>/pg-automerge` and `-cnpg`), or the secret
+  `PG_AUTOMERGE_REGISTRY_TOKEN` plus the variables for the image and user
+  (any registry). Without either the job logs a notice and succeeds. The
+  ghcr.io default is not automatic even on GitHub: a fork's or a private
+  copy's tag would otherwise publish packages under its owner unasked.
+  The workflow's token is `contents: read`; only `publish` gets
+  `packages: write`, used solely for the ghcr.io login in the ghcr mode.
+  `tests/check_ci.sh` fails if any step outside `publish` logs in, pushes
+  or uses `GITHUB_TOKEN`, if a `publish` step is not gated, if any other
+  job asks for write permissions or anything for `push: true`, if the
+  ghcr mode could push elsewhere, or if the job stops depending on the
+  three test jobs. The repository name must start with a
   registry host, so a typo cannot send the image to Docker Hub.
 - **Linting the workflow.** `mise.toml` pins `actionlint` and `shellcheck`
   (prebuilt binaries); `check_ci.sh` runs actionlint on the workflow

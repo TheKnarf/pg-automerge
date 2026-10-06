@@ -10,10 +10,14 @@
 #     including the container variants of the multi-session suites and
 #     tests/cnpg_smoke.sh. On tags it runs on an amd64 and a native arm64
 #     runner and uploads each image as a workflow artifact.
-#   - cnpg-e2e (after docker): tests/cnpg_e2e.sh, the CNPG extension image
-#     with the real CloudNativePG operator in a kind cluster.
-# On tags, publish pushes those images to a registry, but only once one is
-# configured (docs/src/pages/operations/docker-ci.mdx, "Publishing the image"); until then it skips.
+#   - cnpg-e2e (after docker; on tags, the nightly schedule and manual
+#     runs, or on every event with the repository variable
+#     PG_AUTOMERGE_CNPG_E2E=always): tests/cnpg_e2e.sh, the CNPG extension
+#     image with the real CloudNativePG operator in a kind cluster.
+# On tags, publish pushes both images to a registry, but only once one is
+# configured (docs/src/pages/operations/docker-ci.mdx, "Publishing the
+# images"): ghcr.io with the workflow's own token (PG_AUTOMERGE_PUBLISH=ghcr),
+# or any registry with a token secret; until then it skips.
 name: CI
 
 on:
@@ -241,14 +245,15 @@ jobs:
           docker image ls pg-automerge
           docker image ls pg-automerge-cnpg
 
-      # For the cnpg-e2e job: the exact CNPG image this job built and
-      # tests (a few MB; `docker load` restores its tag).
+      # For the cnpg-e2e job (same condition as that job): the exact CNPG
+      # image this job built and tests (a few MB; `docker load` restores
+      # its tag).
       - name: Save the CNPG extension image for cnpg-e2e (amd64)
-        if: matrix.arch == 'amd64'
+        if: matrix.arch == 'amd64' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always')
         run: docker image save "$PG_AUTOMERGE_CNPG_IMAGE" | gzip >cnpg-e2e-image.tar.gz
 
       - name: Upload the CNPG extension image for cnpg-e2e (amd64)
-        if: matrix.arch == 'amd64'
+        if: matrix.arch == 'amd64' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always')
         uses: actions/upload-artifact@v7
         with:
           name: cnpg-e2e-image
@@ -312,9 +317,14 @@ jobs:
   # Cluster mounting the image through spec.postgresql.extensions, the
   # extension created and updated through a Database resource, a rolling
   # update to a new extension image, removal. kind and kubectl as pinned in
-  # mise.toml; the runner's Docker runs the kind node.
+  # mise.toml; the runner's Docker runs the kind node. A few minutes and a
+  # kind cluster, so not on every push and pull request (tests/cnpg_smoke.sh
+  # in the docker job covers the image itself there): on tags (publish
+  # waits for it), nightly, on workflow_dispatch, or always with the
+  # repository variable PG_AUTOMERGE_CNPG_E2E=always.
   cnpg-e2e:
     needs: docker
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -341,43 +351,84 @@ jobs:
 
   # Pushes the tested images of a tag, each as one multi-architecture
   # image: the full image and the CNPG extension image.
-  # Prepared, not enabled: it does nothing until the repository has the
-  # secret PG_AUTOMERGE_REGISTRY_TOKEN and the variables
-  # PG_AUTOMERGE_REGISTRY_IMAGE (e.g. ghcr.io/you/pg-automerge) and
-  # PG_AUTOMERGE_REGISTRY_USERNAME; the CNPG image goes to
-  # PG_AUTOMERGE_REGISTRY_CNPG_IMAGE, by default <image>-cnpg. See
-  # docs/src/pages/operations/docker-ci.mdx, "Publishing the image".
+  # Prepared, not enabled: it does nothing until the repository opts in,
+  # one of two ways (docs/src/pages/operations/docker-ci.mdx, "Publishing
+  # the images"):
+  #   - ghcr.io with this workflow's own GITHUB_TOKEN: the repository
+  #     variable PG_AUTOMERGE_PUBLISH=ghcr. The images default to
+  #     ghcr.io/<owner>/pg-automerge and ghcr.io/<owner>/pg-automerge-cnpg;
+  #     PG_AUTOMERGE_REGISTRY_IMAGE / _CNPG_IMAGE may name others on ghcr.io.
+  #   - any registry: the secret PG_AUTOMERGE_REGISTRY_TOKEN and the
+  #     variables PG_AUTOMERGE_REGISTRY_IMAGE (e.g. docker.io/you/pg-automerge)
+  #     and PG_AUTOMERGE_REGISTRY_USERNAME; the CNPG image goes to
+  #     PG_AUTOMERGE_REGISTRY_CNPG_IMAGE, by default <image>-cnpg.
+  # packages: write is granted here only (tags only, after every test job);
+  # the token is used for nothing but the ghcr.io login, and only in the
+  # ghcr mode.
   publish:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [ci, docker, cnpg-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     env:
+      PUBLISH: ${{ vars.PG_AUTOMERGE_PUBLISH }}
       REGISTRY_IMAGE: ${{ vars.PG_AUTOMERGE_REGISTRY_IMAGE }}
       REGISTRY_CNPG_IMAGE: ${{ vars.PG_AUTOMERGE_REGISTRY_CNPG_IMAGE }}
       REGISTRY_USERNAME: ${{ vars.PG_AUTOMERGE_REGISTRY_USERNAME }}
       REGISTRY_TOKEN: ${{ secrets.PG_AUTOMERGE_REGISTRY_TOKEN }}
     steps:
+      # Decides whether to push, where, and with which credentials; every
+      # later step is gated on its push output.
       - name: Registry configured?
         id: cfg
         run: |
-          if [ -z "$REGISTRY_TOKEN" ]; then
-            echo "::notice::No PG_AUTOMERGE_REGISTRY_TOKEN secret: not pushing (the images are this run's artifacts)."
-            echo "push=false" >>"$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ -z "$REGISTRY_IMAGE" ] || [ -z "$REGISTRY_USERNAME" ]; then
-            echo "::error::PG_AUTOMERGE_REGISTRY_TOKEN is set, but PG_AUTOMERGE_REGISTRY_IMAGE or PG_AUTOMERGE_REGISTRY_USERNAME is not"
+          case "$PUBLISH" in
+            ghcr)
+              owner="${GITHUB_REPOSITORY_OWNER,,}"
+              image="${REGISTRY_IMAGE:-ghcr.io/$owner/pg-automerge}"
+              username="$GITHUB_ACTOR"
+              ;;
+            "")
+              if [ -z "$REGISTRY_TOKEN" ]; then
+                echo "::notice::Neither PG_AUTOMERGE_PUBLISH=ghcr nor a PG_AUTOMERGE_REGISTRY_TOKEN secret: not pushing (the images are this run's artifacts)."
+                echo "push=false" >>"$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if [ -z "$REGISTRY_IMAGE" ] || [ -z "$REGISTRY_USERNAME" ]; then
+                echo "::error::PG_AUTOMERGE_REGISTRY_TOKEN is set, but PG_AUTOMERGE_REGISTRY_IMAGE or PG_AUTOMERGE_REGISTRY_USERNAME is not"
+                exit 1
+              fi
+              image="$REGISTRY_IMAGE"
+              username="$REGISTRY_USERNAME"
+              ;;
+            *)
+              echo "::error::PG_AUTOMERGE_PUBLISH is '$PUBLISH'; the only value is ghcr (or leave it unset)"
+              exit 1
+              ;;
+          esac
+          cnpg_image="${REGISTRY_CNPG_IMAGE:-$image-cnpg}"
+          # One login: both images on the same registry (ghcr.io in the
+          # ghcr mode, whose token is good for nothing else).
+          registry="${image%%/*}"
+          if [ "${cnpg_image%%/*}" != "$registry" ]; then
+            echo "::error::the CNPG image ($cnpg_image) is not on the registry of the full image ($image)"
             exit 1
           fi
-          # One login: the CNPG image must be on the same registry.
-          cnpg_image="${REGISTRY_CNPG_IMAGE:-$REGISTRY_IMAGE-cnpg}"
-          if [ "${cnpg_image%%/*}" != "${REGISTRY_IMAGE%%/*}" ]; then
-            echo "::error::PG_AUTOMERGE_REGISTRY_CNPG_IMAGE ($cnpg_image) is not on the registry of PG_AUTOMERGE_REGISTRY_IMAGE"
+          if [ "$PUBLISH" = ghcr ] && [ "$registry" != ghcr.io ]; then
+            echo "::error::PG_AUTOMERGE_PUBLISH=ghcr pushes to ghcr.io only, but the image is $image"
             exit 1
           fi
-          echo "push=true" >>"$GITHUB_OUTPUT"
-          echo "registry=${REGISTRY_IMAGE%%/*}" >>"$GITHUB_OUTPUT"
+          echo "Pushing $image and $cnpg_image as $username"
+          {
+            echo "push=true"
+            echo "registry=$registry"
+            echo "image=$image"
+            echo "cnpg_image=$cnpg_image"
+            echo "username=$username"
+          } >>"$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
         if: steps.cfg.outputs.push == 'true'
@@ -393,11 +444,14 @@ jobs:
         if: steps.cfg.outputs.push == 'true'
         with:
           registry: ${{ steps.cfg.outputs.registry }}
-          username: ${{ env.REGISTRY_USERNAME }}
-          password: ${{ env.REGISTRY_TOKEN }}
+          username: ${{ steps.cfg.outputs.username }}
+          password: ${{ env.PUBLISH == 'ghcr' && github.token || env.REGISTRY_TOKEN }}
 
       - name: Push
         if: steps.cfg.outputs.push == 'true'
+        env:
+          IMAGE: ${{ steps.cfg.outputs.image }}
+          CNPG_IMAGE: ${{ steps.cfg.outputs.cnpg_image }}
         run: |
-          bash scripts/docker-push.sh "$REGISTRY_IMAGE" dist/pg-automerge-[0-9]*-linux-*.tar.gz
-          bash scripts/docker-push.sh --cnpg "${REGISTRY_CNPG_IMAGE:-$REGISTRY_IMAGE-cnpg}" dist/pg-automerge-cnpg-*-linux-*.tar.gz
+          bash scripts/docker-push.sh "$IMAGE" dist/pg-automerge-[0-9]*-linux-*.tar.gz
+          bash scripts/docker-push.sh --cnpg "$CNPG_IMAGE" dist/pg-automerge-cnpg-*-linux-*.tar.gz

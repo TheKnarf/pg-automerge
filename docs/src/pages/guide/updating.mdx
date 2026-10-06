@@ -2,8 +2,14 @@
 title: "Updating"
 section: Guide
 order: 70
-description: "Update to a new pg_automerge version (with compose, step by step), a new Postgres minor release or a new major version."
+description: "Update to a new pg_automerge version (with compose, step by step, or on CloudNativePG), a new Postgres minor release or a new major version."
 ---
+
+On Kubernetes with CloudNativePG, an update is a new extension image tag
+in the `Cluster` (a rolling restart) followed by
+`ALTER EXTENSION pg_automerge UPDATE`, or a bumped `version` in the
+`Database` resource: see [CloudNativePG](./cloudnativepg.mdx#updating).
+The rest of this page is about the full Docker image and source installs.
 
 **A new pg_automerge version** (a newer image on the same volume):
 recreate the container from the new image, then in every database that

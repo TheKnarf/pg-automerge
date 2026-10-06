@@ -212,26 +212,44 @@ has "$docker_job" 'bash scripts/docker-archive.sh' || fail "$wf: tags must save 
 # the secret nothing is pushed). Nothing else pushes or logs in.
 has "$publish_job" "^    if: startsWith\(github\.ref, 'refs/tags/'\)$" || fail "$wf: publish must be tags only"
 has "$publish_job" '^    needs: \[ci, docker, cnpg-e2e\]$' || fail "$wf: publish must need ci, docker and cnpg-e2e"
-# cnpg-e2e: the docker job's own CNPG image (saved by it, every event),
-# tests/cnpg_e2e.sh with the pinned kind and kubectl.
+# cnpg-e2e: the docker job's own CNPG image (saved by it under the same
+# condition), tests/cnpg_e2e.sh with the pinned kind and kubectl; on tags
+# (publish needs it), nightly, manual runs, or always if the repository says so.
 has "$e2e_job" '^    needs: docker$' || fail "$wf: cnpg-e2e must need docker"
-if has "$e2e_job" '^    if:'; then fail "$wf: the cnpg-e2e job must run for every event"; fi
+e2e_if="startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always'"
+[ "$(grep -cxF "    if: $e2e_if" <<<"$e2e_job")" = 1 ] \
+  || fail "$wf: cnpg-e2e must run on tags, schedule, workflow_dispatch or with PG_AUTOMERGE_CNPG_E2E=always"
+[ "$(grep -cxF "        if: matrix.arch == 'amd64' && ($e2e_if)" <<<"$docker_job")" = 2 ] \
+  || fail "$wf: the docker job must save and upload the CNPG image for cnpg-e2e under cnpg-e2e's condition"
 has "$docker_job" 'docker image save "\$PG_AUTOMERGE_CNPG_IMAGE" \| gzip >cnpg-e2e-image\.tar\.gz$' \
   || fail "$wf: the docker job must save its CNPG image for cnpg-e2e"
 has "$e2e_job" '^          name: cnpg-e2e-image$' || fail "$wf: cnpg-e2e must download the docker job's CNPG image"
 has "$e2e_job" '^          install_args: aqua:kubernetes-sigs/kind kubectl$' || fail "$wf: cnpg-e2e installs kind and kubectl from mise.toml"
 has "$e2e_job" '^        run: bash tests/cnpg_e2e.sh$' || fail "$wf: cnpg-e2e must run tests/cnpg_e2e.sh"
-has "$publish_job" '^          if \[ -z "\$REGISTRY_TOKEN" \]; then$' || fail "$wf: publish must check the secret"
+has "$publish_job" '^              if \[ -z "\$REGISTRY_TOKEN" \]; then$' || fail "$wf: publish must check the secret"
+has "$publish_job" '^      PUBLISH: \$\{\{ vars\.PG_AUTOMERGE_PUBLISH \}\}$' || fail "$wf: publish: the ghcr mode is the variable PG_AUTOMERGE_PUBLISH"
+has "$publish_job" '^          if \[ "\$PUBLISH" = ghcr \] && \[ "\$registry" != ghcr\.io \]; then$' \
+  || fail "$wf: publish: the ghcr mode (GITHUB_TOKEN) must push to ghcr.io only"
+has "$publish_job" "^          password: \\\$\\{\\{ env\\.PUBLISH == 'ghcr' && github\\.token \\|\\| env\\.REGISTRY_TOKEN \\}\\}$" \
+  || fail "$wf: publish: GITHUB_TOKEN only in the ghcr mode"
 steps=$(grep -cE '^      - ' <<<"$publish_job")
 gated=$(grep -cE "^        if: steps\.cfg\.outputs\.push == 'true'$" <<<"$publish_job")
 [ "$gated" -eq $((steps - 1)) ] || fail "$wf: publish: $gated of $((steps - 1)) steps after the check are gated on it"
 outside="$(awk -v j="  publish:" '$0 == j {p=1} p && /^  [a-z]/ && $0 != j {p=0} !p' "$wf")"
 if has "$outside" 'docker/login-action|docker-push\.sh|docker push|imagetools'; then fail "$wf: pushing outside the publish job"; fi
-has "$publish_job" 'bash scripts/docker-push.sh "\$REGISTRY_IMAGE" dist/pg-automerge-\[0-9\]\*-linux-\*\.tar\.gz$' \
+has "$publish_job" 'bash scripts/docker-push.sh "\$IMAGE" dist/pg-automerge-\[0-9\]\*-linux-\*\.tar\.gz$' \
   || fail "$wf: publish must push the full image archives (pg-automerge-[0-9]*) without --cnpg"
 has "$publish_job" 'bash scripts/docker-push.sh --cnpg .* dist/pg-automerge-cnpg-\*-linux-\*\.tar\.gz$' \
   || fail "$wf: publish must push the CNPG archives with --cnpg"
-if grep -qE 'push: true|packages: write|write-all' "$wf"; then fail "$wf: no push: true or write permissions"; fi
+# Write permissions: packages: write in the publish job only (its
+# permissions block exactly contents: read + packages: write), none
+# anywhere else, and no push: true.
+if grep -qE 'push: true|write-all' "$wf"; then fail "$wf: no push: true or write-all"; fi
+if has "$outside" '^ +[a-z-]+: write$'; then fail "$wf: write permissions outside the publish job"; fi
+[ "$(grep -cE '^ +[a-z-]+: write$' <<<"$publish_job")" = 1 ] && has "$publish_job" '^      packages: write$' \
+  && has "$publish_job" '^    permissions:$' && has "$publish_job" '^      contents: read$' \
+  || fail "$wf: publish: permissions must be exactly contents: read and packages: write"
+if grep -qE 'github\.token|secrets\.GITHUB_TOKEN' <<<"$outside"; then fail "$wf: GITHUB_TOKEN used outside the publish job"; fi
 grep -qE '^permissions:$' "$wf" && grep -qE '^  contents: read$' "$wf" || fail "$wf: top-level permissions must be contents: read"
 
 echo "check_ci: workflow ok"

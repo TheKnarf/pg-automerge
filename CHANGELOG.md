@@ -33,7 +33,21 @@ Added:
   `Database` resource's `CREATE EXTENSION` and `ALTER EXTENSION UPDATE`, a
   rolling update to a new extension image, removal), and
   archived and pushed by the release scripts (`--cnpg`). See
-  [CloudNativePG](docs/src/pages/guide/cloudnativepg.mdx).
+  [CloudNativePG](docs/src/pages/guide/cloudnativepg.mdx) (requirements,
+  a `Cluster` and `Database` example, configuration, memory and pod
+  limits, updating, limitations).
+- **Publishing both images from CI**: the tag workflow's `publish` job
+  pushes the full image (`<image>:<version>`, `latest`) and the CNPG
+  extension image (`<image>-cnpg:<version>-18-trixie`), each as one
+  amd64 + arm64 image, after the `ci`, `docker` and `cnpg-e2e` jobs
+  passed. Still opt-in: the new repository variable
+  `PG_AUTOMERGE_PUBLISH=ghcr` pushes to `ghcr.io/<owner>/pg-automerge` and
+  `-cnpg` with the workflow's own `GITHUB_TOKEN` (`packages: write`, in
+  that job only), or a token secret pushes to any registry as before. See
+  [Publishing the images](docs/src/pages/operations/docker-ci.mdx#publishing-the-images).
+  The `cnpg-e2e` CI job runs on tags, nightly and on manual runs
+  (`PG_AUTOMERGE_CNPG_E2E=always`: on every event); the CNPG smoke test
+  runs in the `docker` job on every push.
 - **`automerge_memory_usage()`**: the memory pg_automerge holds in the
   current backend outside Postgres' memory contexts, which
   `pg_backend_memory_contexts` and `work_mem` do not see: bytes held now

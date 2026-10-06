@@ -1,8 +1,8 @@
 ---
-title: "Testing, CI and publishing the image"
+title: "Testing, CI and publishing the images"
 section: Operations
 order: 40
-description: "mise run docker-test, the docker CI job, and pushing tested images to a registry."
+description: "mise run docker-test, the docker and cnpg-e2e CI jobs, and pushing the tested full and CloudNativePG images to a registry."
 ---
 
 ## Testing the image
@@ -29,8 +29,7 @@ extension image (`DOCKER_TEST_CNPG=0` skips it; see
 `scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
 
 `mise run cnpg-e2e` (not part of `docker-test`; the CI `cnpg-e2e` job runs
-it after the `docker` job, on the CNPG image that job built and saved, and
-publishing waits for it) tests the CNPG extension image with the real
+it, see below) tests the CNPG extension image with the real
 operator in a kind cluster; see
 [CloudNativePG](../guide/cloudnativepg.mdx#what-is-tested).
 
@@ -89,42 +88,92 @@ arm64 runner is not available (it depends on the repository's plan and
 visibility), set the repository variable `PG_AUTOMERGE_ARM64` to `false`:
 tags then build amd64 only.
 
-## Publishing the image
+Both images go through the same steps: the `docker` job builds the full
+image first (exporting the layer cache) and then the CloudNativePG
+extension image from that cache, so the extension is compiled once per
+architecture and both images hold the same `pg_automerge.so`.
+`tests/docker.sh` tests both, including `tests/cnpg_smoke.sh` in CNPG's
+own PostgreSQL image, on every push and pull request.
 
-The workflow's `publish` job pushes a tag's tested images to a registry of
-yours as one multi-architecture image, `<image>:<version>` and
-`<image>:latest` (plus the per-architecture `<image>:<version>-amd64` and
-`-arm64` it is made of). It is prepared but off: without the secret
-below it only logs a notice. To turn it on, in the repository's Settings >
-Secrets and variables > Actions:
+The `cnpg-e2e` job runs `tests/cnpg_e2e.sh` (a kind cluster with the
+CloudNativePG operator, a few minutes) after the `docker` job, on the
+amd64 CNPG image that job built and saved as a short-lived artifact. It
+runs on tags (where `publish` waits for it), on the nightly schedule and
+on manual runs (Actions > CI > Run workflow), not on every push or pull
+request. Set the repository variable `PG_AUTOMERGE_CNPG_E2E` to `always`
+to run it on every event.
 
-| Kind | Name | Value |
-|---|---|---|
-| Variable | `PG_AUTOMERGE_REGISTRY_IMAGE` | the image, registry host first, lower case: `ghcr.io/you/pg-automerge`, `docker.io/you/pg-automerge`, ... |
-| Variable | `PG_AUTOMERGE_REGISTRY_USERNAME` | the registry user |
-| Variable (optional) | `PG_AUTOMERGE_REGISTRY_CNPG_IMAGE` | the [CloudNativePG](../guide/cloudnativepg.mdx) extension image, on the same registry; default `<image>-cnpg`, e.g. `ghcr.io/you/pg-automerge-cnpg` |
-| Secret | `PG_AUTOMERGE_REGISTRY_TOKEN` | a token that may push to those two images only (for ghcr.io a personal access token with `write:packages`; for Docker Hub an access token with Read & Write) |
+## Publishing the images
 
-The CNPG extension image is pushed as `<cnpg image>:<version>-18-trixie`,
-an index of `-amd64` and `-arm64`, with no `latest`, following CNPG's
-tag convention.
+The workflow's `publish` job pushes a tag's tested images to a registry,
+each as one multi-architecture image (an index of the amd64 and arm64
+images, which are also pushed with an `-amd64` / `-arm64` suffix):
+
+| Image | Tags |
+|---|---|
+| full image | `<image>:<version>` and `<image>:latest` |
+| [CloudNativePG](../guide/cloudnativepg.mdx) extension image | `<cnpg image>:<version>-18-trixie` (CNPG's tag convention; no `latest`, which would also make Kubernetes pull it on every pod start) |
 
 It runs only for tags, only after the `ci`, `docker` and `cnpg-e2e` jobs
 passed, and pushes exactly the archives those jobs tested
-(`scripts/docker-push.sh`, which checks each one's version and
-architecture first). Nothing else in the workflow logs in to a registry or
-pushes, and its token is read-only (`contents: read`); `tests/check_ci.sh`
-fails if that changes. To require an approval for every push, move the
-secret into a GitHub environment with required reviewers and add
-`environment: <name>` to the job. By hand, the same script pushes archives
-you built yourself:
+(`scripts/docker-push.sh`, which checks each one's version, architecture
+and, for the CNPG image, Debian release first). It is prepared but off:
+until the repository opts in, it only logs a notice. Opt in one of two
+ways, in the repository's Settings > Secrets and variables > Actions.
+
+**GitHub Container Registry with the workflow's own token** (no secret
+to create or rotate):
+
+| Kind | Name | Value |
+|---|---|---|
+| Variable | `PG_AUTOMERGE_PUBLISH` | `ghcr` |
+| Variable (optional) | `PG_AUTOMERGE_REGISTRY_IMAGE` | default `ghcr.io/<owner>/pg-automerge` (the owner in lower case) |
+| Variable (optional) | `PG_AUTOMERGE_REGISTRY_CNPG_IMAGE` | default `<image>-cnpg`, i.e. `ghcr.io/<owner>/pg-automerge-cnpg` |
+
+The job logs in to ghcr.io as the workflow's actor with `GITHUB_TOKEN`,
+which it may use to write packages (`packages: write`, granted to this job
+only). Both names must be on ghcr.io: the token is good for nothing else.
+The first push creates the two packages, linked to the repository through
+the images' `org.opencontainers.image.source` label. New packages are
+**private**: make them public in each package's settings (Package
+settings > Change visibility) so a cluster can pull them without a pull
+secret. A package that already exists, created by a personal access token,
+must first give the repository write access (Package settings > Manage
+Actions access).
+
+**Any registry with a token of yours** (Docker Hub, a private registry,
+or ghcr.io with a personal access token):
+
+| Kind | Name | Value |
+|---|---|---|
+| Variable | `PG_AUTOMERGE_REGISTRY_IMAGE` | the image, registry host first, lower case: `docker.io/you/pg-automerge`, `registry.example.com/db/pg-automerge`, ... |
+| Variable | `PG_AUTOMERGE_REGISTRY_USERNAME` | the registry user |
+| Variable (optional) | `PG_AUTOMERGE_REGISTRY_CNPG_IMAGE` | the extension image, on the same registry; default `<image>-cnpg` |
+| Secret | `PG_AUTOMERGE_REGISTRY_TOKEN` | a token that may push to those two images only (for Docker Hub an access token with Read & Write; for ghcr.io a personal access token with `write:packages`) |
+
+Leave `PG_AUTOMERGE_PUBLISH` unset for this one. Either way the two images
+share one login, so they must be on the same registry, and the job fails
+(rather than pushing half a release) if the settings are incomplete or
+contradict each other.
+
+Nothing else in the workflow logs in to a registry or pushes, and every
+other job's token is read-only (`contents: read`); `tests/check_ci.sh`
+fails if that changes. To require an approval for every push, add
+`environment: <name>` to the job and give that GitHub environment
+required reviewers (and, for the second way, move the secret into it).
+By hand, the same script pushes archives you built yourself:
 
 ```sh
-bash scripts/docker-archive.sh                     # pg-automerge-0.2.0-linux-amd64.tar.gz
-docker login ghcr.io
-bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.2.0-linux-*.tar.gz  # prints the image IDs and the pushes
-bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.2.0-linux-*.tar.gz
-# the CNPG extension image: its own repository, and --cnpg
+mise run docker-build                              # both images
+bash scripts/docker-archive.sh                     # pg-automerge-0.3.0-linux-amd64.tar.gz
 bash scripts/docker-archive.sh pg-automerge-cnpg:0.3.0-18-trixie   # pg-automerge-cnpg-0.3.0-18-trixie-linux-amd64.tar.gz
+docker login ghcr.io
+bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.3.0-linux-*.tar.gz  # prints the image IDs and the pushes
+bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.3.0-linux-*.tar.gz
+# the CNPG extension image: its own repository, and --cnpg
 bash scripts/docker-push.sh --cnpg ghcr.io/you/pg-automerge-cnpg pg-automerge-cnpg-0.3.0-18-trixie-linux-*.tar.gz
 ```
+
+Pass the archives of both architectures (from the tag's workflow run, or
+built on an arm64 machine) to get a multi-architecture image; with one
+archive the index holds that architecture only.

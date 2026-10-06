@@ -5,8 +5,16 @@ order: 10
 description: "Build and install the extension from source, or build a package for another server."
 ---
 
-To self-host, the [Docker image](./docker.mdx) is `postgres:18` with the
-extension built in. From source, with [mise](https://mise.jdx.dev):
+There are three ways to get the extension into a PostgreSQL 18 server:
+
+- **Docker**: the [full image](./docker.mdx) is `postgres:18` with the
+  extension built in, for local development and small deployments.
+- **Kubernetes with CloudNativePG**: the
+  [extension image](./cloudnativepg.mdx) holds only the extension's
+  files, and the operator mounts it into its own PostgreSQL image.
+- **From source** into a server of your own, below.
+
+From source, with [mise](https://mise.jdx.dev):
 
 ```sh
 mise install                 # Rust and cargo-pgrx as pinned in mise.toml
