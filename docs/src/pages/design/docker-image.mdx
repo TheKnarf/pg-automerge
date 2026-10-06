@@ -384,7 +384,11 @@ suites' fixture generators. The nightly run also benchmarks the image.
   the file name's), tagged `<image>:<version>-<arch>` and pushed, then
   `docker buildx imagetools create` makes `<image>:<version>` and
   `<image>:latest` an index of them. The CNPG archives go through the
-  same script with `--cnpg` to `<cnpg image>:<version>-18-trixie`. Pushing
+  same script with `--cnpg` to `<cnpg image>:<version>-18-trixie`. Both
+  sets are dry-run (loaded and checked) before anything is pushed, and the
+  CNPG image is pushed before the full image, so `latest` moves last; a
+  registry refusing a push part way still leaves an incomplete release,
+  which re-running the (idempotent) job completes. Pushing
   the tested bytes rather than rebuilding for the registry means what is
   published is what passed. Every step after the first is gated on an
   explicit opt-in: the variable `PG_AUTOMERGE_PUBLISH=ghcr` (ghcr.io with

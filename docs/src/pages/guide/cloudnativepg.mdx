@@ -129,7 +129,8 @@ the mount, which triggers a rolling update.
 **On kind** (or any cluster), you can use a locally built image without a
 registry. Run `kind load docker-image pg-automerge-cnpg:0.3.0-18-trixie`
 and set `pullPolicy: IfNotPresent` (already the default for any tag but
-`latest`) or `Never` on the image. `tests/cnpg_e2e.sh` does exactly that.
+`latest`) or `Never` on the image. `tests/cnpg_e2e.sh` does the same with `kind load image-archive` and
+`pullPolicy: Never`.
 
 ## Configuration
 

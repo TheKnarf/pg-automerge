@@ -241,6 +241,12 @@ has "$publish_job" 'bash scripts/docker-push.sh "\$IMAGE" dist/pg-automerge-\[0-
   || fail "$wf: publish must push the full image archives (pg-automerge-[0-9]*) without --cnpg"
 has "$publish_job" 'bash scripts/docker-push.sh --cnpg .* dist/pg-automerge-cnpg-\*-linux-\*\.tar\.gz$' \
   || fail "$wf: publish must push the CNPG archives with --cnpg"
+# Order: a dry run of both sets, then the CNPG push, then the full image
+# (whose index moves :latest) last, so a failure part way never leaves a
+# moved :latest without its CNPG image.
+push_order="$(grep -oE 'bash scripts/docker-push\.sh( --dry-run)?( --cnpg)? ' <<<"$publish_job" | sed 's/ $//' | tr '\n' '|')"
+[ "$push_order" = 'bash scripts/docker-push.sh --dry-run --cnpg|bash scripts/docker-push.sh --dry-run|bash scripts/docker-push.sh --cnpg|bash scripts/docker-push.sh|' ] \
+  || fail "$wf: publish must dry-run both image sets, then push CNPG, then the full image (got: $push_order)"
 # Write permissions: packages: write in the publish job only (its
 # permissions block exactly contents: read + packages: write), none
 # anywhere else, and no push: true.

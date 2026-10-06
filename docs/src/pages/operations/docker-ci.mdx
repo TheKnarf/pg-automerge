@@ -154,7 +154,14 @@ or ghcr.io with a personal access token):
 Leave `PG_AUTOMERGE_PUBLISH` unset for this one. Either way the two images
 share one login, so they must be on the same registry, and the job fails
 (rather than pushing half a release) if the settings are incomplete or
-contradict each other.
+contradict each other. It also checks every archive of both images (a
+`--dry-run` of each) before pushing anything, then pushes the CNPG image
+first and the full image last, so `latest` moves only once everything
+else is up. That is not atomic: if the registry refuses a push part way
+(say a 403 because an existing ghcr.io package has not granted the
+repository write access), the release is incomplete until you fix the
+cause and re-run the job; the pushes are idempotent, so the re-run
+completes it.
 
 Nothing else in the workflow logs in to a registry or pushes, and every
 other job's token is read-only (`contents: read`); `tests/check_ci.sh`

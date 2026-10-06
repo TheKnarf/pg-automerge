@@ -452,6 +452,13 @@ jobs:
         env:
           IMAGE: ${{ steps.cfg.outputs.image }}
           CNPG_IMAGE: ${{ steps.cfg.outputs.cnpg_image }}
+        # Check both sets before pushing either; then the CNPG image
+        # (versioned tags only), then the full image, so :latest moves
+        # last. A registry refusing a push (e.g. a 403 on an existing
+        # package) can still stop it part way; the pushes are
+        # idempotent, so re-running the job completes the release.
         run: |
-          bash scripts/docker-push.sh "$IMAGE" dist/pg-automerge-[0-9]*-linux-*.tar.gz
+          bash scripts/docker-push.sh --dry-run --cnpg "$CNPG_IMAGE" dist/pg-automerge-cnpg-*-linux-*.tar.gz
+          bash scripts/docker-push.sh --dry-run "$IMAGE" dist/pg-automerge-[0-9]*-linux-*.tar.gz
           bash scripts/docker-push.sh --cnpg "$CNPG_IMAGE" dist/pg-automerge-cnpg-*-linux-*.tar.gz
+          bash scripts/docker-push.sh "$IMAGE" dist/pg-automerge-[0-9]*-linux-*.tar.gz
