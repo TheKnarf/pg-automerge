@@ -31,14 +31,14 @@ concurrency:
 jobs:
   build:
     name: Build docs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Node and pnpm as pinned in mise.toml (not the Rust toolchain).
       - name: Setup mise
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v5
         with:
           install_args: node pnpm
 
@@ -57,14 +57,14 @@ jobs:
           DOCS_BASE: /${{ github.event.repository.name }}/
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/dist
 
   deploy:
     name: Deploy to GitHub Pages
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:
       name: github-pages
@@ -72,4 +72,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

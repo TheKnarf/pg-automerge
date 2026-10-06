@@ -41,10 +41,10 @@ env:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Postgres build dependencies
         run: |
@@ -58,12 +58,12 @@ jobs:
 
       # Rust (with rustfmt and clippy) and cargo-pgrx, as pinned in
       # mise.toml. mise.toml puts /usr/bin first on PATH (see its comment).
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
         with:
           cache: true
 
       - name: Cache cargo registry, target and the pgrx Postgres
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -90,7 +90,7 @@ jobs:
 
       - name: Upload benchmark tables
         if: github.event_name == 'schedule'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmarks
           path: bench-*.txt
@@ -126,7 +126,7 @@ jobs:
       # GitHub release.
       - name: Upload package (tags only)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pg_automerge-pg18
           path: target/release/pg_automerge-pg18.tar.gz
@@ -140,10 +140,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Node and pnpm as pinned in mise.toml; nothing else.
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
         with:
           install_args: node pnpm
           cache: true
@@ -172,7 +172,7 @@ jobs:
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Tag matches the crate version (tags only)
         if: startsWith(github.ref, 'refs/tags/')
@@ -186,7 +186,7 @@ jobs:
       # Rust as pinned in mise.toml, for the suites' fixture generators
       # (cargo run -p pg_automerge_core --example ...). Only Rust: the image
       # builds its own toolchain, and nothing here needs cargo-pgrx.
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
         with:
           install_args: rust
           cache: true
@@ -208,9 +208,9 @@ jobs:
       # A docker-container builder (BuildKit), which can export its cache;
       # the runtime token lets `docker build` in a run step reach the
       # GitHub Actions cache (type=gha).
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         id: buildx
-      - uses: crazy-max/ghaction-github-runtime@v3
+      - uses: crazy-max/ghaction-github-runtime@v4
 
       # scripts/docker-build.sh, as `mise run docker-build` runs it (the
       # version, source and revision arguments), plus: --load (the
@@ -242,7 +242,7 @@ jobs:
 
       - name: Upload the benchmark table (nightly only)
         if: github.event_name == 'schedule'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmarks-docker
           path: bench-sql-docker.txt
@@ -259,7 +259,7 @@ jobs:
 
       - name: Upload the image (tags only)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.archive.outputs.name }}
           path: ${{ steps.archive.outputs.file }}
@@ -298,17 +298,17 @@ jobs:
           echo "push=true" >>"$GITHUB_OUTPUT"
           echo "registry=${REGISTRY_IMAGE%%/*}" >>"$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.cfg.outputs.push == 'true'
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: steps.cfg.outputs.push == 'true'
         with:
           pattern: pg-automerge-*-linux-*
           path: dist
           merge-multiple: true
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: steps.cfg.outputs.push == 'true'
         with:
           registry: ${{ steps.cfg.outputs.registry }}
