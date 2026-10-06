@@ -33,11 +33,11 @@
 # The compose steps of the docs' Updating page (the "From ... to <current> with compose"
 # section that names 0.1.0) are
 # followed as written: the cluster's superuser is not postgres (POSTGRES_USER
-# is the app's, as in skjera's compose.yml, so there is no postgres role),
+# is the app's own, as in a typical app compose file, so there is no postgres role),
 # the pg_dump of step 1 and the psql commands of step 5 are read from the
 # page's MDX source ($UPDATING_PAGE) and run with `docker compose exec [-T]
 # postgres` as `docker exec -i`
-# on the container and <user>/<db> filled in; and a service like skjera's
+# on the container and <user>/<db> filled in; and a typical app service
 # (image: plus build: with args PG_AUTOMERGE_VERSION) is built with the old
 # version arg (the Dockerfile refuses it) and after step 3's edit (it
 # builds, reusing the cache of the image just built).
@@ -61,12 +61,12 @@ case "$OLD_VERSION" in
     # The last commit before automerge_spans: its SQL is 0.1.0's (the same
     # statements as the snapshot; pgrx may order them differently).
     0.1.0) RELEASE_REV=0918f56 ;;
-    # The 0.2.0 release and its upgrade docs (skjera's image).
+    # The 0.2.0 release and its upgrade docs.
     0.2.0) RELEASE_REV=356a2f9 ;;
     *) fail "PG_AUTOMERGE_OLD_VERSION=$OLD_VERSION: only 0.1.0 and 0.2.0 are known" ;;
 esac
 
-# Not postgres: an app's own POSTGRES_USER (skjera's is skjera).
+# Not postgres: an app's own POSTGRES_USER.
 PG_USER=appowner
 
 on_exit() {
@@ -132,7 +132,7 @@ step_cmd() {
     (cd "$DWORK" && eval "$cmd")
 }
 
-log "Updating step 3: a service with image: and build: args, like skjera's"
+log "Updating step 3: a service with image: and build: args, as apps often have"
 step3_tag="pg-automerge-test-step3-$$:$VERSION"
 cat >"$DWORK/step3.yml" <<YAML
 services:
@@ -207,8 +207,8 @@ expect "new, before UPDATE: documents" "$before" "$(psql_in new app -c "$FINGERP
 psql_in new app -v deep="$DEEP_BLOCK" <<<"INSERT INTO docs VALUES (6, :'deep');"
 
 log "Updating step 5: ALTER EXTENSION pg_automerge UPDATE, as $PG_USER"
-# What the Updating page's commands used to hardcode fails here, as in skjera's
-# cluster.
+# What the Updating page's commands used to hardcode fails here, as in any
+# cluster whose POSTGRES_USER is not postgres.
 if out="$(docker exec "$C" psql -X -U postgres -d app -c 'SELECT 1' 2>&1)"; then
     fail "the cluster has a postgres role: the Updating page's commands are not tested with another superuser"
 fi

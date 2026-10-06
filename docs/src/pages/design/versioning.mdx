@@ -54,7 +54,7 @@ deep-block crash ([Deep blocks](./deep-blocks.mdx)) if it was built from a
 commit up to 555110e (the last commit before the fix, ee574e1), but not
 necessarily if it was built from a working tree: the fix was made
 uncommitted on top of 555110e, and an image built from that tree is
-labelled revision `555110e-dirty` and has it (7c6d11f23a6f, skjera's
+labelled revision `555110e-dirty` and has it (7c6d11f23a6f, the local
 `pg-automerge:0.1.0` at the time of the bump: the 2,000-level deep block
 of the regress fixtures reads as jsonb there, and crashes the backend of
 the released b946069dce9a). A `-dirty` label cannot tell which, so the
@@ -146,20 +146,19 @@ with `psql`.
   on the deep block), the catalog equal to a fresh install's in the same
   container, and clean server logs. It follows the compose steps of
   [Updating](../guide/updating.mdx) as written: the cluster's superuser is an app's own
-  `POSTGRES_USER`, not `postgres` (as in skjera, which has no `postgres`
+  `POSTGRES_USER`, not `postgres` (so the cluster has no `postgres`
   role), the dump of step 1 and the `ALTER EXTENSION` and version check
   of step 5 are that page's commands (read from its MDX source, `docker compose
   exec` run as `docker exec`, `<user>` and `<db>` filled in), and a
   service with `image:` and a `build:` section with `args:
-  PG_AUTOMERGE_VERSION` (skjera's shape) fails to build with the old
+  PG_AUTOMERGE_VERSION` (a common app setup) fails to build with the old
   version (the Dockerfile's version guard) and builds after step 3's
   edit. Run against the released image
   (b946069dce9a), against an image of the `0.1.0+spans` variant, and with
   the image built from 0918f56: all pass. With
   `PG_AUTOMERGE_OLD_VERSION=0.2.0` it does the same from a 0.2.0
   deployment (by default an image built from 356a2f9; its install script
-  must be the 0.2.0 snapshot), the path of an app already on 0.2.0 such
-  as skjera.
+  must be the 0.2.0 snapshot), the path of an app already on 0.2.0.
 
 Data compatibility:
 
