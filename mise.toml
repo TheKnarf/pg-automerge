@@ -131,11 +131,20 @@ description = "Median timings of the everyday SQL paths (reads, inserts, merges,
 run = "bash tests/bench_sql.sh"
 
 [tasks.docker-build]
-description = "Build the Docker image (official postgres:18 + pg_automerge, built against its PGDG Postgres) as pg-automerge:<version> and pg-automerge:dev; extra docker build args after --"
-run = "bash scripts/docker-build.sh"
+description = "Build both Docker images from one compile: the full image (official postgres:18 + pg_automerge, built against its PGDG Postgres) as pg-automerge:<version> and pg-automerge:dev, and the CloudNativePG extension image as pg-automerge-cnpg:<version>-18-trixie; extra docker build args after --"
+run = "bash scripts/docker-build.sh --all"
+
+[tasks.docker-build-cnpg]
+description = "Build only the CloudNativePG extension image (files only, from scratch, for a Cluster's spec.postgresql.extensions) as pg-automerge-cnpg:<version>-18-trixie; extra docker build args after --"
+run = "bash scripts/docker-build.sh --cnpg"
+
+[tasks.cnpg-smoke]
+description = "Build the CloudNativePG extension image, then mount it into CNPG's PostgreSQL 18 operand image the way CNPG does (no Kubernetes): layout and labels, CREATE EXTENSION, merge, jsonb, automerge_spans; part of docker-test"
+depends = ["docker-build-cnpg"]
+run = "bash tests/cnpg_smoke.sh"
 
 [tasks.docker-test]
-description = "Build the Docker image, then test it: init, SQL (casts, merge, jsonb + GIN index, history, LISTEN/NOTIFY), settings, dump/restore into a second container, restart on a volume, PG_AUTOMERGE_CREATE_EXTENSION, the regress examples and the concurrency/notify/dump/extension/memory suites against a container, limits.sh against a memory-capped one, a 60-second soak.sh smoke run, server logs, compose.yaml; not part of test"
+description = "Build both Docker images, then test them: the CNPG extension image (tests/cnpg_smoke.sh), and the full image: init, SQL (casts, merge, jsonb + GIN index, history, LISTEN/NOTIFY), settings, dump/restore into a second container, restart on a volume, PG_AUTOMERGE_CREATE_EXTENSION, the regress examples and the concurrency/notify/dump/extension/memory suites against a container, limits.sh against a memory-capped one, a 60-second soak.sh smoke run, server logs, compose.yaml; not part of test"
 depends = ["docker-build"]
 run = "bash tests/docker.sh"
 

@@ -6,8 +6,10 @@ description: "Packaging decisions of the Docker image, and how CI builds it."
 ---
 
 `docker/Dockerfile` builds the official `postgres:18` image plus the
-extension; `compose.yaml` runs it for local development. Usage is in
-[Docker](../guide/docker.mdx). Packaging decisions:
+extension (the default target); `compose.yaml` runs it for local
+development. Usage is in [Docker](../guide/docker.mdx). The same Dockerfile
+also builds the [CloudNativePG extension image](#cloudnativepg-extension-image)
+from the same builder stage. Packaging decisions:
 
 - **One pinned base for every stage.** The `versions`, `builder` and
   `runtime` stages are all `FROM ${PG_IMAGE}`, by default
@@ -25,7 +27,9 @@ extension; `compose.yaml` runs it for local development. Usage is in
   visible one-line change; the price is that security fixes arrive only
   when someone updates it ([Updating](../guide/updating.mdx) says how). The tag stays next to the
   digest for readers. `tests/check_ci.sh` checks that every stage uses
-  `PG_IMAGE` and that it is a digest-pinned `postgres:18-*`.
+  `PG_IMAGE` (except the CNPG image's final, `FROM scratch` stage), that
+  `PG_IMAGE` is a digest-pinned `postgres:18-*`, and that `runtime` stays
+  the last stage, so it remains the default target.
 - **No hand-copied versions.** `scripts/versions.sh` reads Rust and
   cargo-pgrx from `mise.toml`, checks cargo-pgrx against the pgrx crate in
   `Cargo.lock`, and the crate version from `Cargo.toml`; the `versions`
@@ -204,13 +208,80 @@ with BuildKit:
 | Warm build, nothing changed | 1.3 s |
 | Warm build, one source file changed | 65 s (dependencies cached in the `target/` mount; the release profile's fat LTO and one codegen unit dominate) |
 
+## CloudNativePG extension image
+
+The `cnpg-extension` target is an image volume extension for
+[CloudNativePG](../guide/cloudnativepg.mdx). `scripts/docker-build.sh`
+builds it after the full image (`--all`, the default of
+`mise run docker-build`), or alone (`--cnpg`). Decisions:
+
+- **Same compile, own image.** A `cnpg-files` stage, `FROM ${PG_IMAGE}`,
+  copies the builder's `/out` into CNPG's layout: `/lib/pg_automerge.so`,
+  `/share/extension/` with the control file and SQL scripts, and
+  `/licenses/pg_automerge/copyright`. The final stage is `FROM scratch`
+  with that one tree. Files are root-owned, mode 0644 (the library 0755),
+  and directories 0755, so PostgreSQL (uid 26 in CNPG's images) can read
+  everything and own nothing. The stage ends with `USER 65532:65532`, as
+  CNPG's own extension images do (nothing runs it). These are exactly the
+  files the full image installs, so no second build path exists to drift.
+  The default target never builds these stages.
+- **Works unchanged with CNPG's paths.** CNPG mounts the image at
+  `/extensions/<name>` and appends its `share` and `lib` to
+  `extension_control_path` and `dynamic_library_path` (PostgreSQL 18). That
+  works because the control file's `module_pathname` is the bare
+  `pg_automerge`, and no SQL script names `$libdir`. `cnpg-files` fails the
+  build if either changes, or if the control file's `default_version` is
+  not the version in the `io.cloudnativepg.image.sql.version` label.
+- **Debian trixie only.** CNPG's operand images are Debian slim plus
+  PGDG's packages. `18-minimal-trixie` had PostgreSQL 18.6-1.pgdg13+2 and
+  glibc 2.41 when this was written, the same PGDG build and pkglibdir as
+  the `postgres:18-trixie` builder. So the trixie build loads as it is,
+  in every trixie variant (minimal, standard). The library needs
+  `GLIBC_2.38` (`__isoc23_sscanf`), so a bookworm operand (glibc 2.36)
+  refuses it. A bookworm build would need a builder without Debian's
+  `rustup` package, which bookworm lacks. For a Debian release that is
+  past its end of life, that would be a second toolchain path to maintain,
+  so it is not built. `PG_DEBIAN` names the image. `docker-build.sh` reads
+  it from `PG_IMAGE`'s tag, and `cnpg-files` checks it against the base's
+  `/etc/os-release`.
+- **Name and tags as CNPG's.** The image is `pg-automerge-cnpg`, a
+  repository of its own, so a non-runnable image never sits under the
+  runnable image's tags. Its tag is `<version>-18-<debian>`, CNPG's rolling
+  tag form. The labels are the OCI ones (`base.name=scratch`) plus CNPG's
+  `io.cloudnativepg.image.base.{name,pgmajor,os}` and `sql.version`. CNPG's
+  own images also add an immutable timestamped tag. A release here is
+  built once per version tag, so the plain tag is not re-pushed.
+- **Archives and publishing.** `scripts/docker-archive.sh` names a CNPG
+  image's archive `pg-automerge-cnpg-<version>-18-<debian>-linux-<arch>.tar.gz`,
+  telling the two apart by the `io.cloudnativepg.image.base.os` label.
+  `scripts/docker-push.sh --cnpg` checks the label against the file name,
+  pushes `<repo>:<version>-18-<debian>-<arch>` and builds one index per
+  Debian release, `<repo>:<version>-18-<debian>`, with no `latest`. Each
+  script refuses the other kind's archives.
+- **Tested without Kubernetes.** `tests/cnpg_smoke.sh` mounts the image
+  with `docker run --mount type=image` (Docker 28 or later; on an older
+  Docker it copies the files out and bind-mounts them read-only) into
+  CNPG's digest-pinned `18-minimal-trixie` operand, at
+  `/extensions/pg-automerge`. It writes the two settings CNPG writes and
+  starts PostgreSQL with `initdb` and `postgres` as uid 26, because CNPG's
+  instance manager is not there. Its checks are listed in
+  [CloudNativePG](../guide/cloudnativepg.mdx#what-is-tested).
+  `tests/docker.sh` runs it (unless `DOCKER_TEST_CNPG=0`), then archives
+  the image and runs a `--cnpg` push dry run. `check_ci.sh` checks the
+  stages: the `FROM scratch` stage holds only the `cnpg-files` tree,
+  `cnpg-files` copies only the library, the extension files and the
+  license, the labels are there, and the smoke test's operand is pinned by
+  digest and its settings are CNPG's.
+
 ## Docker image in CI
 
 The `docker` job of `.github/workflows/ci.yml` runs on every push and pull
 request, in parallel with the `ci` job (it needs neither pgrx nor its
-Postgres): it builds the image with `scripts/docker-build.sh` (the same
-build arguments as locally) on a `docker-container` BuildKit builder, and
-runs `tests/docker.sh` in full, the suites included, with PGDG's
+Postgres): it builds the full image with `scripts/docker-build.sh --full`
+(the same build arguments as locally) on a `docker-container` BuildKit
+builder, then the CNPG extension image with `--cnpg` from that builder's
+cache (no second compile, and no second cache export), and runs
+`tests/docker.sh` in full, the suites included, with PGDG's
 `postgresql-client-18` as the client tools
 (`PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config`; `tests/lib.sh` takes
 any Postgres 18 client in external mode) and Rust from `mise.toml` for the

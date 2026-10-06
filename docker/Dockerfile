@@ -14,6 +14,11 @@
 # and cargo-pgrx from mise.toml (and checks cargo-pgrx against the pgrx in
 # Cargo.lock) with scripts/versions.sh. See docs/src/pages/guide/docker.mdx
 # and docs/src/pages/design/docker-image.mdx.
+#
+# Two images come out of one builder: the default target, runtime (the
+# last stage), and cnpg-extension, the CloudNativePG image volume extension
+# (mise run docker-build builds both; scripts/docker-build.sh --cnpg only
+# that one; docs/src/pages/guide/cloudnativepg.mdx).
 
 # The base of both the builder and the runtime stage, so the Debian release,
 # glibc and the Postgres headers the extension is compiled against are the
@@ -120,6 +125,74 @@ extra=$(cd "$pkg" && find . -type f ! -name pg_automerge.so ! -name pg_automerge
 [ -z "$extra" ] || { echo "unexpected files in the package: $extra" >&2; exit 1; }
 ls -l /out/lib /out/extension
 EOF
+
+# ---------------------------------------------------------------------------
+# cnpg-files: the builder's files laid out as a CloudNativePG image volume
+# extension wants them (/lib, /share/extension; the operator mounts the
+# image at /extensions/<name> and sets extension_control_path and
+# dynamic_library_path to its share and lib), checked against the base's
+# Debian release, which names the image (PG_DEBIAN: scripts/docker-build.sh
+# passes it, read from PG_IMAGE's tag). Only the cnpg-extension target
+# builds this; the default target (runtime) never does.
+FROM ${PG_IMAGE} AS cnpg-files
+ARG PG_AUTOMERGE_VERSION
+ARG PG_DEBIAN
+COPY --from=builder /out/lib/pg_automerge.so /cnpg/lib/
+COPY --from=builder /out/extension/ /cnpg/share/extension/
+# The MIT notice travels with every copy (CNPG's extension images keep
+# theirs in /licenses/<package>/).
+COPY LICENSE /cnpg/licenses/pg_automerge/copyright
+RUN <<'EOF'
+set -eu
+fail() { echo "cnpg-files: $*" >&2; exit 1; }
+# Root-owned and read-only for everyone else: Postgres (uid 26 in CNPG's
+# images) only reads them. Directories need their x bit, which COPY
+# --chmod would take from the parents it creates.
+chown -R 0:0 /cnpg
+find /cnpg -type d -exec chmod 0755 {} +
+find /cnpg -type f -exec chmod 0644 {} +
+chmod 0755 /cnpg/lib/pg_automerge.so
+. /etc/os-release
+[ -n "${PG_DEBIAN:-}" ] || fail "pass --build-arg PG_DEBIAN=$VERSION_CODENAME (mise run docker-build-cnpg does)"
+[ "$PG_DEBIAN" = "$VERSION_CODENAME" ] || fail "PG_DEBIAN=$PG_DEBIAN, but the base image is Debian $VERSION_CODENAME"
+[ "$PG_MAJOR" = 18 ] || fail "the base image is Postgres $PG_MAJOR, not 18"
+# The io.cloudnativepg.image.sql.version label is the crate version: it
+# must be the control file's default_version.
+grep -qxF "default_version = '$PG_AUTOMERGE_VERSION'" /cnpg/share/extension/pg_automerge.control \
+  || fail "default_version in pg_automerge.control is not $PG_AUTOMERGE_VERSION"
+# A bare module_pathname is what lets dynamic_library_path find the library
+# in the image volume ('$libdir/pg_automerge' would not).
+grep -qxF "module_pathname = 'pg_automerge'" /cnpg/share/extension/pg_automerge.control \
+  || fail "module_pathname must be the bare 'pg_automerge'"
+if grep -lF '$libdir' /cnpg/share/extension/*.sql; then fail "SQL scripts must not name \$libdir"; fi
+find /cnpg -printf '%M %u %p\n' | sort -k3
+EOF
+
+# ---------------------------------------------------------------------------
+# cnpg-extension: the CloudNativePG extension image, `--target
+# cnpg-extension`. Files only, from scratch (it cannot be run; CNPG mounts
+# it read-only into its own PostgreSQL 18 operand image of the same Debian
+# release and architecture). See docs/src/pages/guide/cloudnativepg.mdx.
+FROM scratch AS cnpg-extension
+ARG PG_AUTOMERGE_VERSION
+ARG PG_DEBIAN
+ARG PG_AUTOMERGE_SOURCE=
+ARG PG_AUTOMERGE_REVISION=
+LABEL org.opencontainers.image.title="pg_automerge (CloudNativePG extension)" \
+      org.opencontainers.image.description="The pg_automerge extension as a CloudNativePG image volume extension for PostgreSQL 18 on Debian ${PG_DEBIAN} (mount it with Cluster spec.postgresql.extensions)" \
+      org.opencontainers.image.version="${PG_AUTOMERGE_VERSION}" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="${PG_AUTOMERGE_SOURCE}" \
+      org.opencontainers.image.revision="${PG_AUTOMERGE_REVISION}" \
+      org.opencontainers.image.base.name="scratch" \
+      io.cloudnativepg.image.base.name="ghcr.io/cloudnative-pg/postgresql:18-minimal-${PG_DEBIAN}" \
+      io.cloudnativepg.image.base.pgmajor="18" \
+      io.cloudnativepg.image.base.os="${PG_DEBIAN}" \
+      io.cloudnativepg.image.sql.version="${PG_AUTOMERGE_VERSION}"
+COPY --from=cnpg-files /cnpg/ /
+# Nobody runs it; a non-root user keeps image scanners quiet (CNPG's own
+# extension images do the same).
+USER 65532:65532
 
 # ---------------------------------------------------------------------------
 # runtime: the untouched official image (entrypoint, users, volume, signals)

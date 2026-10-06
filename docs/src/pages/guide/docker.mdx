@@ -17,9 +17,13 @@ registry of your own (CI can do that for tags once you
 [configure it](../operations/docker-ci.mdx#publishing-the-image)).
 
 ```sh
-mise run docker-build        # pg-automerge:0.2.0 and pg-automerge:dev
+mise run docker-build        # pg-automerge:0.2.0 and pg-automerge:dev (and the CNPG image)
 mise run docker-test         # builds, then tests the image and compose.yaml (about 6 minutes once built)
 ```
+
+On Kubernetes with CloudNativePG, use the extension-only image that the
+same build produces, `pg-automerge-cnpg:<version>-18-trixie`, instead of
+this one: see [CloudNativePG](./cloudnativepg.mdx).
 
 The image is 3.5 MB larger than `postgres:18`. A first build takes about
 8 minutes (Rust, cargo-pgrx and a fat-LTO release build); BuildKit cache

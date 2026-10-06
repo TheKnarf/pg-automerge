@@ -4,11 +4,12 @@
 #     18); on tags also the release tarball.
 #   - docs: only the docs site check (`mise run docs-check`), for quick
 #     feedback.
-#   - docker: builds the Docker image (BuildKit, layers cached in the GitHub
-#     Actions cache) and runs tests/docker.sh against it, including the
-#     container variants of the multi-session suites. On tags it runs on an
-#     amd64 and a native arm64 runner and uploads each image as a workflow
-#     artifact.
+#   - docker: builds the Docker images (BuildKit, layers cached in the GitHub
+#     Actions cache): the full image and the CloudNativePG extension image,
+#     from one builder stage, and runs tests/docker.sh against them,
+#     including the container variants of the multi-session suites and
+#     tests/cnpg_smoke.sh. On tags it runs on an amd64 and a native arm64
+#     runner and uploads each image as a workflow artifact.
 # On tags, publish pushes those images to a registry, but only once one is
 # configured (docs/src/pages/operations/docker-ci.mdx, "Publishing the image"); until then it skips.
 name: CI
@@ -155,8 +156,10 @@ jobs:
           MISE_TASK_RUN_AUTO_INSTALL: "false"
         run: mise run docs-check
 
-  # The Docker image (official postgres:18 + the extension built against
-  # its PGDG Postgres, docker/Dockerfile), tested with tests/docker.sh.
+  # The Docker images of docker/Dockerfile: the full image (official
+  # postgres:18 + the extension built against its PGDG Postgres) and the
+  # CloudNativePG extension image (the same build's files, from scratch),
+  # tested with tests/docker.sh.
   # Independent of the ci job: it needs neither pgrx nor its Postgres.
   docker:
     name: docker (${{ matrix.arch }})
@@ -213,21 +216,28 @@ jobs:
       - uses: crazy-max/ghaction-github-runtime@v4
 
       # scripts/docker-build.sh, as `mise run docker-build` runs it (the
-      # version, source and revision arguments), plus: --load (the
+      # version, Debian, source and revision arguments), plus: --load (the
       # docker-container builder keeps results to itself otherwise) and
       # the layer cache, one scope per architecture, mode=max so the
       # builder stage's toolchain layers are cached too. BuildKit's cache
       # mounts (cargo registry, target/) are not part of it, so a source
       # change recompiles the dependencies. A failed cache export does not
-      # fail the build. Nothing is pushed.
-      - name: Build the image
+      # fail the build. The CNPG extension image comes second, from the
+      # same builder's cache (no second compile), and exports nothing: the
+      # full image's export already holds the builder stage. Nothing is
+      # pushed.
+      - name: Build the images
         env:
           BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
         run: |
-          bash scripts/docker-build.sh -- --load \
+          bash scripts/docker-build.sh --full -- --load \
             --cache-from "type=gha,scope=pg-automerge-${{ matrix.arch }}" \
             --cache-to "type=gha,scope=pg-automerge-${{ matrix.arch }},mode=max,ignore-error=true"
+          cnpg="$(bash scripts/docker-build.sh --cnpg -- --load \
+            --cache-from "type=gha,scope=pg-automerge-${{ matrix.arch }}")"
+          echo "PG_AUTOMERGE_CNPG_IMAGE=$cnpg" >>"$GITHUB_ENV"
           docker image ls pg-automerge
+          docker image ls pg-automerge-cnpg
 
       - name: Test the image (tests/docker.sh)
         env:
@@ -247,14 +257,17 @@ jobs:
           name: benchmarks-docker
           path: bench-sql-docker.txt
 
-      # `docker load -i` reads it back; the publish job pushes it.
-      - name: Save the image (tags only)
+      # `docker load -i` reads them back; the publish job pushes them.
+      - name: Save the images (tags only)
         id: archive
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           file="$(bash scripts/docker-archive.sh "" dist)"
           echo "file=$file" >>"$GITHUB_OUTPUT"
           echo "name=$(basename "$file" .tar.gz)" >>"$GITHUB_OUTPUT"
+          cnpg="$(bash scripts/docker-archive.sh "$PG_AUTOMERGE_CNPG_IMAGE" dist)"
+          echo "cnpg_file=$cnpg" >>"$GITHUB_OUTPUT"
+          echo "cnpg_name=$(basename "$cnpg" .tar.gz)" >>"$GITHUB_OUTPUT"
           ls -l dist
 
       - name: Upload the image (tags only)
@@ -267,11 +280,22 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-  # Pushes the tested images of a tag as one multi-architecture image.
+      - name: Upload the CNPG extension image (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.archive.outputs.cnpg_name }}
+          path: ${{ steps.archive.outputs.cnpg_file }}
+          compression-level: 0
+          if-no-files-found: error
+
+  # Pushes the tested images of a tag, each as one multi-architecture
+  # image: the full image and the CNPG extension image.
   # Prepared, not enabled: it does nothing until the repository has the
   # secret PG_AUTOMERGE_REGISTRY_TOKEN and the variables
   # PG_AUTOMERGE_REGISTRY_IMAGE (e.g. ghcr.io/you/pg-automerge) and
-  # PG_AUTOMERGE_REGISTRY_USERNAME. See
+  # PG_AUTOMERGE_REGISTRY_USERNAME; the CNPG image goes to
+  # PG_AUTOMERGE_REGISTRY_CNPG_IMAGE, by default <image>-cnpg. See
   # docs/src/pages/operations/docker-ci.mdx, "Publishing the image".
   publish:
     if: startsWith(github.ref, 'refs/tags/')
@@ -280,6 +304,7 @@ jobs:
     timeout-minutes: 30
     env:
       REGISTRY_IMAGE: ${{ vars.PG_AUTOMERGE_REGISTRY_IMAGE }}
+      REGISTRY_CNPG_IMAGE: ${{ vars.PG_AUTOMERGE_REGISTRY_CNPG_IMAGE }}
       REGISTRY_USERNAME: ${{ vars.PG_AUTOMERGE_REGISTRY_USERNAME }}
       REGISTRY_TOKEN: ${{ secrets.PG_AUTOMERGE_REGISTRY_TOKEN }}
     steps:
@@ -293,6 +318,12 @@ jobs:
           fi
           if [ -z "$REGISTRY_IMAGE" ] || [ -z "$REGISTRY_USERNAME" ]; then
             echo "::error::PG_AUTOMERGE_REGISTRY_TOKEN is set, but PG_AUTOMERGE_REGISTRY_IMAGE or PG_AUTOMERGE_REGISTRY_USERNAME is not"
+            exit 1
+          fi
+          # One login: the CNPG image must be on the same registry.
+          cnpg_image="${REGISTRY_CNPG_IMAGE:-$REGISTRY_IMAGE-cnpg}"
+          if [ "${cnpg_image%%/*}" != "${REGISTRY_IMAGE%%/*}" ]; then
+            echo "::error::PG_AUTOMERGE_REGISTRY_CNPG_IMAGE ($cnpg_image) is not on the registry of PG_AUTOMERGE_REGISTRY_IMAGE"
             exit 1
           fi
           echo "push=true" >>"$GITHUB_OUTPUT"
@@ -317,4 +348,6 @@ jobs:
 
       - name: Push
         if: steps.cfg.outputs.push == 'true'
-        run: bash scripts/docker-push.sh "$REGISTRY_IMAGE" dist/pg-automerge-*-linux-*.tar.gz
+        run: |
+          bash scripts/docker-push.sh "$REGISTRY_IMAGE" dist/pg-automerge-[0-9]*-linux-*.tar.gz
+          bash scripts/docker-push.sh --cnpg "${REGISTRY_CNPG_IMAGE:-$REGISTRY_IMAGE-cnpg}" dist/pg-automerge-cnpg-*-linux-*.tar.gz

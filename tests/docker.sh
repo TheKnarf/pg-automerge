@@ -11,6 +11,10 @@
 #     version file, no toolchain, lz4 support, only the expected extension
 #     files (install script, control file, library, and every
 #     sql/pg_automerge--*--*.sql upgrade script);
+#   - the CloudNativePG extension image (unless DOCKER_TEST_CNPG=0):
+#     tests/cnpg_smoke.sh (its labels and layout, and the extension mounted
+#     into CNPG's PostgreSQL 18 operand image the way CNPG mounts it), its
+#     archive and a --cnpg push dry run;
 #   - the release scripts: scripts/docker-archive.sh saves the image as
 #     pg-automerge-<version>-linux-<arch>.tar.gz, scripts/docker-push.sh
 #     --dry-run loads it back (the same image ID), prints the per-arch push
@@ -74,12 +78,18 @@
 #     is there, and `down -v` removes everything.
 #
 # Env: PG_AUTOMERGE_IMAGE (default pg-automerge:<Cargo.toml version>),
+# PG_AUTOMERGE_CNPG_IMAGE (default pg-automerge-cnpg:<version>-18-trixie),
+# DOCKER_TEST_CNPG=0 (skip the CNPG extension image),
 # PG_CONFIG (the suites' client tools, default pgrx's pg18),
 # DOCKER_TEST_SUITES=0 (skip the suites and the soak smoke run), DOCKER_TEST_MEMORY (the limits
 # container's memory cap, default 1g).
 
 # shellcheck source=tests/docker_lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/docker_lib.sh"
+CNPG_IMAGE="${PG_AUTOMERGE_CNPG_IMAGE:-pg-automerge-cnpg:$VERSION-18-trixie}"
+if [[ "${DOCKER_TEST_CNPG:-1}" != 0 ]]; then
+    docker image inspect "$CNPG_IMAGE" >/dev/null 2>&1 || fail "image $CNPG_IMAGE not found (run mise run docker-build)"
+fi
 
 on_exit() {
     if [[ $1 == 0 ]]; then log "all docker checks passed"; else echo "docker test FAILED" >&2; fi
@@ -167,6 +177,39 @@ for bad in "pg-automerge|REPOSITORY must be registry-host/path" \
     grep -qF "$want" <<<"$out" || fail "docker-push.sh $args: expected '$want', got: $out"
 done
 expect "refusals leave no tags" "" "$(docker image ls -q "$PUSH_REPO")"
+
+# ---------------------------------------------------------------------------
+# The CloudNativePG extension image (the cnpg-extension target).
+if [[ "${DOCKER_TEST_CNPG:-1}" != 0 ]]; then
+    log "CNPG extension image $CNPG_IMAGE: tests/cnpg_smoke.sh"
+    PG_AUTOMERGE_CNPG_IMAGE="$CNPG_IMAGE" bash tests/cnpg_smoke.sh >"$DWORK/cnpg.log" 2>&1 \
+        || { cat "$DWORK/cnpg.log" >&2; fail "tests/cnpg_smoke.sh"; }
+    sed -n 's/^==> /    /p' "$DWORK/cnpg.log"
+
+    log "CNPG release archive and a push dry run (--cnpg)"
+    DEBIAN="$(docker image inspect -f '{{index .Config.Labels "io.cloudnativepg.image.base.os"}}' "$CNPG_IMAGE")"
+    expect "CNPG image architecture" "$ARCH" "$(docker image inspect -f '{{.Architecture}}' "$CNPG_IMAGE")"
+    carchive="$(bash scripts/docker-archive.sh "$CNPG_IMAGE" "$DWORK/release")"
+    expect "CNPG archive name" "$DWORK/release/pg-automerge-cnpg-$VERSION-18-$DEBIAN-linux-$ARCH.tar.gz" "$carchive"
+    CNPG_REPO=registry.invalid/pg-automerge-cnpg-test
+    CNPG_ID="$(docker image inspect -f '{{.Id}}' "$CNPG_IMAGE")"
+    out="$(bash scripts/docker-push.sh --dry-run --cnpg "$CNPG_REPO" "$carchive")"
+    expect "CNPG push dry run" "$(printf '%s\n' "loaded $carchive $CNPG_ID" "+ docker push $CNPG_REPO:$VERSION-18-$DEBIAN-$ARCH" \
+        "+ docker buildx imagetools create -t $CNPG_REPO:$VERSION-18-$DEBIAN $CNPG_REPO:$VERSION-18-$DEBIAN-$ARCH")" "$out"
+    expect "the CNPG image is still $CNPG_IMAGE" "$CNPG_ID" "$(docker image inspect -f '{{.Id}}' "$CNPG_IMAGE")"
+    # Each kind of archive only in its own mode.
+    for bad in "$PUSH_REPO $carchive|push it with --cnpg" \
+               "--cnpg $CNPG_REPO $archive|not a pg-automerge-cnpg-<version>-18-<debian>-linux-<arch>.tar.gz archive" \
+               "--cnpg $CNPG_REPO $carchive $carchive|two archives for $DEBIAN/$ARCH"; do
+        args="${bad%%|*}"; want="${bad#*|}"
+        # shellcheck disable=SC2086 # args is a word list
+        if out="$(bash scripts/docker-push.sh --dry-run $args 2>&1)"; then fail "docker-push.sh accepted: $args"; fi
+        grep -qF -- "$want" <<<"$out" || fail "docker-push.sh $args: expected '$want', got: $out"
+    done
+    expect "CNPG dry runs leave no tags" "" "$(docker image ls -q "$CNPG_REPO"; docker image ls -q "$PUSH_REPO")"
+else
+    log "DOCKER_TEST_CNPG=0: skipping the CNPG extension image"
+fi
 rm -rf "$DWORK/release"
 
 # ---------------------------------------------------------------------------

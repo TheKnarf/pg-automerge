@@ -23,7 +23,9 @@ those of the pgrx Postgres by default (`mise run pgrx-init`), or PGDG's
 `postgresql-client-18` with
 `PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config` (what CI uses; the soak
 run also needs its `pgbench` and `python3`); `DOCKER_TEST_SUITES=0`
-skips them. It also checks the release scripts:
+skips them. It also runs `tests/cnpg_smoke.sh` against the CloudNativePG
+extension image (`DOCKER_TEST_CNPG=0` skips it; see
+[CloudNativePG](../guide/cloudnativepg.mdx#what-is-tested)). It also checks the release scripts:
 `scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
 
 `mise run docker-upgrade-test` (not part of `docker-test`) upgrades a
@@ -60,9 +62,10 @@ in full against it, with PGDG's client tools. It does not need pgrx.
 On a `v*` tag (which must equal the `Cargo.toml` version) the job runs
 twice, on an amd64 and on GitHub's native arm64 runner
 (`ubuntu-24.04-arm`), each building and testing its own image, and
-uploads each as a workflow artifact
-(`pg-automerge-<version>-linux-<arch>.tar.gz`, under Actions > the run >
-Artifacts). To use one:
+uploads each image as a workflow artifact
+(`pg-automerge-<version>-linux-<arch>.tar.gz` and the CloudNativePG
+extension image's `pg-automerge-cnpg-<version>-18-trixie-linux-<arch>.tar.gz`,
+under Actions > the run > Artifacts). To use one:
 
 ```sh
 docker load -i pg-automerge-0.2.0-linux-arm64.tar.gz   # loads pg-automerge:0.2.0
@@ -93,7 +96,12 @@ Secrets and variables > Actions:
 |---|---|---|
 | Variable | `PG_AUTOMERGE_REGISTRY_IMAGE` | the image, registry host first, lower case: `ghcr.io/you/pg-automerge`, `docker.io/you/pg-automerge`, ... |
 | Variable | `PG_AUTOMERGE_REGISTRY_USERNAME` | the registry user |
-| Secret | `PG_AUTOMERGE_REGISTRY_TOKEN` | a token that may push to that image only (for ghcr.io a personal access token with `write:packages`; for Docker Hub an access token with Read & Write) |
+| Variable (optional) | `PG_AUTOMERGE_REGISTRY_CNPG_IMAGE` | the [CloudNativePG](../guide/cloudnativepg.mdx) extension image, on the same registry; default `<image>-cnpg`, e.g. `ghcr.io/you/pg-automerge-cnpg` |
+| Secret | `PG_AUTOMERGE_REGISTRY_TOKEN` | a token that may push to those two images only (for ghcr.io a personal access token with `write:packages`; for Docker Hub an access token with Read & Write) |
+
+The CNPG extension image is pushed as `<cnpg image>:<version>-18-trixie`,
+an index of `-amd64` and `-arm64`, with no `latest`, following CNPG's
+tag convention.
 
 It runs only for tags, only after both the `ci` and the `docker` jobs
 passed, and pushes exactly the archives those jobs tested
@@ -110,4 +118,7 @@ bash scripts/docker-archive.sh                     # pg-automerge-0.2.0-linux-am
 docker login ghcr.io
 bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.2.0-linux-*.tar.gz  # prints the image IDs and the pushes
 bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.2.0-linux-*.tar.gz
+# the CNPG extension image: its own repository, and --cnpg
+bash scripts/docker-archive.sh pg-automerge-cnpg:0.3.0-18-trixie   # pg-automerge-cnpg-0.3.0-18-trixie-linux-amd64.tar.gz
+bash scripts/docker-push.sh --cnpg ghcr.io/you/pg-automerge-cnpg pg-automerge-cnpg-0.3.0-18-trixie-linux-*.tar.gz
 ```

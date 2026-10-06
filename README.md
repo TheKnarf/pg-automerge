@@ -24,6 +24,7 @@ to GitHub Pages under `/pg-automerge/` by
   [Quick start](docs/src/pages/guide/quick-start.mdx),
   [Keeping backends in sync](docs/src/pages/guide/keeping-backends-in-sync.mdx),
   [Docker](docs/src/pages/guide/docker.mdx),
+  [CloudNativePG](docs/src/pages/guide/cloudnativepg.mdx),
   [Updating](docs/src/pages/guide/updating.mdx),
   [Development](docs/src/pages/guide/development.mdx).
 - Reference: [SQL API](docs/src/pages/reference/index.mdx),
@@ -53,6 +54,10 @@ extension, built locally ([Docker](docs/src/pages/guide/docker.mdx)):
 mise run docker-up           # build the image, start compose.yaml's Postgres
 psql postgres://postgres:postgres@localhost:5432/app
 ```
+
+On Kubernetes, [CloudNativePG](docs/src/pages/guide/cloudnativepg.mdx)
+mounts the extension-only image `pg-automerge-cnpg` (`mise run
+docker-build-cnpg`) into its own PostgreSQL 18 image.
 
 From source, with [mise](https://mise.jdx.dev)
 ([Install](docs/src/pages/guide/install.mdx)):

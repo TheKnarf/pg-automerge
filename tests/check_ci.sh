@@ -69,24 +69,57 @@ for v in $(sed -n 's/^[A-Z_]*=//p' <<<"$versions" | sort -u); do
   if grep -vE '^\s*#' "$df" | grep -qF "$v"; then fail "$df repeats the version $v (read it with scripts/versions.sh)"; fi
 done
 # One pinned base for every stage, so the builder's glibc and Postgres
-# headers are the runtime's.
+# headers are the runtime's; the one exception is the CNPG extension image,
+# FROM scratch (files only).
 grep -qE '^ARG PG_IMAGE=postgres:18-[a-z]+@sha256:[0-9a-f]{64}$' "$df" \
   || fail "$df: PG_IMAGE must be postgres:18-<debian>@sha256:<digest>"
-if grep -E '^FROM ' "$df" | grep -vqE '^FROM \$\{PG_IMAGE\} AS [a-z]+$'; then
-  fail "$df: every stage must be FROM \${PG_IMAGE}"
+if grep -E '^FROM ' "$df" | grep -vxE 'FROM scratch AS cnpg-extension' | grep -vqE '^FROM \$\{PG_IMAGE\} AS [a-z-]+$'; then
+  fail "$df: every stage but cnpg-extension (FROM scratch) must be FROM \${PG_IMAGE}"
 fi
+# The full image stays the default target: runtime is the last stage.
+[ "$(grep -E '^FROM ' "$df" | tail -1)" = 'FROM ${PG_IMAGE} AS runtime' ] || fail "$df: runtime must be the last (default) stage"
+# stage NAME: the lines of that stage, from its FROM to the next one.
+stage() { awk -v s="$1" '/^FROM / {p = ($NF == s)} p' "$df"; }
+runtime_stage="$(stage runtime)"; cnpg_stage="$(stage cnpg-extension)"; cnpg_files="$(stage cnpg-files)"
+[ -n "$cnpg_stage" ] && [ -n "$cnpg_files" ] || fail "$df: no cnpg-extension or cnpg-files stage"
+# The CNPG image: CNPG's layout (/lib, /share/extension) and the license,
+# nothing else: one COPY of the tree cnpg-files assembled and checked
+# (only the builder's /out and LICENSE go into it), its labels, and the
+# non-root user of CNPG's own extension images.
+[ "$(grep -E '^(COPY|ADD|RUN) ' <<<"$cnpg_stage")" = 'COPY --from=cnpg-files /cnpg/ /' ] \
+  || fail "$df: cnpg-extension must hold only COPY --from=cnpg-files /cnpg/ /"
+grep -qxF 'USER 65532:65532' <<<"$cnpg_stage" || fail "$df: cnpg-extension must end with USER 65532:65532"
+for l in org.opencontainers.image.version io.cloudnativepg.image.base.pgmajor io.cloudnativepg.image.base.os io.cloudnativepg.image.sql.version; do
+  grep -qF "$l=" <<<"$cnpg_stage" || fail "$df: cnpg-extension has no $l label"
+done
+[ "$(grep -E '^COPY ' <<<"$cnpg_files" | sed -E 's/ +/ /g')" = "$(printf '%s\n' \
+  'COPY --from=builder /out/lib/pg_automerge.so /cnpg/lib/' \
+  'COPY --from=builder /out/extension/ /cnpg/share/extension/' \
+  'COPY LICENSE /cnpg/licenses/pg_automerge/copyright')" ] || fail "$df: cnpg-files copies more or other than the library, extension files and license"
+grep -qF 'PG_DEBIAN" = "$VERSION_CODENAME"' <<<"$cnpg_files" || fail "$df: cnpg-files must check PG_DEBIAN against the base's Debian release"
+# The smoke test runs a digest-pinned CNPG operand image.
+grep -qE '^    \[trixie\]=ghcr\.io/cloudnative-pg/postgresql:18-minimal-trixie@sha256:[0-9a-f]{64}$' tests/cnpg_smoke.sh \
+  || fail "tests/cnpg_smoke.sh: pin the CNPG operand image by digest"
+for guc in "extension_control_path = '\\\$system:\$MOUNT/share'" "dynamic_library_path = '\\\$libdir:\$MOUNT/lib'"; do
+  grep -qxF "$guc" tests/cnpg_smoke.sh || fail "tests/cnpg_smoke.sh: set $guc, as CNPG does"
+done
+grep -qE '^MOUNT=/extensions/pg-automerge ' tests/cnpg_smoke.sh || fail "tests/cnpg_smoke.sh: mount at /extensions/pg-automerge, as CNPG does"
+grep -qF 'bash tests/cnpg_smoke.sh' tests/docker.sh || fail "tests/docker.sh must run tests/cnpg_smoke.sh"
+for t in docker-build-cnpg cnpg-smoke; do grep -qxF "[tasks.$t]" mise.toml || fail "mise.toml: no $t task"; done
 grep -qE '^COPY .*docker/initdb-pg-automerge.sh /docker-entrypoint-initdb.d/' "$df" || fail "$df: initdb script not installed"
 grep -qE '^COPY .*docker/initdb-pg-automerge.sh /usr/local/bin/pg-automerge-initdb$' "$df" \
   || fail "$df: initdb script not installed as /usr/local/bin/pg-automerge-initdb (for directory mounts)"
 grep -qE "^PGHOST='' PGHOSTADDR='' psql " docker/initdb-pg-automerge.sh \
   || fail "docker/initdb-pg-automerge.sh: clear PGHOST/PGHOSTADDR for psql, like the entrypoint's docker_process_sql"
-if grep -qE '^(ENTRYPOINT|CMD|USER|VOLUME) ' "$df"; then fail "$df: keep the official image's entrypoint, cmd, user and volume"; fi
+if grep -qE '^(ENTRYPOINT|CMD|VOLUME) ' "$df" || grep -qE '^USER ' <<<"$runtime_stage"; then
+  fail "$df: keep the official image's entrypoint, cmd, user and volume"
+fi
 # Everything COPY'd from the build context is let through .dockerignore.
 for src in $(grep -E '^COPY ' "$df" | grep -v -- '--from=' | sed -E 's/^COPY( --[a-z]+=[^ ]+)* //; s/ [^ ]+$//'); do
   [ "$src" = . ] && continue
   grep -qxF "!$src" .dockerignore || fail ".dockerignore does not let $src through (COPY in $df)"
 done
-for f in docker/initdb-pg-automerge.sh scripts/oci-source-url.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh; do
+for f in docker/initdb-pg-automerge.sh scripts/oci-source-url.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/cnpg_smoke.sh; do
   bash -n "$f" || fail "$f: syntax"
 done
 [ -x docker/initdb-pg-automerge.sh ] || fail "docker/initdb-pg-automerge.sh must be executable (the entrypoint sources non-executable scripts)"
@@ -125,7 +158,7 @@ command -v actionlint >/dev/null && command -v shellcheck >/dev/null \
   || fail "actionlint and shellcheck are needed (pinned in mise.toml: mise install)"
 docs_wf=.github/workflows/deploy-docs.yml
 actionlint "$wf" "$docs_wf" || fail "$wf, $docs_wf: actionlint"
-shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/docker_upgrade.sh \
+shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/docker_upgrade.sh tests/cnpg_smoke.sh \
   tests/soak.sh tests/soak/proc_sample.sh \
   docker/initdb-pg-automerge.sh || fail "shellcheck"
 
@@ -142,7 +175,10 @@ if has "$docker_job" '^    if:'; then fail "$wf: the docker job must run for eve
 has "$docker_job" "^        arch: .*startsWith\(github\.ref, 'refs/tags/'\).*'\[\"amd64\", \"arm64\"\]'.*'\[\"amd64\"\]'" \
   || fail "$wf: docker matrix must be amd64, plus arm64 on tags"
 has "$docker_job" "^    runs-on: .*'ubuntu-24.04-arm'" || fail "$wf: arm64 must build on the native arm64 runner"
-has "$docker_job" 'bash scripts/docker-build.sh -- --load ' || fail "$wf: build with scripts/docker-build.sh --load"
+has "$docker_job" 'bash scripts/docker-build.sh --full -- --load ' || fail "$wf: build the full image with scripts/docker-build.sh --full -- --load"
+has "$docker_job" 'bash scripts/docker-build.sh --cnpg -- --load ' || fail "$wf: build the CNPG image with scripts/docker-build.sh --cnpg -- --load"
+has "$docker_job" 'PG_AUTOMERGE_CNPG_IMAGE=\$cnpg" >>"\$GITHUB_ENV"' || fail "$wf: hand the CNPG image's tag to the later steps"
+has "$docker_job" 'bash scripts/docker-archive.sh "\$PG_AUTOMERGE_CNPG_IMAGE" dist' || fail "$wf: tags must save the CNPG image too"
 has "$docker_job" '--cache-from "type=gha,scope=pg-automerge-\$\{\{ matrix.arch \}\}"' || fail "$wf: cache-from type=gha per arch"
 has "$docker_job" '--cache-to "type=gha,scope=pg-automerge-\$\{\{ matrix.arch \}\},mode=max' || fail "$wf: cache-to type=gha,mode=max per arch"
 has "$docker_job" '^        run: bash tests/docker.sh$' || fail "$wf: the docker job must run tests/docker.sh"
@@ -162,6 +198,10 @@ gated=$(grep -cE "^        if: steps\.cfg\.outputs\.push == 'true'$" <<<"$publis
 [ "$gated" -eq $((steps - 1)) ] || fail "$wf: publish: $gated of $((steps - 1)) steps after the check are gated on it"
 outside="$(awk -v j="  publish:" '$0 == j {p=1} p && /^  [a-z]/ && $0 != j {p=0} !p' "$wf")"
 if has "$outside" 'docker/login-action|docker-push\.sh|docker push|imagetools'; then fail "$wf: pushing outside the publish job"; fi
+has "$publish_job" 'bash scripts/docker-push.sh "\$REGISTRY_IMAGE" dist/pg-automerge-\[0-9\]\*-linux-\*\.tar\.gz$' \
+  || fail "$wf: publish must push the full image archives (pg-automerge-[0-9]*) without --cnpg"
+has "$publish_job" 'bash scripts/docker-push.sh --cnpg .* dist/pg-automerge-cnpg-\*-linux-\*\.tar\.gz$' \
+  || fail "$wf: publish must push the CNPG archives with --cnpg"
 if grep -qE 'push: true|packages: write|write-all' "$wf"; then fail "$wf: no push: true or write permissions"; fi
 grep -qE '^permissions:$' "$wf" && grep -qE '^  contents: read$' "$wf" || fail "$wf: top-level permissions must be contents: read"
 

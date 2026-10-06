@@ -22,6 +22,15 @@ backend loads the new library, before the `UPDATE`. With compose, set a
 
 Added:
 
+- **CloudNativePG extension image** (`pg-automerge-cnpg:0.3.0-18-trixie`):
+  the extension's files in the layout of a CNPG image volume extension
+  (`FROM scratch`), built from the same compile as the full image by
+  `mise run docker-build` (or alone with `mise run docker-build-cnpg`).
+  List it in a `Cluster`'s `spec.postgresql.extensions` with a PostgreSQL 18
+  trixie operand (CNPG 1.27 or later, Kubernetes image volumes). It is
+  tested against CNPG's operand image by `tests/cnpg_smoke.sh`, and
+  archived and pushed by the release scripts (`--cnpg`). See
+  [CloudNativePG](docs/src/pages/guide/cloudnativepg.mdx).
 - **`automerge_memory_usage()`**: the memory pg_automerge holds in the
   current backend outside Postgres' memory contexts, which
   `pg_backend_memory_contexts` and `work_mem` do not see: bytes held now

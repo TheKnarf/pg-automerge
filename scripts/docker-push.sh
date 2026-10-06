@@ -17,20 +17,30 @@
 # REPOSITORY:latest, unless PG_AUTOMERGE_PUSH_LATEST=0) an index of the
 # per-architecture images. The caller must be logged in to the registry.
 #
+# --cnpg: the archives are CloudNativePG extension images
+# (pg-automerge-cnpg-<version>-18-<debian>-linux-<arch>.tar.gz), each also
+# checked for its io.cloudnativepg.image.base.os label, tagged
+# REPOSITORY:<version>-18-<debian>-<arch>, and indexed per Debian release as
+# REPOSITORY:<version>-18-<debian> (CNPG's tag convention; no latest).
+#
 # --dry-run: load and check everything, print the push and imagetools
 # commands instead of running them, and remove the tags it made (and an
 # image the load added that no tag refers to any more).
 #
-# Usage: docker-push.sh [--dry-run] REPOSITORY ARCHIVE...
+# Usage: docker-push.sh [--dry-run] [--cnpg] REPOSITORY ARCHIVE...
 #   REPOSITORY: fully qualified, registry host first, lower case, e.g.
-#   ghcr.io/you/pg-automerge or docker.io/you/pg-automerge.
+#   ghcr.io/you/pg-automerge or docker.io/you/pg-automerge (with --cnpg,
+#   e.g. ghcr.io/you/pg-automerge-cnpg).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail() { echo "docker-push.sh: $*" >&2; exit 1; }
 
-dry_run=0
-if [[ "${1:-}" == --dry-run ]]; then dry_run=1; shift; fi
-(($# >= 2)) || fail "usage: docker-push.sh [--dry-run] REPOSITORY ARCHIVE..."
+dry_run=0 cnpg=0
+while [[ "${1:-}" == --dry-run || "${1:-}" == --cnpg ]]; do
+    if [[ "$1" == --dry-run ]]; then dry_run=1; else cnpg=1; fi
+    shift
+done
+(($# >= 2)) || fail "usage: docker-push.sh [--dry-run] [--cnpg] REPOSITORY ARCHIVE..."
 repo="$1"; shift
 # A registry host (with a dot or port, or localhost) and a path: never a
 # bare name that Docker would silently send to Docker Hub.
@@ -68,14 +78,24 @@ cleanup() {
 trap cleanup EXIT
 
 seen=" "
+declare -A index_tags=()   # index tag -> the per-arch tags it is made of
 for archive in "$@"; do
     name="$(basename "$archive")"
-    [[ "$name" =~ ^pg-automerge-([0-9A-Za-z.+-]+)-linux-([a-z0-9]+)\.tar\.gz$ ]] \
-        || fail "$archive: not a pg-automerge-<version>-linux-<arch>.tar.gz archive"
+    debian=''
+    if ((cnpg)); then
+        [[ "$name" =~ ^pg-automerge-cnpg-([0-9A-Za-z.+-]+)-18-([a-z]+)-linux-([a-z0-9]+)\.tar\.gz$ ]] \
+            || fail "$archive: not a pg-automerge-cnpg-<version>-18-<debian>-linux-<arch>.tar.gz archive"
+        debian="${BASH_REMATCH[2]}"; arch="${BASH_REMATCH[3]}"
+    else
+        [[ "$name" != pg-automerge-cnpg-* ]] || fail "$archive: a CNPG extension image archive (push it with --cnpg)"
+        [[ "$name" =~ ^pg-automerge-([0-9A-Za-z.+-]+)-linux-([a-z0-9]+)\.tar\.gz$ ]] \
+            || fail "$archive: not a pg-automerge-<version>-linux-<arch>.tar.gz archive"
+        arch="${BASH_REMATCH[2]}"
+    fi
     [[ "${BASH_REMATCH[1]}" == "$version" ]] || fail "$archive: version ${BASH_REMATCH[1]}, Cargo.toml says $version"
-    arch="${BASH_REMATCH[2]}"
-    [[ "$seen" != *" $arch "* ]] || fail "two archives for $arch"
-    seen+="$arch "
+    key="${debian:+$debian/}$arch"
+    [[ "$seen" != *" $key "* ]] || fail "two archives for $key"
+    seen+="$key "
 
     # The tags in the archive, and what they point to now, to put back.
     archive_tags="$(tar -xzOf "$archive" manifest.json | jq -r '.[].RepoTags[]?')" \
@@ -95,13 +115,20 @@ for archive in "$@"; do
     [[ "$label" == "$version" ]] || fail "$archive: image version label '$label', expected $version"
     image_arch="$(docker image inspect -f '{{.Architecture}}' "$loaded")"
     [[ "$image_arch" == "$arch" ]] || fail "$archive: image architecture $image_arch, file name says $arch"
+    image_debian="$(docker image inspect -f '{{index .Config.Labels "io.cloudnativepg.image.base.os"}}' "$loaded")"
+    [[ "$image_debian" == "$debian" ]] || fail "$archive: image io.cloudnativepg.image.base.os label '$image_debian', expected '$debian'"
 
-    tag="$repo:$version-$arch"
+    if ((cnpg)); then index_tag="$repo:$version-18-$debian"; else index_tag="$repo:$version"; fi
+    tag="$index_tag-$arch"
     docker tag "$loaded" "$tag"
     tags+=("$tag")
+    index_tags[$index_tag]+=" $tag"
     run docker push "$tag"
 done
 
-index=(-t "$repo:$version")
-[[ "${PG_AUTOMERGE_PUSH_LATEST:-1}" == 0 ]] || index+=(-t "$repo:latest")
-run docker buildx imagetools create "${index[@]}" "${tags[@]}"
+for index_tag in $(printf '%s\n' "${!index_tags[@]}" | sort); do
+    index=(-t "$index_tag")
+    ((cnpg)) || [[ "${PG_AUTOMERGE_PUSH_LATEST:-1}" == 0 ]] || index+=(-t "$repo:latest")
+    # shellcheck disable=SC2086 # a word list of tags
+    run docker buildx imagetools create "${index[@]}" ${index_tags[$index_tag]}
+done

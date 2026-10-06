@@ -1,0 +1,172 @@
+---
+title: "CloudNativePG"
+section: Guide
+order: 65
+description: "Run pg_automerge on Kubernetes with CloudNativePG, as an image volume extension mounted into CNPG's own PostgreSQL 18 image."
+---
+
+[CloudNativePG](https://cloudnative-pg.io) (CNPG) can add an extension to a
+cluster without a custom PostgreSQL image. The extension ships as a small
+image that holds only its files. The operator mounts that image read-only
+into every instance pod and points PostgreSQL at it. CNPG calls these
+*image volume extensions*. The repository builds such an image next to
+the full [Docker](./docker.mdx) image, from the same compile:
+
+| Image | What it is | For |
+|---|---|---|
+| `pg-automerge:<version>` | the official `postgres:18` image plus the extension | `docker run`, compose, local development, small deployments |
+| `pg-automerge-cnpg:<version>-18-trixie` | the extension's files only, `FROM scratch` (it cannot be run) | a CNPG `Cluster`'s `spec.postgresql.extensions` |
+
+```sh
+mise run docker-build        # both images
+mise run docker-build-cnpg   # only pg-automerge-cnpg:0.3.0-18-trixie
+mise run cnpg-smoke          # build it, then test it in CNPG's PostgreSQL image (no Kubernetes)
+```
+
+The name and tag follow CNPG's own extension images (`<extension version>-<PostgreSQL major>-<Debian release>`,
+as in `pgvector:0.8.6-18-trixie`). The image has a repository of its own, so its
+tags never get mixed up with the runnable image's.
+
+## Requirements
+
+- **CloudNativePG 1.27 or later** (`spec.postgresql.extensions`). Defining
+  the extension in an image catalog needs 1.29 or later.
+- **Kubernetes with image volumes**: on by default from Kubernetes 1.35, and
+  stable from 1.36. On 1.33 and 1.34, enable the `ImageVolume` feature gate.
+  The nodes need containerd 2.1 or later, or CRI-O 1.31 or later. On a
+  managed service this depends on the provider's node images.
+- **A PostgreSQL 18 operand on Debian trixie, amd64 or arm64**, for example
+  `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie` or
+  `18-standard-trixie`. Both variants share one base, and the library
+  needs only `libc` and `libgcc_s`. The extension image must match the
+  cluster's PostgreSQL major version, Debian release and CPU architecture.
+
+**No bookworm.** A `-bookworm` operand cannot load the library: it is
+built on trixie, and needs `GLIBC_2.38`, which bookworm's glibc 2.36 does
+not have. `CREATE EXTENSION` fails with `version 'GLIBC_2.38' not found`.
+The image is not built for bookworm either: the builder installs Rust
+with Debian's `rustup` package, which bookworm does not have. Debian 12
+also reached its end of life in June 2026, and CNPG supports its bookworm
+images on a best-effort basis only.
+
+## A cluster with pg_automerge
+
+Push the image to a registry your cluster can pull from (see
+[publishing](../operations/docker-ci.mdx#publishing-the-image)), then
+list it in the `Cluster`. A `Database` resource can create the extension
+for you:
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: automerge
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie   # trixie, like the extension image
+  storage:
+    size: 10Gi
+  postgresql:
+    parameters:
+      pg_automerge.max_load_memory: "1GB"     # optional; see Configuration
+    extensions:
+      - name: pg-automerge                    # mounted at /extensions/pg-automerge
+        image:
+          reference: ghcr.io/you/pg-automerge-cnpg:0.3.0-18-trixie
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: automerge-app
+spec:
+  name: app
+  owner: app
+  cluster:
+    name: automerge
+  extensions:
+    - name: pg_automerge                      # the SQL name
+      version: "0.3.0"
+```
+
+For each entry, the operator adds an image volume and mounts it at
+`/extensions/<name>`. It also appends that path to two settings:
+
+```
+extension_control_path = '$system:/extensions/pg-automerge/share'
+dynamic_library_path   = '$libdir:/extensions/pg-automerge/lib'
+```
+
+PostgreSQL 18 finds `pg_automerge.control` and the SQL scripts through the
+first setting. It finds `pg_automerge.so` through the second, because the
+control file names the library without a directory
+(`module_pathname = 'pg_automerge'`). The extension needs no
+`shared_preload_libraries`.
+
+Mounting the image only makes the extension *available*. The `Database`
+resource above runs `CREATE EXTENSION pg_automerge` as the superuser (it
+is not trusted, see [Install](./install.mdx)). Without it, a superuser
+can run that command, for example through `kubectl cnpg psql automerge -- -d app`.
+The `app` owner cannot. To check that the image was resolved:
+
+```sh
+kubectl get cluster automerge -o jsonpath='{.status.pgDataImageInfo.extensions}'
+```
+
+The settings of [Configuration](../reference/configuration.mdx) go in
+`spec.postgresql.parameters`. CNPG accepts custom names with a dot, and a
+value set before the library loads applies once it loads. Size
+`pg_automerge.max_load_memory` to the pod's memory limit, as for a
+container ([Sizing memory](../operations/index.mdx#sizing-memory)).
+
+Pick the `name` once (`pg-automerge` above) and keep it. Renaming it moves
+the mount, which triggers a rolling update.
+
+**On kind** (or any cluster), you can use a locally built image without a
+registry. Run `kind load docker-image pg-automerge-cnpg:0.3.0-18-trixie`
+and set `pullPolicy: IfNotPresent` on the image. That is already the
+default for any tag but `latest`.
+
+## Updating
+
+1. Change `extensions[].image.reference` to the new tag. CNPG restarts the
+   instances one by one (image volumes are resolved when a pod starts).
+   Every image holds all the upgrade scripts, so any older version can
+   update.
+2. Bump `version` in the `Database` resource. The operator then runs
+   `ALTER EXTENSION pg_automerge UPDATE TO '<version>'`. Without a
+   `Database` resource, run `ALTER EXTENSION pg_automerge UPDATE` as a
+   superuser in every database that has the extension.
+
+Between the two steps the new library serves the old SQL definitions,
+exactly as after recreating a container ([Updating](./updating.mdx)). The
+[Changelog](../changelog.mdx) says whether a version needs more.
+
+To remove the extension, first set `ensure: absent` in the `Database`
+resource (or run `DROP EXTENSION`), then delete the `extensions` entry,
+which triggers a rolling update.
+
+## What is tested
+
+`tests/cnpg_smoke.sh` (`mise run cnpg-smoke`, and part of
+`mise run docker-test` and the CI `docker` job) needs no Kubernetes. It
+runs CNPG's pinned `18-minimal-trixie` operand image, mounts the extension
+image read-only at `/extensions/pg-automerge` (a Docker image mount,
+which is what an image volume is), and sets the two settings exactly as
+the operator writes them. It checks:
+
+- the image's labels and that it holds exactly CNPG's layout:
+  `/lib/pg_automerge.so`, the control file and SQL scripts in
+  `/share/extension`, and the license in `/licenses/pg_automerge`;
+- that the operand has no copy of its own;
+- that `CREATE EXTENSION` works for the superuser and is refused for a
+  plain role;
+- that the backend maps the library from the mount, and that a setting
+  given before the library loads applies;
+- merges, jsonb reads with a GIN index, `automerge_spans` and the upgrade
+  path;
+- that the server log shows no crash.
+
+What it does not cover is the operator itself: the instance manager, the
+`Database` reconciler and rolling updates.
+[Docker image](../design/docker-image.mdx#cloudnativepg-extension-image)
+has the packaging decisions.
