@@ -21,6 +21,7 @@ the full [Docker](./docker.mdx) image, from the same compile:
 mise run docker-build        # both images
 mise run docker-build-cnpg   # only pg-automerge-cnpg:0.3.0-18-trixie
 mise run cnpg-smoke          # build it, then test it in CNPG's PostgreSQL image (no Kubernetes)
+mise run cnpg-e2e            # build it, then test it with the CNPG operator on kind
 ```
 
 The name and tag follow CNPG's own extension images (`<extension version>-<PostgreSQL major>-<Debian release>`,
@@ -123,8 +124,8 @@ the mount, which triggers a rolling update.
 
 **On kind** (or any cluster), you can use a locally built image without a
 registry. Run `kind load docker-image pg-automerge-cnpg:0.3.0-18-trixie`
-and set `pullPolicy: IfNotPresent` on the image. That is already the
-default for any tag but `latest`.
+and set `pullPolicy: IfNotPresent` (already the default for any tag but
+`latest`) or `Never` on the image. `tests/cnpg_e2e.sh` does exactly that.
 
 ## Updating
 
@@ -166,7 +167,52 @@ the operator writes them. It checks:
   path;
 - that the server log shows no crash.
 
-What it does not cover is the operator itself: the instance manager, the
-`Database` reconciler and rolling updates.
+`tests/cnpg_e2e.sh` (`mise run cnpg-e2e`, and the CI `cnpg-e2e` job on
+the image the `docker` job built) covers the operator itself. It takes a
+few minutes and needs kind, so it is not part of `mise run ci` or
+`docker-test`. It creates a throwaway kind cluster (pinned kind and
+Kubernetes 1.36 node image), installs the pinned CNPG release (1.30.1),
+loads the images into the node (`kind load`, `pullPolicy: Never`, no
+registry), and walks the steps of this page:
+
+1. A `Cluster` on the same pinned operand, with an *older* extension
+   image in `spec.postgresql.extensions`: the image under test with the
+   previous release's SQL scripts and `default_version`, standing in for
+   that release's image. It checks the pod's image volume and
+   `status.pgDataImageInfo`, the two settings, the
+   `pg_automerge.max_load_memory` parameter, and that the `app` owner
+   cannot `CREATE EXTENSION`.
+2. A `Database` resource with that older `version`: the operator creates
+   the extension. Data is written, and the backend maps the library from
+   `/extensions/pg-automerge/lib`.
+3. The `Cluster`'s image changed to the image under test: the pod rolls
+   (a new pod with the new image volume), the data survives, and the
+   catalog stays at the old version with the update path found.
+4. The `Database`'s `version` bumped: the operator runs
+   `ALTER EXTENSION ... UPDATE TO`. Then merges, jsonb reads with a GIN
+   index, `automerge_spans` and `automerge_memory_usage()` on the regress
+   fixtures.
+5. Removal as described above: `ensure: absent` drops the extension, and
+   deleting the `extensions` entry rolls the pod without the image
+   volume. The server log shows no crash.
+
+kind's node runs as root of the Docker daemon, so its inotify instances
+count against root's `fs.inotify.max_user_instances`. kind asks for 512,
+and Debian's default is 128. Where root already uses most of them (a k3s
+on the same host, for example), kube-proxy and the operator crash-loop
+with `too many open files`, and the test prints that diagnosis. Raise the
+limit (`sudo sysctl -w fs.inotify.max_user_instances=512`), or run kind on
+a rootless Docker daemon of your own user, whose containers count against
+your user instead. `CNPG_E2E_DOCKER_HOST` points the test at it; the
+images are still built by the default daemon:
+
+```sh
+dockerd-rootless.sh --data-root ~/.local/share/docker-e2e \
+  -H unix://$XDG_RUNTIME_DIR/e2e/docker.sock &
+CNPG_E2E_DOCKER_HOST=unix://$XDG_RUNTIME_DIR/e2e/docker.sock mise run cnpg-e2e
+```
+
+Neither test covers more than one instance (replicas, switchover), image
+catalogs, or a managed Kubernetes service.
 [Docker image](../design/docker-image.mdx#cloudnativepg-extension-image)
 has the packaging decisions.

@@ -272,6 +272,22 @@ builds it after the full image (`--all`, the default of
   `cnpg-files` copies only the library, the extension files and the
   license, the labels are there, and the smoke test's operand is pinned by
   digest and its settings are CNPG's.
+- **Tested with the operator on kind.** `tests/cnpg_e2e.sh`
+  (`mise run cnpg-e2e`, the CI `cnpg-e2e` job) runs the real CNPG operator
+  (a pinned release, its manifest checked by sha256) in a throwaway kind
+  cluster (a digest-pinned Kubernetes 1.36 node, where image volumes are
+  stable) with the smoke test's operand. The images reach the node with
+  `kind load` and `pullPolicy: Never`, so no registry is involved. The
+  rolling update needs a second, different extension image, and no
+  earlier release had one, so the test builds a stand-in: the image under
+  test with the previous release's SQL snapshot
+  (`sql/snapshots/pg_automerge--<previous>.sql`) and `default_version`.
+  Its library is the current one, which the extension must accept anyway
+  between the roll and `ALTER EXTENSION UPDATE`, and which
+  `tests/upgrade.sh` already exercises. The test uses a kubeconfig of its
+  own and never touches another cluster. Its steps are listed in
+  [CloudNativePG](../guide/cloudnativepg.mdx#what-is-tested). It is not
+  part of `docker-test` or `mise run ci`: it takes minutes and needs kind.
 
 ## Docker image in CI
 

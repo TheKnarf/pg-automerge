@@ -28,6 +28,12 @@ extension image (`DOCKER_TEST_CNPG=0` skips it; see
 [CloudNativePG](../guide/cloudnativepg.mdx#what-is-tested)). It also checks the release scripts:
 `scripts/docker-archive.sh` and a `--dry-run` of `scripts/docker-push.sh`.
 
+`mise run cnpg-e2e` (not part of `docker-test`; the CI `cnpg-e2e` job runs
+it after the `docker` job, on the CNPG image that job built and saved, and
+publishing waits for it) tests the CNPG extension image with the real
+operator in a kind cluster; see
+[CloudNativePG](../guide/cloudnativepg.mdx#what-is-tested).
+
 `mise run docker-upgrade-test` (not part of `docker-test`) upgrades a
 0.1.0 deployment to the current version the way the [Updating](../guide/updating.mdx)
 section describes: a
@@ -103,7 +109,7 @@ The CNPG extension image is pushed as `<cnpg image>:<version>-18-trixie`,
 an index of `-amd64` and `-arm64`, with no `latest`, following CNPG's
 tag convention.
 
-It runs only for tags, only after both the `ci` and the `docker` jobs
+It runs only for tags, only after the `ci`, `docker` and `cnpg-e2e` jobs
 passed, and pushes exactly the archives those jobs tested
 (`scripts/docker-push.sh`, which checks each one's version and
 architecture first). Nothing else in the workflow logs in to a registry or

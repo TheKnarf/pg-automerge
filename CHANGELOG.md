@@ -28,7 +28,10 @@ Added:
   `mise run docker-build` (or alone with `mise run docker-build-cnpg`).
   List it in a `Cluster`'s `spec.postgresql.extensions` with a PostgreSQL 18
   trixie operand (CNPG 1.27 or later, Kubernetes image volumes). It is
-  tested against CNPG's operand image by `tests/cnpg_smoke.sh`, and
+  tested against CNPG's operand image by `tests/cnpg_smoke.sh`, with the
+  CNPG operator on kind by `tests/cnpg_e2e.sh` (`mise run cnpg-e2e`: the
+  `Database` resource's `CREATE EXTENSION` and `ALTER EXTENSION UPDATE`, a
+  rolling update to a new extension image, removal), and
   archived and pushed by the release scripts (`--cnpg`). See
   [CloudNativePG](docs/src/pages/guide/cloudnativepg.mdx).
 - **`automerge_memory_usage()`**: the memory pg_automerge holds in the

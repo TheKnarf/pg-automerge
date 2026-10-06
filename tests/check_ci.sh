@@ -105,7 +105,27 @@ for guc in "extension_control_path = '\\\$system:\$MOUNT/share'" "dynamic_librar
 done
 grep -qE '^MOUNT=/extensions/pg-automerge ' tests/cnpg_smoke.sh || fail "tests/cnpg_smoke.sh: mount at /extensions/pg-automerge, as CNPG does"
 grep -qF 'bash tests/cnpg_smoke.sh' tests/docker.sh || fail "tests/docker.sh must run tests/cnpg_smoke.sh"
-for t in docker-build-cnpg cnpg-smoke; do grep -qxF "[tasks.$t]" mise.toml || fail "mise.toml: no $t task"; done
+for t in docker-build-cnpg cnpg-smoke cnpg-e2e; do grep -qxF "[tasks.$t]" mise.toml || fail "mise.toml: no $t task"; done
+# The end-to-end test: the smoke test's operand, a digest-pinned kind node,
+# the operator's manifest checked by sha256, a kubeconfig of its own (never
+# the user's cluster), the images loaded into the node and never pulled;
+# kind and kubectl pinned; not part of ci (too heavy).
+smoke_operand="$(sed -nE 's/^    \[trixie\]=(.*)$/\1/p' tests/cnpg_smoke.sh)"
+[ -n "$smoke_operand" ] && grep -qxF "OPERAND=$smoke_operand" tests/cnpg_e2e.sh \
+  || fail "tests/cnpg_e2e.sh: OPERAND must be tests/cnpg_smoke.sh's trixie operand"
+grep -qE '^NODE_IMAGE="\$\{CNPG_E2E_NODE_IMAGE:-kindest/node:v[0-9.]+@sha256:[0-9a-f]{64}\}"$' tests/cnpg_e2e.sh \
+  || fail "tests/cnpg_e2e.sh: pin the kind node image by digest"
+grep -qE '^CNPG_MANIFEST_SHA256=[0-9a-f]{64}$' tests/cnpg_e2e.sh && grep -qF 'sha256sum -c' tests/cnpg_e2e.sh \
+  || fail "tests/cnpg_e2e.sh: check the operator manifest's sha256"
+grep -qxF 'export KUBECONFIG="$DWORK/kubeconfig"   # never the user'"'"'s own' tests/cnpg_e2e.sh \
+  || fail "tests/cnpg_e2e.sh: use a kubeconfig of its own"
+[ "$(grep -c '          pullPolicy: Never' tests/cnpg_e2e.sh)" = 1 ] || fail "tests/cnpg_e2e.sh: extension images pullPolicy: Never"
+for tool in '"aqua:kubernetes-sigs/kind" = "' 'kubectl = "'; do
+  grep -qE "^${tool}[0-9.]+\"$" mise.toml || fail "mise.toml: pin $tool"
+done
+if sed -n '/^\[tasks.ci\]/,/^\[/p' mise.toml | grep -q cnpg-e2e || grep -qF cnpg_e2e tests/docker.sh; then
+  fail "cnpg-e2e must not be part of mise run ci or docker-test"
+fi
 grep -qE '^COPY .*docker/initdb-pg-automerge.sh /docker-entrypoint-initdb.d/' "$df" || fail "$df: initdb script not installed"
 grep -qE '^COPY .*docker/initdb-pg-automerge.sh /usr/local/bin/pg-automerge-initdb$' "$df" \
   || fail "$df: initdb script not installed as /usr/local/bin/pg-automerge-initdb (for directory mounts)"
@@ -119,7 +139,7 @@ for src in $(grep -E '^COPY ' "$df" | grep -v -- '--from=' | sed -E 's/^COPY( --
   [ "$src" = . ] && continue
   grep -qxF "!$src" .dockerignore || fail ".dockerignore does not let $src through (COPY in $df)"
 done
-for f in docker/initdb-pg-automerge.sh scripts/oci-source-url.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/cnpg_smoke.sh; do
+for f in docker/initdb-pg-automerge.sh scripts/oci-source-url.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/cnpg_smoke.sh tests/cnpg_e2e.sh; do
   bash -n "$f" || fail "$f: syntax"
 done
 [ -x docker/initdb-pg-automerge.sh ] || fail "docker/initdb-pg-automerge.sh must be executable (the entrypoint sources non-executable scripts)"
@@ -158,14 +178,14 @@ command -v actionlint >/dev/null && command -v shellcheck >/dev/null \
   || fail "actionlint and shellcheck are needed (pinned in mise.toml: mise install)"
 docs_wf=.github/workflows/deploy-docs.yml
 actionlint "$wf" "$docs_wf" || fail "$wf, $docs_wf: actionlint"
-shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/docker_upgrade.sh tests/cnpg_smoke.sh \
+shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/docker_upgrade.sh tests/cnpg_smoke.sh tests/cnpg_e2e.sh \
   tests/soak.sh tests/soak/proc_sample.sh \
   docker/initdb-pg-automerge.sh || fail "shellcheck"
 
 # job NAME: the lines of that job (from "  NAME:" to the next job).
 job() { awk -v j="  $1:" '$0 == j {p=1; print; next} p && /^  [a-z]/ {exit} p' "$wf"; }
-for j in ci docs docker publish; do [ -n "$(job "$j")" ] || fail "$wf: no $j job"; done
-docker_job="$(job docker)"; publish_job="$(job publish)"
+for j in ci docs docker cnpg-e2e publish; do [ -n "$(job "$j")" ] || fail "$wf: no $j job"; done
+docker_job="$(job docker)"; publish_job="$(job publish)"; e2e_job="$(job cnpg-e2e)"
 has() { grep -qE -- "$2" <<<"$1"; }
 
 # docker: runs on every push and PR (no job-level if), amd64 always and
@@ -191,7 +211,16 @@ has "$docker_job" 'bash scripts/docker-archive.sh' || fail "$wf: tags must save 
 # and every step after the configuration check gated by it (so without
 # the secret nothing is pushed). Nothing else pushes or logs in.
 has "$publish_job" "^    if: startsWith\(github\.ref, 'refs/tags/'\)$" || fail "$wf: publish must be tags only"
-has "$publish_job" '^    needs: \[ci, docker\]$' || fail "$wf: publish must need ci and docker"
+has "$publish_job" '^    needs: \[ci, docker, cnpg-e2e\]$' || fail "$wf: publish must need ci, docker and cnpg-e2e"
+# cnpg-e2e: the docker job's own CNPG image (saved by it, every event),
+# tests/cnpg_e2e.sh with the pinned kind and kubectl.
+has "$e2e_job" '^    needs: docker$' || fail "$wf: cnpg-e2e must need docker"
+if has "$e2e_job" '^    if:'; then fail "$wf: the cnpg-e2e job must run for every event"; fi
+has "$docker_job" 'docker image save "\$PG_AUTOMERGE_CNPG_IMAGE" \| gzip >cnpg-e2e-image\.tar\.gz$' \
+  || fail "$wf: the docker job must save its CNPG image for cnpg-e2e"
+has "$e2e_job" '^          name: cnpg-e2e-image$' || fail "$wf: cnpg-e2e must download the docker job's CNPG image"
+has "$e2e_job" '^          install_args: aqua:kubernetes-sigs/kind kubectl$' || fail "$wf: cnpg-e2e installs kind and kubectl from mise.toml"
+has "$e2e_job" '^        run: bash tests/cnpg_e2e.sh$' || fail "$wf: cnpg-e2e must run tests/cnpg_e2e.sh"
 has "$publish_job" '^          if \[ -z "\$REGISTRY_TOKEN" \]; then$' || fail "$wf: publish must check the secret"
 steps=$(grep -cE '^      - ' <<<"$publish_job")
 gated=$(grep -cE "^        if: steps\.cfg\.outputs\.push == 'true'$" <<<"$publish_job")

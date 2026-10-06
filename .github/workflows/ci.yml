@@ -1,4 +1,4 @@
-# Three jobs on every push and pull request, in parallel:
+# Four jobs on every push and pull request (three in parallel):
 #   - ci: what `mise run ci` runs locally (lint, the docs site check, all
 #     test suites and the regress tests, against the pgrx-managed Postgres
 #     18); on tags also the release tarball.
@@ -10,6 +10,8 @@
 #     including the container variants of the multi-session suites and
 #     tests/cnpg_smoke.sh. On tags it runs on an amd64 and a native arm64
 #     runner and uploads each image as a workflow artifact.
+#   - cnpg-e2e (after docker): tests/cnpg_e2e.sh, the CNPG extension image
+#     with the real CloudNativePG operator in a kind cluster.
 # On tags, publish pushes those images to a registry, but only once one is
 # configured (docs/src/pages/operations/docker-ci.mdx, "Publishing the image"); until then it skips.
 name: CI
@@ -239,6 +241,22 @@ jobs:
           docker image ls pg-automerge
           docker image ls pg-automerge-cnpg
 
+      # For the cnpg-e2e job: the exact CNPG image this job built and
+      # tests (a few MB; `docker load` restores its tag).
+      - name: Save the CNPG extension image for cnpg-e2e (amd64)
+        if: matrix.arch == 'amd64'
+        run: docker image save "$PG_AUTOMERGE_CNPG_IMAGE" | gzip >cnpg-e2e-image.tar.gz
+
+      - name: Upload the CNPG extension image for cnpg-e2e (amd64)
+        if: matrix.arch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cnpg-e2e-image
+          path: cnpg-e2e-image.tar.gz
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
       - name: Test the image (tests/docker.sh)
         env:
           PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config
@@ -289,6 +307,38 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+  # tests/cnpg_e2e.sh (mise run cnpg-e2e) on the docker job's amd64 CNPG
+  # extension image: a kind cluster with the CloudNativePG operator, a
+  # Cluster mounting the image through spec.postgresql.extensions, the
+  # extension created and updated through a Database resource, a rolling
+  # update to a new extension image, removal. kind and kubectl as pinned in
+  # mise.toml; the runner's Docker runs the kind node.
+  cnpg-e2e:
+    needs: docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: aqua:kubernetes-sigs/kind kubectl
+          cache: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: cnpg-e2e-image
+
+      - name: Load the CNPG extension image
+        run: |
+          image="$(gunzip -c cnpg-e2e-image.tar.gz | docker image load | sed -n 's/^Loaded image: //p')"
+          echo "PG_AUTOMERGE_CNPG_IMAGE=$image" >>"$GITHUB_ENV"
+          rm cnpg-e2e-image.tar.gz
+          sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+
+      - name: End-to-end test with the CNPG operator (tests/cnpg_e2e.sh)
+        run: bash tests/cnpg_e2e.sh
+
   # Pushes the tested images of a tag, each as one multi-architecture
   # image: the full image and the CNPG extension image.
   # Prepared, not enabled: it does nothing until the repository has the
@@ -299,7 +349,7 @@ jobs:
   # docs/src/pages/operations/docker-ci.mdx, "Publishing the image".
   publish:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [ci, docker]
+    needs: [ci, docker, cnpg-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
