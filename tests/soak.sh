@@ -391,7 +391,7 @@ failed="$(sed -n 's/^number of failed transactions: \([0-9]*\).*/\1/p' "$OUT/pgb
 check "no failed transactions" $(( ${failed:-1} == 0 )) "${failed:-no summary}"
 check "no aborted client" "$(ok not grep -qiE 'client [0-9]+ aborted|Run was aborted' "$OUT/pgbench.out")"
 bad_log="$(grep -E 'ERROR:|FATAL:|PANIC:|TRAP:|panicked|terminated by signal|exited with exit code|memory allocation of' "$OUT/server.log" \
-    | grep -vE 'FATAL:  terminating connection due to administrator command|"logical replication launcher" \(PID [0-9]+\) exited with exit code 1|ERROR:  canceling autovacuum task' \
+    | grep -vE 'FATAL:  terminating connection due to administrator command|FATAL:  the database system is starting up|"logical replication launcher" \(PID [0-9]+\) exited with exit code 1|ERROR:  canceling autovacuum task' \
     | head -5 || true)"
 check "server log without errors or crashes" "$(ok [ -z "$bad_log" ])" "$bad_log"
 check "postmaster not restarted" "$(ok [ "$(q -c "SELECT pg_postmaster_start_time()")" = "$START_TIME" ])"
