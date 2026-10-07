@@ -13,7 +13,7 @@
 #      V equal to the current version, an empty V-snapshot--V script;
 #   2. CREATE EXTENSION pg_automerge VERSION 'V-snapshot', and what a
 #      deployed database has on it: a table with a STORED generated
-#      doc::jsonb column, GIN and B-tree expression indexes, a view and a
+#      doc::jsonb column, GIN and B-tree expression indexes, views and a
 #      SQL function over the extension's, an automerge_notify() trigger,
 #      and documents (plain, merged, rich text, a 2,000-level deep block);
 #      read them all (the old catalog on the new library, as between a new
@@ -24,22 +24,29 @@
 #      labels, symbols and ACLs, aggregates, types, casts, operators, the
 #      extension row) with a fresh CREATE EXTENSION of the current
 #      version, check the documents still read the same (bytes, heads, the
-#      cast, the generated column, the view, the SQL function), the indexes
-#      are valid, used and agree with a sequential scan, the trigger sends
-#      its notification, and automerge_spans and automerge_memory_usage
-#      work;
+#      cast, the generated column, the views, the SQL function), the
+#      indexes are valid, used and agree with a sequential scan, the
+#      trigger sends its notification, and automerge_spans and
+#      automerge_memory_usage work;
 #   4. the same update of an extension relocated (SET SCHEMA) before it:
-#      every member ends up in its schema; and, for a version without
-#      automerge_spans or automerge_memory_usage, that the update fails
-#      instead of adopting or replacing a user's function of the same
-#      signature in the extension's schema.
+#      every member ends up in its schema.
 #
 # The current version must have a snapshot, and every upgrade script must
 # be installed byte for byte as in sql/.
 #
-# So a SQL change without a new version and upgrade script fails here once
-# a snapshot of the current version exists, and a broken upgrade script
-# fails for the older versions.
+# So a SQL change without a new version and upgrade script fails here (the
+# current version's snapshot no longer matches a fresh install), and a
+# broken upgrade script fails for the older versions.
+#
+# Until the first upgrade script exists (0.1.0, the first release, is the
+# only version so far), the only snapshot is the current version's and
+# step 1 uses the empty script: the test then checks that the snapshot is
+# the build's catalog. Once a new version W adds sql/pg_automerge--0.1.0--W.sql
+# (and, at its release, sql/snapshots/pg_automerge--W.sql), the loop runs
+# the real update from 0.1.0. An upgrade script that adds an object should
+# also be checked against a user's object of the same name already in the
+# extension's schema (the update must fail, not adopt or replace it): add
+# that case here for the new object.
 #
 # Env: see tests/lib.sh.
 
@@ -91,17 +98,19 @@ sql_on "$DB_NEW" -c "$CATALOG_SQL" >"$WORK/catalog.new"
 grep -q '^depends ' "$WORK/catalog.new" || fail "no dependencies in the catalog listing"
 
 shopt -s nullglob
-# Released scripts, and variants of a released version's catalog that
-# exist in deployments (sql/snapshots/variants/pg_automerge--V+NAME.sql,
-# updated with V's upgrade scripts; see docs/src/pages/design/versioning.mdx).
-snapshots=(sql/snapshots/pg_automerge--*.sql sql/snapshots/variants/pg_automerge--*.sql)
+# Released versions' install scripts (see docs/src/pages/design/versioning.mdx).
+snapshots=(sql/snapshots/pg_automerge--*.sql)
 ((${#snapshots[@]})) || fail "no snapshots in sql/snapshots"
 [[ -e "sql/snapshots/pg_automerge--$CURRENT.sql" ]] \
     || fail "no snapshot of the current version $CURRENT (cargo pgrx schema pg18 -o sql/snapshots/pg_automerge--$CURRENT.sql)"
+upgrade_scripts=(sql/pg_automerge--*--*.sql)
+if ((${#upgrade_scripts[@]} == 0)); then
+    log "no upgrade scripts in sql/ yet: only the current version's snapshot is checked (an empty update to $CURRENT)"
+fi
 for snapshot in "${snapshots[@]}"; do
-    label="${snapshot##*/pg_automerge--}"
-    label="${label%.sql}"
-    version="${label%%+*}"
+    version="${snapshot##*/pg_automerge--}"
+    version="${version%.sql}"
+    label="$version"
     log "upgrading from $label (snapshot) to $CURRENT"
     old="$version-snapshot"
     cp "$snapshot" "$EXTDIR/pg_automerge--$old.sql"
@@ -143,14 +152,10 @@ CREATE TRIGGER docs_notify AFTER INSERT OR UPDATE OR DELETE ON docs
 INSERT INTO docs VALUES (1, :'base'), (2, :'a'), (3, merge(:'base'::automerge, :'inc'::bytea)),
                         (4, :'note'), (5, :'deep');
 SQL
-    # A catalog that already has automerge_spans: a view on it must
-    # survive the update (the functions are replaced in place).
-    spans_view=0
-    if grep -q 'automerge_spans' "$snapshot"; then
-        spans_view=1
-        sql -c "CREATE VIEW note_spans AS SELECT id, automerge_spans(doc, '{body}') AS s FROM docs WHERE id = 4"
-        spans_before="$(sql -c "SELECT md5(s::text) FROM note_spans")"
-    fi
+    # A view on automerge_spans must survive the update (an upgrade script
+    # that redefines a function keeps its OID: CREATE OR REPLACE).
+    sql -c "CREATE VIEW note_spans AS SELECT id, automerge_spans(doc, '{body}') AS s FROM docs WHERE id = 4"
+    spans_before="$(sql -c "SELECT md5(s::text) FROM note_spans")"
     # The old catalog runs on the new library until the UPDATE (a new
     # image started on the old volume): everything reads the same.
     before="$(sql -c "$FINGERPRINT_SQL")"
@@ -203,10 +208,8 @@ SQL
     [[ "$(sql -v p="$payload" -v h="$heads" <<<"SELECT concat_ws(' ', p->>'table', p->>'op', p->'key', p->'columns'->'doc'->'heads' = :'h'::jsonb) FROM (SELECT :'p'::jsonb AS p) s")" \
         == 'public.docs UPDATE {"id": 1} t' ]] || fail "$label: notification payload after the update: $payload"
 
-    if ((spans_view)); then
-        [[ "$(sql -c "SELECT md5(s::text) FROM note_spans")" == "$spans_before" ]] \
-            || fail "$label: a view on automerge_spans reads differently after the update"
-    fi
+    [[ "$(sql -c "SELECT md5(s::text) FROM note_spans")" == "$spans_before" ]] \
+        || fail "$label: a view on automerge_spans reads differently after the update"
 
     # The new functions work on the stored documents.
     [[ "$(sql -c "SELECT s->>'value' FROM docs, jsonb_array_elements(automerge_spans(doc, '{body}')) s WHERE id = 4 AND s->>'type' = 'text'" | tr '\n' '|')" \
@@ -217,7 +220,7 @@ SQL
         fail "$label: automerge_spans of the deep block did not fail"
     fi
     grep -q 'nested more than 32 levels deep' <<<"$out" || fail "$label: automerge_spans of the deep block: $out"
-    # The memory counters (0.3.0) count this session's loads.
+    # The memory counters count this session's loads.
     [[ "$(sql -c "SELECT count(*) FROM docs WHERE doc::jsonb IS NOT NULL" \
         -c "SELECT loads > 0 AND live_documents = 0 AND peak_allocated_bytes >= allocated_bytes FROM automerge_memory_usage()" | tail -1)" == t ]] \
         || fail "$label: automerge_memory_usage after the update"
@@ -243,35 +246,4 @@ SQL
         -c "SELECT am2.automerge_spans(''::bytea::am2.automerge, '{missing}') IS NULL" \
         -c "SELECT count(*) FROM am2.automerge_memory_usage()")"
     [[ "$out" == $'am2\nt\n1' ]] || fail "$label: relocated update: $out"
-
-    # A function of the new signature that already exists in the
-    # extension's schema is not adopted: the update fails and leaves the
-    # old version (CREATE OR REPLACE in an extension script refuses an
-    # object the extension does not own).
-    if ! grep -q 'automerge_spans' "$snapshot"; then
-        log "  $label: a user's automerge_spans in the extension's schema"
-        sql_on "$DB_REL" -c "DROP SCHEMA am1, am2 CASCADE" -c "CREATE EXTENSION pg_automerge VERSION '$old'" \
-            -c "CREATE FUNCTION automerge_spans(automerge, text[]) RETURNS jsonb LANGUAGE sql RETURN NULL::jsonb"
-        if out="$(sql_on "$DB_REL" -c "ALTER EXTENSION pg_automerge UPDATE" 2>&1)"; then
-            fail "$label: the update adopted a user's automerge_spans"
-        fi
-        grep -q 'is not a member of extension "pg_automerge"' <<<"$out" || fail "$label: update over a user's automerge_spans: $out"
-        [[ "$(sql_on "$DB_REL" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")" == "$old" ]] \
-            || fail "$label: a failed update changed the version"
-    fi
-    # The same for automerge_memory_usage (plain CREATE FUNCTION: the
-    # update fails on the existing function).
-    if ! grep -q 'automerge_memory_usage' "$snapshot"; then
-        log "  $label: a user's automerge_memory_usage in the extension's schema"
-        sql_on "$DB_REL" -c "DROP EXTENSION pg_automerge CASCADE" -c "DROP SCHEMA IF EXISTS am1, am2 CASCADE" \
-            -c "CREATE EXTENSION pg_automerge VERSION '$old'" \
-            -c "CREATE FUNCTION automerge_memory_usage() RETURNS TABLE (allocated_bytes bigint) LANGUAGE sql AS 'SELECT 0::bigint'"
-        if out="$(sql_on "$DB_REL" -c "ALTER EXTENSION pg_automerge UPDATE" 2>&1)"; then
-            fail "$label: the update replaced a user's automerge_memory_usage"
-        fi
-        grep -q 'function "automerge_memory_usage" already exists' <<<"$out" \
-            || fail "$label: update over a user's automerge_memory_usage: $out"
-        [[ "$(sql_on "$DB_REL" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")" == "$old" ]] \
-            || fail "$label: a failed update changed the version"
-    fi
 done

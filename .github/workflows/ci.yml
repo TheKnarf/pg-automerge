@@ -315,8 +315,8 @@ jobs:
   # tests/cnpg_e2e.sh (mise run cnpg-e2e) on the docker job's amd64 CNPG
   # extension image: a kind cluster with the CloudNativePG operator, a
   # Cluster mounting the image through spec.postgresql.extensions, the
-  # extension created and updated through a Database resource, a rolling
-  # update to a new extension image, removal. kind and kubectl as pinned in
+  # extension created through a Database resource, a rolling update to a
+  # rebuilt extension image of the same version, removal. kind and kubectl as pinned in
   # mise.toml; the runner's Docker runs the kind node. A few minutes and a
   # kind cluster, so not on every push and pull request (tests/cnpg_smoke.sh
   # in the docker job covers the image itself there): on tags (publish

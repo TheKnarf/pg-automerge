@@ -97,6 +97,17 @@ install_extension() {
     log "installing extension${1:+ ($*)}"
     cargo pgrx install --pg-config "$PG_CONFIG" "$@" >"$WORK/install.log" 2>&1 \
         || { cat "$WORK/install.log" >&2; fail "cargo pgrx install"; }
+    # cargo pgrx install adds files but never removes any: drop SQL scripts
+    # of earlier builds that are neither this version's install script nor
+    # an upgrade script in sql/, so the server sees only this build's
+    # versions and update paths.
+    local extdir version f
+    extdir="$("$PG_CONFIG" --sharedir)/extension"
+    version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+    for f in "$extdir"/pg_automerge--*.sql; do
+        [[ -e "$f" ]] || continue
+        [[ "${f##*/}" == "pg_automerge--$version.sql" || -e "sql/${f##*/}" ]] || rm -f "$f"
+    done
 }
 
 # Start the pgrx-managed Postgres unless one is already running on PORT;

@@ -1,81 +1,90 @@
 #!/usr/bin/env bash
-# Upgrade of a real 0.1.0 deployment to the current image (run via `mise
-# run docker-upgrade-test`, which builds the current image first). Not part
-# of `mise run test` or `mise run docker-test`: it needs a 0.1.0 image. See
-# the docs' "Updating" (docs/src/pages/guide/updating.mdx) and "Versioning
-# and upgrades" (docs/src/pages/design/versioning.mdx).
+# Upgrade of a real deployment of the previous release to the current image
+# (run via `mise run docker-upgrade-test`, which builds the current image
+# first). Not part of `mise run test` or `mise run docker-test`: it needs
+# the previous release's image. See the docs' "Updating"
+# (docs/src/pages/guide/updating.mdx) and "Versioning and upgrades"
+# (docs/src/pages/design/versioning.mdx).
 #
-# What an app on the 0.1.0 image does when it moves to this one:
+# The previous release OLD is the newest version with a snapshot in
+# sql/snapshots older than the current one. 0.1.0 is the first release, so
+# while it is the current version there is nothing to upgrade from and the
+# test says so and passes (skipped). Once a newer version exists (its
+# upgrade script sql/pg_automerge--0.1.0--<new>.sql, the Cargo.toml bump),
+# it rehearses the update from 0.1.0 with the 0.1.0 image:
+# PG_AUTOMERGE_OLD_IMAGE (e.g. the published ghcr.io/<owner>/pg-automerge:0.1.0,
+# or a local pg-automerge:0.1.0 kept from before the bump), or by default
+# one built from the release tag v<OLD> with that revision's own
+# scripts/docker-build.sh.
+#
+# What an app on the OLD image does when it moves to this one:
 #   1. a container of the OLD image on a fresh volume (labelled
 #      pg-automerge-test, like every container and volume here, all
-#      removed on exit): the init script creates pg_automerge 0.1.0 in
+#      removed on exit): the init script creates pg_automerge OLD in
 #      POSTGRES_DB; tables with automerge columns, a STORED generated
 #      doc::jsonb column, a GIN index on (doc::jsonb) and a B-tree one on
 #      (doc::jsonb ->> 'title'), a view, an automerge_notify() trigger, and
 #      documents (merged, rich text); the old image's install script must
-#      be sql/snapshots/pg_automerge--0.1.0.sql (the release) or a variant
-#      in sql/snapshots/variants (0.1.0+spans: images built from the
-#      development tree after automerge_spans, still labelled 0.1.0);
+#      be sql/snapshots/pg_automerge--OLD.sql (the same statements);
 #   2. stop it (the volume stays) and start the CURRENT image on the same
-#      volume: init is not re-run, the extension is still 0.1.0 (its
-#      catalog on the new library) and every document reads the same; the
-#      2,000-level deep block, which crashes the released 0.1.0 library in
-#      a generated doc::jsonb column, is stored fine already;
-#   3. ALTER EXTENSION pg_automerge UPDATE to the current version (0.1.0
-#      -> 0.2.0 -> ..., every script in one step); the documents, the view
-#      and the generated column read the same; the indexes are valid, used
-#      and agree with a sequential scan; the trigger sends its
-#      notification; automerge_spans works (54000 on the deep block), and
-#      so does automerge_memory_usage() (0.3.0); the
-#      extension's catalog (tests/catalog.sql) is that of a fresh CREATE
-#      EXTENSION in the same container; no server log shows a crash.
+#      volume: init is not re-run, the extension is still OLD (its catalog
+#      on the new library) and every document reads the same; the
+#      2,000-level deep block is stored through the generated column;
+#   3. ALTER EXTENSION pg_automerge UPDATE to the current version (every
+#      upgrade script from OLD in one step); the documents, the view and
+#      the generated column read the same; the indexes are valid, used and
+#      agree with a sequential scan; the trigger sends its notification;
+#      automerge_spans works (54000 on the deep block), and so does
+#      automerge_memory_usage(); the extension's catalog (tests/catalog.sql)
+#      is that of a fresh CREATE EXTENSION in the same container; no server
+#      log shows a crash.
 #
-# The compose steps of the docs' Updating page (the "From ... to <current> with compose"
-# section that names 0.1.0) are
-# followed as written: the cluster's superuser is not postgres (POSTGRES_USER
-# is the app's own, as in a typical app compose file, so there is no postgres role),
-# the pg_dump of step 1 and the psql commands of step 5 are read from the
-# page's MDX source ($UPDATING_PAGE) and run with `docker compose exec [-T]
-# postgres` as `docker exec -i`
-# on the container and <user>/<db> filled in; and a typical app service
-# (image: plus build: with args PG_AUTOMERGE_VERSION) is built with the old
-# version arg (the Dockerfile refuses it) and after step 3's edit (it
-# builds, reusing the cache of the image just built).
+# The compose steps of the docs' Updating page (its "With compose, step by
+# step" section) are followed as written: the cluster's superuser is not
+# postgres (POSTGRES_USER is the app's own, as in a typical app compose
+# file, so there is no postgres role), the pg_dump of step 1 and the psql
+# commands of step 5 are read from the page's MDX source ($UPDATING_PAGE)
+# and run with `docker compose exec [-T] postgres` as `docker exec -i` on
+# the container and <user>/<db>/<version> filled in; and a typical app
+# service (image: plus build: with args PG_AUTOMERGE_VERSION) is built with
+# the old version arg (the Dockerfile refuses it) and after step 3's edit
+# (it builds, reusing the cache of the image just built).
 #
 # Env: PG_AUTOMERGE_IMAGE (the new image, default
-# pg-automerge:<Cargo.toml version>), PG_AUTOMERGE_OLD_VERSION (the
-# version upgraded from: 0.1.0, the default, or 0.2.0; the steps are the
-# same, 0.1.0 is used as the example above), PG_AUTOMERGE_OLD_IMAGE (the
-# old image, a tag or an image ID; by default built from RELEASE_REV below
-# with that revision's own scripts/docker-build.sh, as
-# pg-automerge-test-old-<pid>:<old version>, removed on exit; needs the git
-# history).
+# pg-automerge:<Cargo.toml version>), PG_AUTOMERGE_OLD_VERSION (the version
+# upgraded from; default the previous release as above), PG_AUTOMERGE_OLD_IMAGE
+# (the old image, a tag or an image ID; by default built from the tag
+# v<old version>, as pg-automerge-test-old-<pid>:<old version>, removed on
+# exit; needs the tag in this clone).
 
 # shellcheck source=tests/docker_lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/docker_lib.sh"
 
-# The version upgraded from (PG_AUTOMERGE_OLD_VERSION, default 0.1.0) and
-# the commit its image is built from when PG_AUTOMERGE_OLD_IMAGE is unset.
-OLD_VERSION="${PG_AUTOMERGE_OLD_VERSION:-0.1.0}"
-case "$OLD_VERSION" in
-    # The last commit before automerge_spans: its SQL is 0.1.0's (the same
-    # statements as the snapshot; pgrx may order them differently).
-    0.1.0) RELEASE_REV=0918f56 ;;
-    # The 0.2.0 release and its upgrade docs.
-    0.2.0) RELEASE_REV=356a2f9 ;;
-    *) fail "PG_AUTOMERGE_OLD_VERSION=$OLD_VERSION: only 0.1.0 and 0.2.0 are known" ;;
-esac
-
 # Not postgres: an app's own POSTGRES_USER.
 PG_USER=appowner
+SKIPPED=
 
 on_exit() {
-    if [[ $1 == 0 ]]; then log "all docker upgrade checks passed"; else echo "docker upgrade test FAILED" >&2; fi
+    if [[ $1 == 0 && -n "$SKIPPED" ]]; then log "docker upgrade test skipped: $SKIPPED"
+    elif [[ $1 == 0 ]]; then log "all docker upgrade checks passed"
+    else echo "docker upgrade test FAILED" >&2; fi
 }
 
-[[ "$VERSION" != "$OLD_VERSION" ]] || fail "the current version is $OLD_VERSION: nothing to upgrade to"
+# The version upgraded from: the newest snapshot older than VERSION.
+OLD_VERSION="${PG_AUTOMERGE_OLD_VERSION:-$(for f in sql/snapshots/pg_automerge--*.sql; do
+    [[ -e "$f" ]] || continue; v="${f##*/pg_automerge--}"; v="${v%.sql}"
+    [[ "$v" == "$VERSION" ]] || echo "$v"; done | sort -V | tail -1)}"
+if [[ -z "$OLD_VERSION" ]]; then
+    SKIPPED="$VERSION is the first release: no older version in sql/snapshots to upgrade from"
+    exit 0
+fi
+[[ "$(printf '%s\n' "$OLD_VERSION" "$VERSION" | sort -V | head -1)" == "$OLD_VERSION" && "$OLD_VERSION" != "$VERSION" ]] \
+    || fail "PG_AUTOMERGE_OLD_VERSION=$OLD_VERSION is not older than the current version $VERSION"
 SNAPSHOT="sql/snapshots/pg_automerge--$OLD_VERSION.sql"
 [[ -e "$SNAPSHOT" ]] || fail "$SNAPSHOT missing"
+compgen -G "sql/pg_automerge--$OLD_VERSION--*.sql" >/dev/null || fail "no upgrade script from $OLD_VERSION in sql/"
+# The release tag the old image is built from when PG_AUTOMERGE_OLD_IMAGE is unset.
+RELEASE_REV="v$OLD_VERSION"
 
 BASE="\\x$(fixture base)"; ALICE="\\x$(fixture alice)"; BOB_CHANGES="\\x$(fixture bob_changes)"
 NOTE="\\x$(fixture note)"; DEEP_BLOCK="\\x$(fixture deep_block)"
@@ -87,7 +96,7 @@ OLD_IMAGE="${PG_AUTOMERGE_OLD_IMAGE:-}"
 if [[ -z "$OLD_IMAGE" ]]; then
     log "building the $OLD_VERSION image from $RELEASE_REV (set PG_AUTOMERGE_OLD_IMAGE to use an existing one)"
     git cat-file -e "$RELEASE_REV^{commit}" 2>/dev/null \
-        || fail "commit $RELEASE_REV is not in this clone (a shallow checkout?); set PG_AUTOMERGE_OLD_IMAGE"
+        || fail "$RELEASE_REV is not in this clone (a shallow checkout, or not released?); set PG_AUTOMERGE_OLD_IMAGE"
     mkdir "$DWORK/old-src"
     git archive "$RELEASE_REV" | tar -x -C "$DWORK/old-src"
     old_repo="pg-automerge-test-old-$$"
@@ -98,28 +107,22 @@ if [[ -z "$OLD_IMAGE" ]]; then
 fi
 docker image inspect "$OLD_IMAGE" >/dev/null 2>&1 || fail "old image $OLD_IMAGE not found"
 
-log "the old image ($OLD_IMAGE): version $OLD_VERSION, its install script a known $OLD_VERSION catalog"
+log "the old image ($OLD_IMAGE): version $OLD_VERSION, its install script the $OLD_VERSION snapshot"
 expect "old image version label" "$OLD_VERSION" \
     "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$OLD_IMAGE")"
 docker run --rm --label "$LABEL" --network none --entrypoint cat "$OLD_IMAGE" \
     "/usr/share/postgresql/18/extension/pg_automerge--$OLD_VERSION.sql" >"$DWORK/old.sql"
-# The released script, or a variant (sql/snapshots/variants): the same
-# statements, in pgrx's order of the day and with its source-line comments.
+# The released script: the same statements as the snapshot, in pgrx's
+# order of the day and with its source-line comments.
 statements() { grep -v '^-- src/' "$1" | sort; }
-known=""
-for f in "$SNAPSHOT" sql/snapshots/variants/pg_automerge--"$OLD_VERSION"+*.sql; do
-    [[ -e "$f" ]] || continue
-    if cmp -s <(statements "$DWORK/old.sql") <(statements "$f"); then known="$f"; break; fi
-done
-[[ -n "$known" ]] || fail "the old image's install script is none of the known $OLD_VERSION catalogs: $(diff "$SNAPSHOT" "$DWORK/old.sql" | head -20)"
-log "  its install script is $known"
-if grep -q automerge_spans "$DWORK/old.sql"; then OLD_HAS_SPANS=f; else OLD_HAS_SPANS=t; fi
+cmp -s <(statements "$DWORK/old.sql") <(statements "$SNAPSHOT") \
+    || fail "the old image's install script is not $SNAPSHOT: $(diff "$SNAPSHOT" "$DWORK/old.sql" | head -20)"
 
 # The Updating page's compose steps, as shell commands: [0] the pg_dump of step 1,
 # [1] the ALTER EXTENSION and [2] the version check of step 5.
 UPDATING_PAGE=docs/src/pages/guide/updating.mdx
-section="$(sed -n "/^\*\*From .*$OLD_VERSION.* to $VERSION with compose\*\*/,/^There is no downgrade script/p" "$UPDATING_PAGE")"
-[[ -n "$section" ]] || fail "$UPDATING_PAGE has no section \"From ... $OLD_VERSION ... to $VERSION with compose\""
+section="$(sed -n '/^\*\*With compose, step by step\*\*/,/^There is no downgrade script/p' "$UPDATING_PAGE")"
+[[ -n "$section" ]] || fail "$UPDATING_PAGE has no section \"With compose, step by step\""
 mapfile -t STEP_CMDS < <(grep -o 'docker compose exec [^`]*' <<<"$section")
 expect "Updating page compose commands" 3 "${#STEP_CMDS[@]}"
 # step_cmd NAME I: run STEP_CMDS[I] against container NAME, in DWORK.
@@ -127,7 +130,7 @@ step_cmd() {
     local cmd="${STEP_CMDS[$2]}"
     [[ "$cmd" =~ ^docker\ compose\ exec\ (-T\ )?postgres\  ]] || fail "Updating page command not of the form 'docker compose exec [-T] postgres ...': $cmd"
     cmd="docker exec -i $(cname "$1") ${cmd#"${BASH_REMATCH[0]}"}"
-    cmd="${cmd//<user>/$PG_USER}"; cmd="${cmd//<db>/app}"
+    cmd="${cmd//<user>/$PG_USER}"; cmd="${cmd//<db>/app}"; cmd="${cmd//<version>/$VERSION}"
     [[ "$cmd" != *'<'*'>'* ]] || fail "Updating page command with an unknown placeholder: $cmd"
     (cd "$DWORK" && eval "$cmd")
 }
@@ -199,11 +202,12 @@ log "new image ($IMAGE) on the same volume, before the UPDATE"
 start_ready new data
 C="$(cname new)"
 grep -q 'Skipping initialization' <<<"$(docker logs "$C" 2>&1)" || { docker logs "$C" >&2; fail "the new image re-ran init"; }
-expect "new, before UPDATE: extension version, automerge_spans absent" "$OLD_VERSION|$OLD_HAS_SPANS" \
-    "$(psql_in new app -c "SELECT extversion, to_regprocedure('automerge_spans(automerge,text[])') IS NULL FROM pg_extension WHERE extname = 'pg_automerge'")"
+expect "new, before UPDATE: extension version" "$OLD_VERSION" \
+    "$(psql_in new app -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")"
 expect "new, before UPDATE: documents" "$before" "$(psql_in new app -c "$FINGERPRINT")"
 # The library is the new one: the deep block is stored through the
-# generated column (the released 0.1.0 library crashes here).
+# generated column (a library without the deep-block fix crashed here; see
+# docs/src/pages/design/deep-blocks.mdx).
 psql_in new app -v deep="$DEEP_BLOCK" <<<"INSERT INTO docs VALUES (6, :'deep');"
 
 log "Updating step 5: ALTER EXTENSION pg_automerge UPDATE, as $PG_USER"

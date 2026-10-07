@@ -71,7 +71,7 @@ description = "pg_dump/pg_restore (plain and custom format) and COPY round trips
 run = "bash tests/dump.sh"
 
 [tasks.upgrade]
-description = "Install every released version's snapshot, ALTER EXTENSION UPDATE, compare the catalog with a fresh install (installs + starts the pgrx Postgres)"
+description = "Install every released version's snapshot (so far only the current version's), ALTER EXTENSION UPDATE, compare the catalog with a fresh install (installs + starts the pgrx Postgres)"
 run = "bash tests/upgrade.sh"
 
 [tasks.extension]
@@ -148,7 +148,7 @@ depends = ["docker-build-cnpg"]
 run = "bash tests/cnpg_smoke.sh"
 
 [tasks.cnpg-e2e]
-description = "Build the CloudNativePG extension image, then test it with the real operator in a throwaway kind cluster (pinned kind, Kubernetes 1.36 node, CNPG operator, CNPG's PostgreSQL 18 operand): a Cluster with the image in spec.postgresql.extensions, CREATE EXTENSION and ALTER EXTENSION UPDATE through a Database resource, a rolling update to a new extension image, SQL on the regress fixtures, removal; CNPG_E2E_DOCKER_HOST runs kind on another Docker daemon (see tests/cnpg_e2e.sh); not part of ci or docker-test"
+description = "Build the CloudNativePG extension image, then test it with the real operator in a throwaway kind cluster (pinned kind, Kubernetes 1.36 node, CNPG operator, CNPG's PostgreSQL 18 operand): a Cluster with the image in spec.postgresql.extensions, CREATE EXTENSION through a Database resource, a rolling update to a rebuilt extension image of the same version, SQL on the regress fixtures, removal; CNPG_E2E_DOCKER_HOST runs kind on another Docker daemon (see tests/cnpg_e2e.sh); not part of ci or docker-test"
 depends = ["docker-build-cnpg"]
 run = "bash tests/cnpg_e2e.sh"
 
@@ -163,7 +163,7 @@ depends = ["docker-build"]
 run = "bash tests/soak.sh"
 
 [tasks.docker-upgrade-test]
-description = "Upgrade a 0.1.0 (or, with PG_AUTOMERGE_OLD_VERSION=0.2.0, a 0.2.0) deployment to the current image: an old container (PG_AUTOMERGE_OLD_IMAGE, or built from the release revision) with tables, a generated doc::jsonb column, indexes, a notify trigger and data; the new image on the same volume, following the compose steps of docs/src/pages/guide/updating.mdx (a non-postgres superuser, that page's pg_dump and psql commands, a service build: with the version arg); ALTER EXTENSION pg_automerge UPDATE; data, indexes, trigger, automerge_spans and the catalog checked; not part of test or docker-test"
+description = "Upgrade a deployment of the previous release (the newest older snapshot in sql/snapshots, or PG_AUTOMERGE_OLD_VERSION; skipped while the current version is the first release, 0.1.0) to the current image: an old container (PG_AUTOMERGE_OLD_IMAGE, or built from the release tag v<old version>) with tables, a generated doc::jsonb column, indexes, a notify trigger and data; the new image on the same volume, following the compose steps of docs/src/pages/guide/updating.mdx (a non-postgres superuser, that page's pg_dump and psql commands, a service build: with the version arg); ALTER EXTENSION pg_automerge UPDATE; data, indexes, trigger, automerge_spans and the catalog checked; not part of test or docker-test"
 depends = ["docker-build"]
 run = "bash tests/docker_upgrade.sh"
 

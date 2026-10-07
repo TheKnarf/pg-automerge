@@ -15,7 +15,9 @@
 #     file and SQL scripts in /share/extension, the license), root-owned,
 #     readable by everyone;
 #   - the operand has no pg_automerge of its own; the mounted one is
-#     available at the crate version with its upgrade path from 0.1.0;
+#     available at the crate version, with exactly the versions of its
+#     scripts (the install script and sql/'s upgrade scripts) and an
+#     update path from each older one to the current version;
 #   - CREATE EXTENSION as the superuser (a plain role is refused: not
 #     trusted), the backend maps the library from the image volume, a
 #     setting given in postgresql.conf before the library loads applies
@@ -144,16 +146,25 @@ docker exec "$C" bash -euc "
     ! touch $MOUNT/lib/x 2>/dev/null
 " || fail "operand: no pg_automerge of its own, the mounted one readable and read-only"
 
+# The versions the image's scripts name: the install script's and both
+# ends of every upgrade script in sql/ (none before the first upgrade).
+versions="$( { echo "$VERSION"
+    for f in sql/pg_automerge--*--*.sql; do
+        if [[ -e "$f" ]]; then f="${f##*/pg_automerge--}"; f="${f%.sql}"; echo "${f%%--*}"; echo "${f##*--}"; fi
+    done; } | LC_ALL=C sort -u | paste -sd, -)"
 out="$(psql_in cnpg app -v version="$VERSION" <<'SQL'
 SHOW extension_control_path;
 SHOW dynamic_library_path;
 SELECT default_version, installed_version IS NULL FROM pg_available_extensions WHERE name = 'pg_automerge';
--- The upgrade scripts are found next to the control file.
-SELECT path IS NOT NULL FROM pg_extension_update_paths('pg_automerge') WHERE source = '0.1.0' AND target = :'version';
+-- The scripts are found next to the control file: every version, and an
+-- update path from each older one.
+SELECT string_agg(v, ',' ORDER BY v COLLATE "C") FROM (SELECT source FROM pg_extension_update_paths('pg_automerge')
+    UNION SELECT target FROM pg_extension_update_paths('pg_automerge') UNION SELECT :'version') s(v);
+SELECT coalesce(bool_and(path IS NOT NULL), true) FROM pg_extension_update_paths('pg_automerge') WHERE target = :'version' AND source <> :'version';
 SQL
 )" || fail "available extensions: $out"
 expect "extension available from the mount" \
-    "$(printf '%s\n' "\$system:$MOUNT/share" "\$libdir:$MOUNT/lib" "$VERSION|t" t)" "$out"
+    "$(printf '%s\n' "\$system:$MOUNT/share" "\$libdir:$MOUNT/lib" "$VERSION|t" "$versions" t)" "$out"
 
 log "CREATE EXTENSION: refused for a plain role, then as the superuser"
 if out="$(psql_in cnpg app -c 'CREATE ROLE app LOGIN' -c 'SET ROLE app' -c 'CREATE EXTENSION pg_automerge' 2>&1)"; then

@@ -46,10 +46,11 @@
 #     trigger restored;
 #   - a restart on the same volume keeps the data and does not re-run init;
 #     ALTER EXTENSION pg_automerge UPDATE is a no-op at the current version;
-#   - the upgrade path in the image: every sql/snapshots version (and
-#     variant, sql/snapshots/variants) installed
+#   - the upgrade path in the image: every sql/snapshots version installed
 #     under a scratch name with the image's upgrade scripts, documents
-#     stored, ALTER EXTENSION UPDATE to the current version, same data;
+#     stored, ALTER EXTENSION UPDATE to the current version, same data
+#     (until there is an upgrade script, only the current version's
+#     snapshot with an empty update);
 #   - PG_AUTOMERGE_CREATE_EXTENSION=0 skips the extension (and it can then
 #     be created by hand into a schema); an invalid value fails init;
 #   - PGHOST/PGHOSTADDR in the container's environment do not break init,
@@ -400,7 +401,7 @@ expect "data after restart" "Groceries for Sunday|eggs" "$(psql_in restart app -
 psql_in restart app -c 'SET client_min_messages = warning' -c 'ALTER EXTENSION pg_automerge UPDATE'
 expect "version after UPDATE" "$VERSION" "$(psql_in restart app -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'")"
 
-log "upgrade path in the image: each sql/snapshots version and variant, ALTER EXTENSION UPDATE with the image's scripts"
+log "upgrade path in the image: each sql/snapshots version, ALTER EXTENSION UPDATE with the image's scripts"
 # As tests/upgrade.sh does against pgrx's Postgres: install the snapshot
 # under the version name "V-snapshot", plus the first hop of each upgrade
 # path from V that the image ships (renamed to start at V-snapshot), or an
@@ -409,9 +410,9 @@ log "upgrade path in the image: each sql/snapshots version and variant, ALTER EX
 EXTDIR=/usr/share/postgresql/18/extension
 DOCS_FINGERPRINT="$(head -1 <<<"$FINGERPRINT")"
 n=0
-for snapshot in sql/snapshots/pg_automerge--*.sql sql/snapshots/variants/pg_automerge--*.sql; do
+for snapshot in sql/snapshots/pg_automerge--*.sql; do
     [[ -e "$snapshot" ]] || continue
-    v="${snapshot##*/pg_automerge--}"; v="${v%.sql}"; v="${v%%+*}"; old="$v-snapshot"; n=$((n + 1))
+    v="${snapshot##*/pg_automerge--}"; v="${v%.sql}"; old="$v-snapshot"; n=$((n + 1))
     docker cp -q "$snapshot" "$C2:$EXTDIR/pg_automerge--$old.sql"
     if [[ "$v" == "$VERSION" ]]; then
         docker exec "$C2" sh -c ": >'$EXTDIR/pg_automerge--$old--$VERSION.sql'"

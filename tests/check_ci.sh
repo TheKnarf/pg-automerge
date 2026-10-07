@@ -298,7 +298,7 @@ stale="$(git grep -lE '(docs/)?DESIGN\.md' -- ':!docs/Readme.md' || true)"
 # tests/docker_upgrade.sh runs the compose commands of the Updating page.
 grep -qxF 'UPDATING_PAGE=docs/src/pages/guide/updating.mdx' tests/docker_upgrade.sh \
   || fail "tests/docker_upgrade.sh must read the Updating page's commands"
-grep -qE '^\*\*From .* to [0-9.]+ with compose\*\*' docs/src/pages/guide/updating.mdx \
-  || fail "docs/src/pages/guide/updating.mdx: no **From ... to <version> with compose** steps"
+grep -qxF '**With compose, step by step**' docs/src/pages/guide/updating.mdx \
+  || fail "docs/src/pages/guide/updating.mdx: no **With compose, step by step** section"
 
 echo "check_ci: docs ok"

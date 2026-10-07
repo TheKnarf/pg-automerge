@@ -9,26 +9,35 @@
 # docker-test (minutes, and it needs kind).
 #
 # It walks the life cycle docs/src/pages/guide/cloudnativepg.mdx describes:
-#   1. the Cluster mounts an "old" extension image: the image under test
-#      with the previous release's SQL (sql/snapshots/pg_automerge--OLD.sql,
-#      the control file's default_version OLD; the same library), standing
-#      in for that release's image, which was never built;
+#   1. the Cluster mounts the image under test;
 #   2. a Database resource with extensions: [{name: pg_automerge, version:
-#      OLD}]: the operator runs CREATE EXTENSION; the settings the operator
-#      writes (SHOW extension_control_path, dynamic_library_path), the
-#      library mapped from the image volume, a spec.postgresql.parameters
+#      <version>}]: the operator runs CREATE EXTENSION; the settings the
+#      operator writes (SHOW extension_control_path, dynamic_library_path),
+#      the library mapped from the image volume, a spec.postgresql.parameters
 #      setting of the extension, the app role refused CREATE EXTENSION,
 #      data written;
-#   3. the Cluster's extension image changed to the image under test: the
-#      pod rolls (a new pod, its image volume the new reference, the
-#      Cluster's status.pgDataImageInfo too), the data survives, the
-#      catalog is still OLD with the update path to the new version found;
-#   4. the Database's version bumped: the operator runs ALTER EXTENSION
-#      UPDATE TO it; then merge, jsonb reads with a GIN index,
-#      automerge_spans, automerge_memory_usage() on the regress fixtures;
-#   5. removal: ensure: absent drops the extension, deleting the
+#   3. the Cluster's extension image changed to a rebuild of the same
+#      version under another tag (the image under test with one more label,
+#      as a rebuilt image on a new base would be): the pod rolls (a new pod,
+#      its image volume the new reference, the Cluster's
+#      status.pgDataImageInfo too), the data survives, the extension is
+#      still at the version and works: merge, jsonb reads with a GIN index,
+#      automerge_spans, automerge_memory_usage() on the regress fixtures,
+#      ALTER EXTENSION UPDATE a no-op;
+#   4. removal: ensure: absent drops the extension, deleting the
 #      extensions entry rolls the pod without the image volume;
 #   and the server log has no crash.
+#
+# A new version (once there is one after 0.1.0, the first release) is
+# rolled out the same way, followed by the Database's version bumped to it:
+# the operator then runs ALTER EXTENSION pg_automerge UPDATE TO it (the
+# Updating section of docs/src/pages/guide/cloudnativepg.mdx). To test that
+# path, start the Cluster on the previous release's image (e.g.
+# pg-automerge-cnpg:0.1.0-18-trixie, published or kept from before the
+# bump) with that version in the Database, roll to the image under test as
+# step 3 does, then apply database_yaml "$VERSION" present and wait for
+# ext_is "$VERSION"; tests/upgrade.sh and tests/docker_upgrade.sh check the
+# upgraded catalog itself.
 #
 # Images reach the node with `kind load image-archive` (no registry): the
 # extensions entries say pullPolicy: Never. The node pulls the operator and
@@ -224,38 +233,19 @@ rolled() {
 }
 
 # ---------------------------------------------------------------------------
-# The previous release: the version the upgrade script to VERSION starts at.
-old_script=(sql/pg_automerge--*--"$VERSION".sql)
-[[ -e "${old_script[0]}" ]] || fail "no upgrade script to $VERSION in sql/"
-OLD="$(basename "${old_script[0]}" .sql)"; OLD="${OLD#pg_automerge--}"; OLD="${OLD%--*}"
-[[ -f "sql/snapshots/pg_automerge--$OLD.sql" ]] || fail "no snapshot sql/snapshots/pg_automerge--$OLD.sql"
 DEBIAN="$(docker image inspect -f '{{index .Config.Labels "io.cloudnativepg.image.base.os"}}' "$IMAGE")"
 [[ "$DEBIAN" == trixie ]] || fail "$IMAGE is for Debian '$DEBIAN'; the pinned operand is trixie"
+expect "$IMAGE: SQL version label" "$VERSION" \
+    "$(docker image inspect -f '{{index .Config.Labels "io.cloudnativepg.image.sql.version"}}' "$IMAGE")"
 
-log "the $OLD extension image: $IMAGE's library and license, $OLD's SQL"
-files="$(cname files)"
-docker create --label "$LABEL" --name "$files" "$IMAGE" /none >/dev/null; CONTAINERS+=("$files")
-mkdir -p "$DWORK/old/share/extension"
-docker cp "$files:/lib" "$DWORK/old/" >/dev/null
-docker cp "$files:/licenses" "$DWORK/old/" >/dev/null
-docker cp "$files:/share/extension/pg_automerge.control" "$DWORK/old/share/extension/" >/dev/null
-docker rm "$files" >/dev/null
-sed -i "s/^default_version = .*/default_version = '$OLD'/" "$DWORK/old/share/extension/pg_automerge.control"
-cp "sql/snapshots/pg_automerge--$OLD.sql" "$DWORK/old/share/extension/"
-for f in sql/pg_automerge--*--*.sql; do
-    [[ "$f" == "${old_script[0]}" ]] || cp "$f" "$DWORK/old/share/extension/"
-done
-chmod -R a+rX,go-w "$DWORK/old"
-cat >"$DWORK/old.Dockerfile" <<EOF
-FROM scratch
-COPY old/ /
-LABEL org.opencontainers.image.version="$OLD" io.cloudnativepg.image.sql.version="$OLD" io.cloudnativepg.image.base.os="$DEBIAN"
-USER 65532:65532
-EOF
-OLD_IMAGE="pg-automerge-cnpg:$OLD-$PROJECT-18-$DEBIAN"
-docker buildx build -q --load --label "$LABEL" -f "$DWORK/old.Dockerfile" -t "$OLD_IMAGE" "$DWORK" >/dev/null
-IMAGES+=("$OLD_IMAGE")
-NEW_REF="$(node_ref "$IMAGE")"; OLD_REF="$(node_ref "$OLD_IMAGE")"
+log "a rebuild of $IMAGE under another tag (the same version and files, one more label)"
+printf 'FROM %s\nLABEL io.pg-automerge.test.rebuild="%s"\n' "$IMAGE" "$PROJECT" >"$DWORK/rebuild.Dockerfile"
+REBUILT_IMAGE="pg-automerge-cnpg:$VERSION-rebuilt-$PROJECT-18-$DEBIAN"
+docker buildx build -q --load --label "$LABEL" -f "$DWORK/rebuild.Dockerfile" -t "$REBUILT_IMAGE" "$DWORK" >/dev/null
+IMAGES+=("$REBUILT_IMAGE")
+[[ "$(docker image inspect -f '{{.Id}}' "$IMAGE")" != "$(docker image inspect -f '{{.Id}}' "$REBUILT_IMAGE")" ]] \
+    || fail "the rebuilt image is the same image"
+NEW_REF="$(node_ref "$IMAGE")"; REBUILT_REF="$(node_ref "$REBUILT_IMAGE")"
 
 # ---------------------------------------------------------------------------
 log "kind cluster $KIND_CLUSTER on $NODE_IMAGE${KIND_DOCKER_HOST:+ (Docker at $KIND_DOCKER_HOST)}"
@@ -274,8 +264,8 @@ kdocker kind create cluster --name "$KIND_CLUSTER" --image "$NODE_IMAGE" --confi
     --kubeconfig "$KUBECONFIG" --wait 180s >/dev/null 2>"$DWORK/kind.log" || { cat "$DWORK/kind.log" >&2; fail "kind create cluster"; }
 k version -o json | jq -r '"server " + .serverVersion.gitVersion'
 
-log "load $IMAGE and $OLD_IMAGE into the node"
-docker image save "$IMAGE" "$OLD_IMAGE" -o "$DWORK/images.tar"
+log "load $IMAGE and $REBUILT_IMAGE into the node"
+docker image save "$IMAGE" "$REBUILT_IMAGE" -o "$DWORK/images.tar"
 kdocker kind load image-archive "$DWORK/images.tar" --name "$KIND_CLUSTER" >/dev/null
 rm -f "$DWORK/images.tar"
 
@@ -293,18 +283,18 @@ until [[ "$(k -n cnpg-system get deploy/cnpg-controller-manager \
     sleep 5
 done
 
-log "Cluster $PGC with the $OLD extension image"
+log "Cluster $PGC with the extension image $IMAGE"
 # The webhook may take a moment after the deployment is available.
-wait_until "the CNPG webhook to accept the Cluster" 120 apply cluster cluster_yaml "$OLD_REF"
+wait_until "the CNPG webhook to accept the Cluster" 120 apply cluster cluster_yaml "$NEW_REF"
 wait_until "Cluster $PGC Ready" 600 k -n "$NS" wait --for=condition=Ready "cluster/$PGC" --timeout=10s
-expect "pod image volume" "$OLD_REF" "$(pod_ext_ref)"
-expect "status.pgDataImageInfo.extensions" "$OLD_REF" "$(status_ext_ref)"
+expect "pod image volume" "$NEW_REF" "$(pod_ext_ref)"
+expect "status.pgDataImageInfo.extensions" "$NEW_REF" "$(status_ext_ref)"
 # The operand ships no pg_automerge of its own.
 k -n "$NS" exec "$(primary)" -c postgres -- bash -c \
     '! ls /usr/lib/postgresql/18/lib/pg_automerge* /usr/share/postgresql/18/extension/pg_automerge* 2>/dev/null' \
     || fail "the operand has its own pg_automerge"
 expect "the settings CNPG writes" \
-    "$(printf '%s\n' "\$system:/extensions/$EXT/share" "\$libdir:/extensions/$EXT/lib" 1GB "$OLD|t" none)" \
+    "$(printf '%s\n' "\$system:/extensions/$EXT/share" "\$libdir:/extensions/$EXT/lib" 1GB "$VERSION|t" none)" \
     "$(pg -c 'SHOW extension_control_path' -c 'SHOW dynamic_library_path' -c 'SHOW pg_automerge.max_load_memory' \
         -c "SELECT default_version, installed_version IS NULL FROM pg_available_extensions WHERE name = 'pg_automerge'" \
         -c "SELECT coalesce((SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'), 'none')")"
@@ -313,9 +303,9 @@ log "the app role cannot CREATE EXTENSION (not trusted)"
 if out="$(pg -c 'SET ROLE app' -c 'CREATE EXTENSION pg_automerge' 2>&1)"; then fail "the app role created the extension"; fi
 grep -q 'permission denied to create extension' <<<"$out" || fail "app role: $out"
 
-log "Database resource: extension pg_automerge $OLD (the operator runs CREATE EXTENSION)"
-wait_until "the CNPG webhook to accept the Database" 60 apply database database_yaml "$OLD" present
-wait_until "pg_automerge $OLD in database app" 180 ext_is "$OLD"
+log "Database resource: extension pg_automerge $VERSION (the operator runs CREATE EXTENSION)"
+wait_until "the CNPG webhook to accept the Database" 60 apply database database_yaml "$VERSION" present
+wait_until "pg_automerge $VERSION in database app" 180 ext_is "$VERSION"
 wait_until "the Database applied" 60 db_applied
 
 BASE="$(fixture base)"; ALICE="$(fixture alice)"; BOB="$(fixture bob)"; NOTE="$(fixture note)"
@@ -329,23 +319,19 @@ SELECT doc->>'title', cardinality(automerge_heads(doc)) FROM docs;
 -- The backend mapped the library from the image volume.
 SELECT position('/extensions/pg-automerge/lib/pg_automerge.so' IN pg_read_file('/proc/self/maps')) > 0;
 SQL
-)" || fail "SQL at $OLD: $out"
-expect "SQL at $OLD" "$(printf '%s\n' 'Groceries for Sunday|1' t)" "$out"
+)" || fail "SQL before the roll: $out"
+expect "SQL before the roll" "$(printf '%s\n' 'Groceries for Sunday|1' t)" "$out"
 
 # ---------------------------------------------------------------------------
-log "change the Cluster's extension image to $IMAGE: the pod rolls"
+log "change the Cluster's extension image to $REBUILT_IMAGE: the pod rolls"
 uid="$(pod_uid)"
-apply cluster cluster_yaml "$NEW_REF"
-wait_until "the pod to roll onto $NEW_REF" 600 rolled "$uid" "$NEW_REF"
-expect "after the roll: the data, the catalog still $OLD, the update path found" \
-    "$(printf '%s\n' 'Groceries for Sunday' "$OLD" "$VERSION|t" t)" \
+apply cluster cluster_yaml "$REBUILT_REF"
+wait_until "the pod to roll onto $REBUILT_REF" 600 rolled "$uid" "$REBUILT_REF"
+expect "after the roll: the data, the extension still $VERSION, the Database applied" \
+    "$(printf '%s\n' 'Groceries for Sunday' "$VERSION" "$VERSION|t")" \
     "$(pg -c "SELECT doc->>'title' FROM docs" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge'" \
-        -c "SELECT default_version, installed_version = '$OLD' FROM pg_available_extensions WHERE name = 'pg_automerge'" \
-        -c "SELECT path IS NOT NULL FROM pg_extension_update_paths('pg_automerge') WHERE source = '$OLD' AND target = '$VERSION'")"
-
-log "bump the Database's extension version to $VERSION (the operator runs ALTER EXTENSION UPDATE)"
-apply database database_yaml "$VERSION" present
-wait_until "pg_automerge $VERSION in database app" 180 ext_is "$VERSION"
+        -c "SELECT default_version, installed_version = default_version FROM pg_available_extensions WHERE name = 'pg_automerge'")"
+wait_until "the Database applied after the roll" 60 db_applied
 
 out="$(pg -v bob="\\x$BOB" -v note="\\x$NOTE" <<'SQL'
 SHOW pg_automerge.max_load_memory;
@@ -364,8 +350,8 @@ SET client_min_messages = warning;
 ALTER EXTENSION pg_automerge UPDATE;
 SELECT extversion FROM pg_extension WHERE extname = 'pg_automerge';
 SQL
-)" || fail "SQL at $VERSION: $out"
-expect "SQL at $VERSION" "$(printf '%s\n' 1GB 'Groceries for Sunday|["milk", "eggs"]|eggs|2' 1 \
+)" || fail "SQL after the roll: $out"
+expect "SQL after the roll" "$(printf '%s\n' 1GB 'Groceries for Sunday|["milk", "eggs"]|eggs|2' 1 \
     'Shopping tipsBuy fresh milk on Sunday.' 't|t' t "$VERSION")" "$out"
 
 # ---------------------------------------------------------------------------
