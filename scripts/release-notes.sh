@@ -36,6 +36,7 @@ while [[ "$notes" == *$'\n' || "$notes" =~ $'\n'[[:blank:]]*$ ]]; do notes="${no
 cnpg_ref="$cnpg_image:$version-18-$debian"
 package="pg_automerge-$version-pg18-linux-amd64.tar.gz"
 fence='```'
+docs=https://theknarf.com/pg-automerge
 section="$(cat <<EOF
 $begin
 ## Docker images
@@ -48,10 +49,11 @@ docker pull $image:$version
 docker pull $cnpg_ref   # CloudNativePG extension image (files only)
 ${fence}
 
-The first is the official \`postgres:18\` image plus the extension (see
-the Docker guide). The second is mounted by
+The first is the official \`postgres:18\` image plus the extension
+([Docker]($docs/guide/docker)). The second is mounted by
 [CloudNativePG](https://cloudnative-pg.io) 1.27 or later into its own
-PostgreSQL 18 $debian image (Kubernetes image volumes):
+PostgreSQL 18 $debian image through Kubernetes image volumes
+([CloudNativePG]($docs/guide/cloudnativepg)):
 
 ${fence}yaml
 apiVersion: postgresql.cnpg.io/v1

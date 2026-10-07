@@ -254,7 +254,7 @@ the operator writes them. It checks:
   path from each older one;
 - that the server log shows no crash.
 
-`tests/cnpg_e2e.sh` (`mise run cnpg-e2e`, and the CI `cnpg-e2e` job on tags, nightly and on manual runs, on
+`tests/cnpg_e2e.sh` (`mise run cnpg-e2e`, and the CI `cnpg-e2e` job for every release, nightly and on manual runs, on
 the image the `docker` job built) covers the operator itself. It takes a
 few minutes and needs kind, so it is not part of `mise run ci` or
 `docker-test`. It creates a throwaway kind cluster (pinned kind and

@@ -10,8 +10,9 @@ The extension version is the crate version (`default_version =
 currently 0.1.0, the first release; pgrx generates the install script
 `pg_automerge--X.Y.Z.sql` for the build, and the Docker images' version
 labels and tags come from it (`scripts/versions.sh`). A release is a
-`v<version>` tag (CI checks it against `Cargo.toml`); see the
-[Changelog](../changelog.mdx).
+GitHub release with the tag `v<version>` (the release workflow checks it
+against `Cargo.toml`; see [Releasing](../operations/releasing.mdx)) and
+an entry in the [Changelog](../changelog.mdx).
 
 Policy:
 

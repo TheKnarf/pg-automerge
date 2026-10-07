@@ -147,10 +147,12 @@ description: "The test suites, and what each covers."
   on every push and pull request, and the benchmarks nightly (uploaded as a
   workflow-run artifact). Runs are grouped by event and ref, so a newer
   push cancels an older push run on the same ref but never the nightly
-  run, and the other way round. On tags it installs the PGDG Postgres 18,
-  runs `PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package`,
+  run, and the other way round. For a release (the release workflow
+  calls it with `release: true`) it installs the PGDG Postgres 18, runs
+  `PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package`,
   unpacks the tarball into `/` and runs `CREATE EXTENSION` in that server,
-  then uploads the tarball as a workflow-run artifact (not a release).
+  then uploads the tarball, which the release workflow attaches to the
+  GitHub release (see [Releasing](../operations/releasing.mdx)).
 - `mise run package` (`scripts/package.sh`) requires `PG_CONFIG` and
   refuses one under `$PGRX_HOME` (also through a symlink) or of another
   major version: `cargo pgrx package` mirrors that pg_config's install
