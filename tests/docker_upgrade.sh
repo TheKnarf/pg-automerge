@@ -15,7 +15,8 @@
 # PG_AUTOMERGE_OLD_IMAGE (e.g. the published ghcr.io/<owner>/pg-automerge:0.1.0,
 # or a local pg-automerge:0.1.0 kept from before the bump), or by default
 # one built from the release tag v<OLD> with that revision's own
-# scripts/docker-build.sh.
+# scripts/docker-build.sh --full (the full image only, under a test tag:
+# no CloudNativePG image, so no local pg-automerge-cnpg tag is touched).
 #
 # What an app on the OLD image does when it moves to this one:
 #   1. a container of the OLD image on a fresh volume (labelled
@@ -101,7 +102,10 @@ if [[ -z "$OLD_IMAGE" ]]; then
     git archive "$RELEASE_REV" | tar -x -C "$DWORK/old-src"
     old_repo="pg-automerge-test-old-$$"
     IMAGES+=("$old_repo:$OLD_VERSION" "$old_repo:dev")
-    (cd "$DWORK/old-src" && PG_AUTOMERGE_IMAGE="$old_repo" bash scripts/docker-build.sh) >"$DWORK/old-build.log" 2>&1 \
+    # --full: only the full image (scripts/docker-build.sh builds both by
+    # default, and the CloudNativePG one would take the user's
+    # pg-automerge-cnpg:<old>-18-<debian> tag).
+    (cd "$DWORK/old-src" && PG_AUTOMERGE_IMAGE="$old_repo" bash scripts/docker-build.sh --full) >"$DWORK/old-build.log" 2>&1 \
         || { tail -50 "$DWORK/old-build.log" >&2; fail "building the $OLD_VERSION image"; }
     OLD_IMAGE="$old_repo:$OLD_VERSION"
 fi

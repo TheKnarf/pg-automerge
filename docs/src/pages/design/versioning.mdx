@@ -110,8 +110,8 @@ EXTENSION pg_automerge UPDATE`.
   (`PG_AUTOMERGE_OLD_IMAGE`, a tag or an image ID, such as the published
   `ghcr.io/<owner>/pg-automerge:0.1.0`, or by default built from the
   release tag `v<version>` with that revision's own
-  `scripts/docker-build.sh`; its install script must be that version's
-  snapshot) creates tables with a generated `doc::jsonb` column, GIN and
+  `scripts/docker-build.sh --full`, under a test tag; its install script
+  must be that version's snapshot) creates tables with a generated `doc::jsonb` column, GIN and
   B-tree expression indexes, a view, a notify trigger and documents; it
   is stopped and the new image started on the same volume (init not
   re-run, still the old version, the same data, and the deep block

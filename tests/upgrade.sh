@@ -41,9 +41,10 @@
 # Until the first upgrade script exists (0.1.0, the first release, is the
 # only version so far), the only snapshot is the current version's and
 # step 1 uses the empty script: the test then checks that the snapshot is
-# the build's catalog. Once a new version W adds sql/pg_automerge--0.1.0--W.sql
-# (and, at its release, sql/snapshots/pg_automerge--W.sql), the loop runs
-# the real update from 0.1.0. An upgrade script that adds an object should
+# the build's catalog. Once a new version W is started (the Cargo.toml
+# bump, sql/pg_automerge--0.1.0--W.sql and, in the same change,
+# sql/snapshots/pg_automerge--W.sql, regenerated until W is released; see
+# versioning.mdx), the loop runs the real update from 0.1.0. An upgrade script that adds an object should
 # also be checked against a user's object of the same name already in the
 # extension's schema (the update must fail, not adopt or replace it): add
 # that case here for the new object.
