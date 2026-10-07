@@ -23,7 +23,7 @@ Building the jsonb value from the walk's events adds about 30 ms on the
 a `serde_json::Value`, for comparison, takes 89 ms and 8 ms in total with
 the walk on the two list documents.
 
-Since 0.3.0 every Rust allocation is counted (for
+Every Rust allocation is counted (for
 `automerge_memory_usage()`): about 1 ns per allocation, within noise on
 loads and at most a few percent on the allocation-heavy per-object walk
 (see [Memory observability](./memory-observability.mdx)); the numbers above

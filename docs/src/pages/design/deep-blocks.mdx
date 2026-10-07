@@ -107,13 +107,15 @@ the depth check use explicit stacks, and jsonb's own recursion
 Automerge would not help: how deep Automerge recurses is decided inside
 it, which is why the fix keeps such calls away from deep structures.
 
-**Upgrading.** The fix changed no SQL object: it takes effect as soon as
-the new library is loaded, before `ALTER EXTENSION .. UPDATE` (which 0.2.0
-needs for `automerge_spans` only, see [0.1.0 to
-0.2.0](./versioning.mdx#010-to-020)), and the jsonb result of every document is unchanged (expression indexes and generated columns
-stay valid). Values stored by earlier builds read normally with it,
-including documents whose jsonb view crashed those builds (a table
-without a jsonb generated column or expression index could store them).
+**No SQL change.** The fix is inside the library: it changed no SQL
+object, so it would take effect as soon as a library with it is loaded,
+before any `ALTER EXTENSION .. UPDATE`, and the jsonb result of every
+document is unchanged (expression indexes and generated columns stay
+valid). Values stored by builds without it read normally, including
+documents whose jsonb view crashed those builds (a table without a jsonb
+generated column or expression index could store them). This is the kind
+of fix [Versioning and upgrades](./versioning.mdx#writing-an-upgrade-script)
+means by one that needs no SQL at all.
 
 Tests: `crates/pg_automerge_core/tests/blocks.rs` (the block check against
 a scan of every change's ops over generated documents with and without

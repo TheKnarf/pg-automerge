@@ -19,7 +19,7 @@ the full [Docker](./docker.mdx) image, from the same compile:
 
 ```sh
 mise run docker-build        # both images
-mise run docker-build-cnpg   # only pg-automerge-cnpg:0.3.0-18-trixie
+mise run docker-build-cnpg   # only pg-automerge-cnpg:0.1.0-18-trixie
 mise run cnpg-smoke          # build it, then test it in CNPG's PostgreSQL image (no Kubernetes)
 mise run cnpg-e2e            # build it, then test it with the CNPG operator on kind
 ```
@@ -83,7 +83,7 @@ spec:
     extensions:
       - name: pg-automerge                    # mounted at /extensions/pg-automerge
         image:
-          reference: ghcr.io/<owner>/pg-automerge-cnpg:0.3.0-18-trixie
+          reference: ghcr.io/<owner>/pg-automerge-cnpg:0.1.0-18-trixie
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Database
@@ -96,7 +96,7 @@ spec:
     name: automerge
   extensions:
     - name: pg_automerge                      # the SQL name
-      version: "0.3.0"
+      version: "0.1.0"
 ```
 
 For each entry, the operator adds an image volume and mounts it at
@@ -127,7 +127,7 @@ Pick the `name` once (`pg-automerge` above) and keep it. Renaming it moves
 the mount, which triggers a rolling update.
 
 **On kind** (or any cluster), you can use a locally built image without a
-registry. Run `kind load docker-image pg-automerge-cnpg:0.3.0-18-trixie`
+registry. Run `kind load docker-image pg-automerge-cnpg:0.1.0-18-trixie`
 and set `pullPolicy: IfNotPresent` (already the default for any tag but
 `latest`) or `Never` on the image. `tests/cnpg_e2e.sh` does the same with `kind load image-archive` and
 `pullPolicy: Never`.
@@ -187,6 +187,8 @@ a large load relies on.
 
 ## Updating
 
+0.1.0 is the first release; a later version is rolled out like this:
+
 1. Change `extensions[].image.reference` to the new tag. CNPG restarts the
    instances one by one (image volumes are resolved when a pod starts).
    Every image holds all the upgrade scripts, so any older version can
@@ -198,7 +200,9 @@ a large load relies on.
 
 Between the two steps the new library serves the old SQL definitions,
 exactly as after recreating a container ([Updating](./updating.mdx)). The
-[Changelog](../changelog.mdx) says whether a version needs more.
+[Changelog](../changelog.mdx) says whether a version needs more. A
+rebuilt image of the same version under a new tag (a newer base, say)
+needs only step 1: the pods roll and the catalog stays as it is.
 
 To remove the extension, first set `ensure: absent` in the `Database`
 resource (or run `DROP EXTENSION`), then delete the `extensions` entry,
@@ -246,8 +250,9 @@ the operator writes them. It checks:
   plain role;
 - that the backend maps the library from the mount, and that a setting
   given before the library loads applies;
-- merges, jsonb reads with a GIN index, `automerge_spans` and the upgrade
-  path;
+- merges, jsonb reads with a GIN index, `automerge_spans`, and that the
+  image offers exactly the versions of its SQL scripts, with an update
+  path from each older one;
 - that the server log shows no crash.
 
 `tests/cnpg_e2e.sh` (`mise run cnpg-e2e`, and the CI `cnpg-e2e` job on tags, nightly and on manual runs, on
@@ -258,26 +263,30 @@ Kubernetes 1.36 node image), installs the pinned CNPG release (1.30.1),
 loads the images into the node (`kind load`, `pullPolicy: Never`, no
 registry), and walks the steps of this page:
 
-1. A `Cluster` on the same pinned operand, with an *older* extension
-   image in `spec.postgresql.extensions`: the image under test with the
-   previous release's SQL scripts and `default_version`, standing in for
-   that release's image. It checks the pod's image volume and
+1. A `Cluster` on the same pinned operand, with the image under test in
+   `spec.postgresql.extensions`. It checks the pod's image volume and
    `status.pgDataImageInfo`, the two settings, the
    `pg_automerge.max_load_memory` parameter, and that the `app` owner
    cannot `CREATE EXTENSION`.
-2. A `Database` resource with that older `version`: the operator creates
-   the extension. Data is written, and the backend maps the library from
-   `/extensions/pg-automerge/lib`.
-3. The `Cluster`'s image changed to the image under test: the pod rolls
+2. A `Database` resource with the image's `version`: the operator
+   creates the extension. Data is written, and the backend maps the
+   library from `/extensions/pg-automerge/lib`.
+3. The `Cluster`'s image changed to a rebuild of the same version under
+   another tag (the image under test with one more label): the pod rolls
    (a new pod with the new image volume), the data survives, and the
-   catalog stays at the old version with the update path found.
-4. The `Database`'s `version` bumped: the operator runs
-   `ALTER EXTENSION ... UPDATE TO`. Then merges, jsonb reads with a GIN
-   index, `automerge_spans` and `automerge_memory_usage()` on the regress
-   fixtures.
-5. Removal as described above: `ensure: absent` drops the extension, and
+   extension, still at its version, works: merges, jsonb reads with a
+   GIN index, `automerge_spans` and `automerge_memory_usage()` on the
+   regress fixtures.
+4. Removal as described above: `ensure: absent` drops the extension, and
    deleting the `extensions` entry rolls the pod without the image
    volume. The server log shows no crash.
+
+With only one version so far, the test does not run the update of
+step 2 under Updating. For the first version after 0.1.0 it gets that
+step back: the `Cluster` starts on the 0.1.0 image with `version:
+"0.1.0"` in the `Database`, rolls to the image under test, and bumps the
+`Database`'s `version`, so the operator runs `ALTER EXTENSION ... UPDATE
+TO` (the top of `tests/cnpg_e2e.sh` describes how).
 
 kind's node runs as root of the Docker daemon, so its inotify instances
 count against root's `fs.inotify.max_user_instances`. kind asks for 512,

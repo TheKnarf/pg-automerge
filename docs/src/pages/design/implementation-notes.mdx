@@ -22,9 +22,9 @@ description: "Details of the implementation worth knowing."
   uncompressed, else a palloc'd copy the guard frees when dropped; its
   bytes are the core `Input`, read in place; an unchanged result is the
   original datum) or the loaded document of an expanded one. Neither
-  outlives the call. (Until 0.2.0 the bytes were copied again into a Rust
-  `Vec` and the palloc'd copy stayed until the per-call context reset, so
-  a flat argument held about twice its size; a pg_test measures the
+  outlives the call. (Earlier development builds copied the bytes again into a
+  Rust `Vec` and kept the palloc'd copy until the per-call context reset,
+  so a flat argument held about twice its size; a pg_test measures the
   context before and after.)
   `merge`, `merge(automerge, bytea)` and `automerge_contains` first decide
   what they can from the heads (a prefix of a flat value), before
@@ -64,7 +64,7 @@ description: "Details of the implementation worth knowing."
   `pg_automerge.verify_writes`, behind the `test-hooks` feature) is
   compiled only into test builds. The count of live documents
   (`loaded::live_count`, which the pg_tests use for leak checks) is the
-  always-on counter of `stats` since 0.3.0.
+  always-on counter of `stats`.
 - `pg_automerge.verify_writes` is defined in `_PG_init` and registered with
   the core (`set_verification_check`), which asks it whenever it would run
   the save-and-load check (`verification_enabled`).

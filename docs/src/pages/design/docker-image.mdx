@@ -164,13 +164,13 @@ Packaging decisions:
     a manual `CREATE EXTENSION .. SCHEMA`), an invalid value failing init;
   - the upgrade path with the image's own scripts and library, as
     `tests/upgrade.sh` does against pgrx's Postgres: each
-    `sql/snapshots` version and variant is copied into the container under a scratch
+    `sql/snapshots` version is copied into the container under a scratch
     version name, with the first hop of each upgrade path the image ships
     (so an image missing an upgrade script fails), documents are stored,
     `ALTER EXTENSION .. UPDATE` reaches the current version and the
     documents read the same (the catalog comparison stays in
-    `upgrade.sh`; a real 0.1.0 deployment moved to the image is
-    `tests/docker_upgrade.sh`, see [Upgrade tests](./versioning.mdx#upgrade-tests));
+    `upgrade.sh`; a real deployment of the previous release moved to the
+    image is `tests/docker_upgrade.sh`, see [Upgrade tests](./versioning.mdx#upgrade-tests));
   - `PGHOST=localhost` and `PGHOSTADDR` in the container's environment
     with an init file mounted as a single file next to ours (the
     extension is created, the file runs after it), and a whole directory
@@ -300,13 +300,14 @@ builds it after the full image (`--all`, the default of
   cluster (a digest-pinned Kubernetes 1.36 node, where image volumes are
   stable) with the smoke test's operand. The images reach the node with
   `kind load` and `pullPolicy: Never`, so no registry is involved. The
-  rolling update needs a second, different extension image, and no
-  earlier release had one, so the test builds a stand-in: the image under
-  test with the previous release's SQL snapshot
-  (`sql/snapshots/pg_automerge--<previous>.sql`) and `default_version`.
-  Its library is the current one, which the extension must accept anyway
-  between the roll and `ALTER EXTENSION UPDATE`, and which
-  `tests/upgrade.sh` already exercises. The test uses a kubeconfig of its
+  rolling update needs a second, different extension image. With 0.1.0
+  the only version there is no older release's image to roll from, so
+  the test rolls to a rebuild of the same version under another tag (the
+  image under test with one more label: a different image ID and
+  reference, the same files), as a rebuild on a newer base would be; the
+  update to a new version through the `Database` resource joins it once
+  there is a previous release's image to start from (see the top of
+  `tests/cnpg_e2e.sh`). The test uses a kubeconfig of its
   own and never touches another cluster. Its steps are listed in
   [CloudNativePG](../guide/cloudnativepg.mdx#what-is-tested). It is not
   part of `docker-test` or `mise run ci`: it takes minutes and needs kind.

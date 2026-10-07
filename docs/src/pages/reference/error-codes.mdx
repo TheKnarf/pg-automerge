@@ -77,7 +77,7 @@ crafted by adding an author footer to a seq 2 change); the SQL tests
 check the SQLSTATE, DETAIL and HINT for the first, which share one mapping
 in `src/error.rs`.
 
-## Other reclassifications (before 0.1.0)
+## Other reclassifications (before the first release)
 
 - Nesting deeper than 1000 levels: `XX000` → `54000`. The document is
   valid; the jsonb view has a limit, like jsonb's own element and string

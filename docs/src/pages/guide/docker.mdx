@@ -29,7 +29,7 @@ registry of your own (CI can push both, multi-architecture, for tags once
 you [configure it](../operations/docker-ci.mdx#publishing-the-images)).
 
 ```sh
-mise run docker-build        # both: pg-automerge:0.3.0 + :dev, and pg-automerge-cnpg:0.3.0-18-trixie
+mise run docker-build        # both: pg-automerge:0.1.0 + :dev, and pg-automerge-cnpg:0.1.0-18-trixie
 mise run docker-test         # builds, then tests both images and compose.yaml (about 6 minutes once built)
 ```
 
@@ -57,7 +57,7 @@ Run it like `postgres:18`. Mount the volume at `/var/lib/postgresql` (the
 docker run -d --name pg -p 127.0.0.1:5432:5432 \
   -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=app \
   -v pgdata:/var/lib/postgresql \
-  pg-automerge:0.2.0 \
+  pg-automerge:0.1.0 \
   postgres -c default_toast_compression=lz4 -c pg_automerge.max_load_memory=1GB
 ```
 
@@ -92,7 +92,7 @@ of your own; do not mount a whole directory over
 `/docker-entrypoint-initdb.d`:
 
 ```sh
-docker run ... -v ./init/20-app.sql:/docker-entrypoint-initdb.d/20-app.sql:ro pg-automerge:0.2.0
+docker run ... -v ./init/20-app.sql:/docker-entrypoint-initdb.d/20-app.sql:ro pg-automerge:0.1.0
 ```
 
 A directory mounted there replaces `10-pg-automerge.sh`, and the database

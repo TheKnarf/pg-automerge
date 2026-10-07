@@ -34,10 +34,12 @@ operator in a kind cluster; see
 [CloudNativePG](../guide/cloudnativepg.mdx#what-is-tested).
 
 `mise run docker-upgrade-test` (not part of `docker-test`) upgrades a
-0.1.0 deployment to the current version the way the [Updating](../guide/updating.mdx)
-section describes: a
-container of the 0.1.0 image (`PG_AUTOMERGE_OLD_IMAGE=<tag or image ID>`,
-or by default built from the 0.1.0 source in the git history) with
+deployment of the previous release to the current version the way the
+[Updating](../guide/updating.mdx) section describes (while 0.1.0, the
+first release, is the current version, it has nothing to upgrade from and
+says so): a container of the previous release's image
+(`PG_AUTOMERGE_OLD_IMAGE=<tag or image ID>`, or by default built from its
+release tag `v<version>` in the git history) with
 tables, a generated `doc::jsonb` column, GIN and B-tree expression
 indexes, a view, an `automerge_notify()` trigger and documents; then the
 new image on the same volume, `ALTER EXTENSION pg_automerge UPDATE`, and
@@ -73,10 +75,10 @@ extension image's `pg-automerge-cnpg-<version>-18-trixie-linux-<arch>.tar.gz`,
 under Actions > the run > Artifacts). To use one:
 
 ```sh
-docker load -i pg-automerge-0.2.0-linux-arm64.tar.gz   # loads pg-automerge:0.2.0
+docker load -i pg-automerge-0.1.0-linux-arm64.tar.gz   # loads pg-automerge:0.1.0
 ```
 
-`docker load` moves your local `pg-automerge:0.2.0` tag to the loaded
+`docker load` moves your local `pg-automerge:0.1.0` tag to the loaded
 image, so loading the other architecture's archive leaves that tag on an
 image your host cannot run (`exec format error`) until you
 `mise run docker-build` again. `scripts/docker-push.sh` (below) loads
@@ -172,13 +174,13 @@ By hand, the same script pushes archives you built yourself:
 
 ```sh
 mise run docker-build                              # both images
-bash scripts/docker-archive.sh                     # pg-automerge-0.3.0-linux-amd64.tar.gz
-bash scripts/docker-archive.sh pg-automerge-cnpg:0.3.0-18-trixie   # pg-automerge-cnpg-0.3.0-18-trixie-linux-amd64.tar.gz
+bash scripts/docker-archive.sh                     # pg-automerge-0.1.0-linux-amd64.tar.gz
+bash scripts/docker-archive.sh pg-automerge-cnpg:0.1.0-18-trixie   # pg-automerge-cnpg-0.1.0-18-trixie-linux-amd64.tar.gz
 docker login ghcr.io
-bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.3.0-linux-*.tar.gz  # prints the image IDs and the pushes
-bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.3.0-linux-*.tar.gz
+bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz  # prints the image IDs and the pushes
+bash scripts/docker-push.sh ghcr.io/you/pg-automerge pg-automerge-0.1.0-linux-*.tar.gz
 # the CNPG extension image: its own repository, and --cnpg
-bash scripts/docker-push.sh --cnpg ghcr.io/you/pg-automerge-cnpg pg-automerge-cnpg-0.3.0-18-trixie-linux-*.tar.gz
+bash scripts/docker-push.sh --cnpg ghcr.io/you/pg-automerge-cnpg pg-automerge-cnpg-0.1.0-18-trixie-linux-*.tar.gz
 ```
 
 Pass the archives of both architectures (from the tag's workflow run, or

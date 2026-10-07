@@ -55,8 +55,8 @@ evaluation, for a decision before the first release.
   and hot queries are rewritten deliberately; `IMMUTABLE`, so indexable
   too. Their cost is discoverability.
 - **Recommendation.** If faster single-field reads are wanted, add the
-  functions (no compatibility hazard). 0.1.0 is released without the
-  operators; adding them now is an SQL change like any other (a new
+  functions (no compatibility hazard). 0.1.0, the first release, ships
+  without them; adding them later is an SQL change like any other (a new
   version and upgrade script) and, if at all, needs a test that an index on
   `(doc->>'x')` created afterwards is used. For read-heavy tables the
   stored generated jsonb column stays the fastest option either way

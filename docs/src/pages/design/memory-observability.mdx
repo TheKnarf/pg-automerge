@@ -12,8 +12,8 @@ Postgres' memory contexts: `pg_backend_memory_contexts`,
 `pg_log_backend_memory_contexts()`, `work_mem` and HashAgg's accounting do
 not see them, and a 3 MB document takes about 400 MB loaded (see
 [Input amplification
-measurements](./benchmarks/2026-09-29.mdx#input-amplification-measurements-2026-09-29)). Since 0.3.0
-two functions show it, for the current backend:
+measurements](./benchmarks/2026-09-29.mdx#input-amplification-measurements-2026-09-29)). Two
+functions show it, for the current backend:
 
 | Column of `automerge_memory_usage()` | Meaning |
 |---|---|
@@ -47,7 +47,7 @@ Two designs were compared:
   jsonb builder's tree, merge intermediates.
 - **A counting `#[global_allocator]`** (`src/alloc.rs`): the system
   allocator plus three atomic counters (the allocation, its peak, and
-  since 0.3.0 its high point since the last trim, see
+  its high point since the last trim, see
   [Returning freed memory](./memory-observability.mdx#returning-freed-memory-pg_automergetrim_threshold)).
   Exact, and covers everything the library's Rust code allocates, at a
   cost on every allocation.
@@ -151,7 +151,7 @@ throughout: each connection holding the most it ever needed, whether
 idle or not. For an application pool that is `connections × the largest
 document's load`, permanently.
 
-Since 0.3.0 a transaction callback (`RegisterXactCallback` in
+A transaction callback (`RegisterXactCallback` in
 `_PG_init`; no `shared_preload_libraries` needed) calls glibc's
 `malloc_trim(0)` at the end of every top-level transaction (commit,
 abort, prepare; and in parallel workers) in which the library's Rust
@@ -305,6 +305,5 @@ includes this heap.
   alive, and at least 10 loads per round were counted. Then the reset,
   and a new session's counters starting at zero.
 - `tests/upgrade.sh` and `tests/docker_upgrade.sh`: the functions after
-  `ALTER EXTENSION .. UPDATE` from every earlier version, relocated too,
-  and an update over a user's `automerge_memory_usage()` in the
-  extension's schema failing.
+  `ALTER EXTENSION .. UPDATE` from every earlier version (none yet: 0.1.0
+  is the first release), relocated too.

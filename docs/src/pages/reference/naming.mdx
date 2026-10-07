@@ -5,10 +5,10 @@ order: 100
 description: "Why the SQL objects are named the way they are."
 ---
 
-The SQL surface was reviewed as a whole before the first release (0.1.0;
-until then renames needed no aliases or upgrade script, now every change
-needs a version and an upgrade script, see [Versioning and
-upgrades](../design/versioning.mdx)). Principles:
+The SQL surface was reviewed as a whole before the first release, 0.1.0
+(until a version is released, renames need no aliases or upgrade script;
+after it, every change needs a version and an upgrade script, see
+[Versioning and upgrades](../design/versioning.mdx)). Principles:
 objects that cannot collide because they take an `automerge` argument may
 use generic names where that reads better (`merge`, `merge_agg`, `||`);
 everything else carries the `automerge_` prefix; parameter names are the

@@ -196,8 +196,8 @@ The jsonb walk before and after it skips Automerge's document iterator
 for documents with blocks (see [Deep blocks](../deep-blocks.mdx)); release
 builds of the previous commit (555110e) and this one, interleaved.
 
-The crash: the Docker image of 0.1.0 built before `automerge_spans`
-(the one the reported crash came from) segfaults on
+The crash: a Docker image built from an earlier commit, before
+`automerge_spans` (the one the reported crash came from), segfaults on
 `INSERT INTO t (doc) VALUES (:'deep_block')` into a table with a stored
 generated `doc::jsonb` column (the regress fixture: 2,000 levels, 4 kB);
 so did `tests/limits.sh` step 3 with the previous commit's library, on
