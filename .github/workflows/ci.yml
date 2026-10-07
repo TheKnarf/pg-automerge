@@ -1,40 +1,56 @@
 # Four jobs on every push and pull request (three in parallel):
 #   - ci: what `mise run ci` runs locally (lint, the docs site check, all
 #     test suites and the regress tests, against the pgrx-managed Postgres
-#     18); on tags also the release tarball.
+#     18); for a release also the package tarball.
 #   - docs: only the docs site check (`mise run docs-check`), for quick
 #     feedback.
 #   - docker: builds the Docker images (BuildKit, layers cached in the GitHub
 #     Actions cache): the full image and the CloudNativePG extension image,
 #     from one builder stage, and runs tests/docker.sh against them,
 #     including the container variants of the multi-session suites and
-#     tests/cnpg_smoke.sh. On tags it runs on an amd64 and a native arm64
-#     runner and uploads each image as a workflow artifact.
-#   - cnpg-e2e (after docker; on tags, the nightly schedule and manual
-#     runs, or on every event with the repository variable
+#     tests/cnpg_smoke.sh. For a release it runs on an amd64 and a native
+#     arm64 runner and uploads each image as a workflow artifact.
+#   - cnpg-e2e (after docker; for a release, on the nightly schedule and
+#     manual runs, or on every event with the repository variable
 #     PG_AUTOMERGE_CNPG_E2E=always): tests/cnpg_e2e.sh, the CNPG extension
 #     image with the real CloudNativePG operator in a kind cluster.
-# On tags, publish pushes both images to a registry, but only once one is
-# configured (docs/src/pages/operations/docker-ci.mdx, "Publishing the
-# images"): ghcr.io with the workflow's own token (PG_AUTOMERGE_PUBLISH=ghcr),
-# or any registry with a token secret; until then it skips.
+# This workflow never publishes anything. release.yml (on a published
+# GitHub release) calls it with release: true and the tag's commit, then
+# pushes the images and uploads the release assets once every job here
+# passed (docs/src/pages/operations/releasing.mdx).
 name: CI
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   schedule:
     # Nightly: also run the benchmarks.
     - cron: "17 3 * * *"
   workflow_dispatch:
+  # release.yml: the same jobs on a release's commit, plus what a release
+  # needs (arm64, the package, the image archives, cnpg-e2e).
+  workflow_call:
+    inputs:
+      release:
+        description: "Build and test everything a release publishes, and upload it as artifacts"
+        type: boolean
+        default: false
+      ref:
+        description: "The commit to check out (the release tag's)"
+        type: string
+        default: ""
+    outputs:
+      cnpg-e2e-passed:
+        description: "true once cnpg-e2e ran to its end (release.yml publishes only then)"
+        value: ${{ jobs.cnpg-e2e.outputs.passed }}
 
 # One group per event and ref: a newer push supersedes an older push run on
 # the same ref, but a push to main never cancels the nightly (schedule) run
-# with its benchmarks, nor the other way round.
+# with its benchmarks, nor the other way round. A release's call has a
+# group of its own (its commit).
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}-${{ inputs.ref }}
   cancel-in-progress: true
 
 # Read-only by default; no job needs to write to the repository.
@@ -52,6 +68,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Install Postgres build dependencies
         run: |
@@ -106,22 +124,22 @@ jobs:
       # development Postgres in ~/.pgrx): `cargo pgrx package` mirrors the
       # pg_config's install paths, so the tarball unpacks into
       # /usr/lib/postgresql/18/lib and /usr/share/postgresql/18/extension.
-      - name: Install PGDG Postgres 18 (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Install PGDG Postgres 18 (releases only)
+        if: inputs.release
         run: |
           sudo apt-get install -y --no-install-recommends postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y --no-install-recommends \
             postgresql-18 postgresql-server-dev-18
 
-      - name: Package (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Package (releases only)
+        if: inputs.release
         run: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package
 
       # Install the tarball the way docs/src/pages/guide/install.mdx says and create the
       # extension in the PGDG server.
-      - name: Check the package installs (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Check the package installs (releases only)
+        if: inputs.release
         run: |
           sudo tar -C / -xzf target/release/pg_automerge-pg18.tar.gz
           sudo pg_ctlcluster 18 main start || sudo pg_createcluster 18 main --start
@@ -129,14 +147,15 @@ jobs:
             -c 'CREATE EXTENSION pg_automerge' \
             -c "SELECT automerge_to_jsonb(''::bytea::automerge)"
 
-      # Attached to the workflow run (Actions > run > Artifacts), not to a
-      # GitHub release.
-      - name: Upload package (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+      # For release.yml's publish job, which attaches it to the release.
+      - name: Upload package (releases only)
+        if: inputs.release
         uses: actions/upload-artifact@v7
         with:
           name: pg_automerge-pg18
           path: target/release/pg_automerge-pg18.tar.gz
+          if-no-files-found: error
+          overwrite: true
 
   # The documentation site (docs/): typecheck, biome, the static build
   # under /pg-automerge/ and the link/route check, as
@@ -148,6 +167,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       # Node and pnpm as pinned in mise.toml; nothing else.
       - uses: jdx/mise-action@v5
@@ -172,25 +193,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # amd64 always; on tags also arm64, on GitHub's native arm64 runner
-        # (no QEMU, no cross-compilation; see
-        # docs/src/pages/design/docker-image.mdx, "Docker image in CI"). Set
-        # the repository variable PG_AUTOMERGE_ARM64=false
-        # where that runner is not available.
-        arch: ${{ fromJSON((startsWith(github.ref, 'refs/tags/') && vars.PG_AUTOMERGE_ARM64 != 'false') && '["amd64", "arm64"]' || '["amd64"]') }}
+        # amd64 always; for a release also arm64, on GitHub's native arm64
+        # runner (no QEMU, no cross-compilation; see
+        # docs/src/pages/design/docker-image.mdx, "Docker image in CI").
+        arch: ${{ fromJSON(inputs.release && '["amd64", "arm64"]' || '["amd64"]') }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-
-      - name: Tag matches the crate version (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          version="$(sh scripts/versions.sh | sed -n 's/^CRATE_VERSION=//p')"
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml's version $version"
-            exit 1
-          fi
+        with:
+          ref: ${{ inputs.ref }}
 
       # Rust as pinned in mise.toml, for the suites' fixture generators
       # (cargo run -p pg_automerge_core --example ...). Only Rust: the image
@@ -249,11 +261,11 @@ jobs:
       # image this job built and tests (a few MB; `docker load` restores
       # its tag).
       - name: Save the CNPG extension image for cnpg-e2e (amd64)
-        if: matrix.arch == 'amd64' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always')
+        if: matrix.arch == 'amd64' && (inputs.release || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always')
         run: docker image save "$PG_AUTOMERGE_CNPG_IMAGE" | gzip >cnpg-e2e-image.tar.gz
 
       - name: Upload the CNPG extension image for cnpg-e2e (amd64)
-        if: matrix.arch == 'amd64' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always')
+        if: matrix.arch == 'amd64' && (inputs.release || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always')
         uses: actions/upload-artifact@v7
         with:
           name: cnpg-e2e-image
@@ -261,6 +273,7 @@ jobs:
           compression-level: 0
           retention-days: 3
           if-no-files-found: error
+          overwrite: true
 
       - name: Test the image (tests/docker.sh)
         env:
@@ -280,10 +293,11 @@ jobs:
           name: benchmarks-docker
           path: bench-sql-docker.txt
 
-      # `docker load -i` reads them back; the publish job pushes them.
-      - name: Save the images (tags only)
+      # `docker load -i` reads them back; release.yml's publish job pushes
+      # them and attaches them to the release.
+      - name: Save the images (releases only)
         id: archive
-        if: startsWith(github.ref, 'refs/tags/')
+        if: inputs.release
         run: |
           file="$(bash scripts/docker-archive.sh "" dist)"
           echo "file=$file" >>"$GITHUB_OUTPUT"
@@ -293,8 +307,8 @@ jobs:
           echo "cnpg_name=$(basename "$cnpg" .tar.gz)" >>"$GITHUB_OUTPUT"
           ls -l dist
 
-      - name: Upload the image (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload the image (releases only)
+        if: inputs.release
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.archive.outputs.name }}
@@ -302,15 +316,17 @@ jobs:
           # Already gzipped.
           compression-level: 0
           if-no-files-found: error
+          overwrite: true
 
-      - name: Upload the CNPG extension image (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload the CNPG extension image (releases only)
+        if: inputs.release
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.archive.outputs.cnpg_name }}
           path: ${{ steps.archive.outputs.cnpg_file }}
           compression-level: 0
           if-no-files-found: error
+          overwrite: true
 
   # tests/cnpg_e2e.sh (mise run cnpg-e2e) on the docker job's amd64 CNPG
   # extension image: a kind cluster with the CloudNativePG operator, a
@@ -319,16 +335,21 @@ jobs:
   # rebuilt extension image of the same version, removal. kind and kubectl as pinned in
   # mise.toml; the runner's Docker runs the kind node. A few minutes and a
   # kind cluster, so not on every push and pull request (tests/cnpg_smoke.sh
-  # in the docker job covers the image itself there): on tags (publish
-  # waits for it), nightly, on workflow_dispatch, or always with the
-  # repository variable PG_AUTOMERGE_CNPG_E2E=always.
+  # in the docker job covers the image itself there): for a release
+  # (release.yml publishes only after its last step), nightly, on
+  # workflow_dispatch, or always with the repository variable
+  # PG_AUTOMERGE_CNPG_E2E=always.
   cnpg-e2e:
     needs: docker
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always'
+    if: inputs.release || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    outputs:
+      passed: ${{ steps.passed.outputs.passed }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: jdx/mise-action@v5
         with:
@@ -349,116 +370,8 @@ jobs:
       - name: End-to-end test with the CNPG operator (tests/cnpg_e2e.sh)
         run: bash tests/cnpg_e2e.sh
 
-  # Pushes the tested images of a tag, each as one multi-architecture
-  # image: the full image and the CNPG extension image.
-  # Prepared, not enabled: it does nothing until the repository opts in,
-  # one of two ways (docs/src/pages/operations/docker-ci.mdx, "Publishing
-  # the images"):
-  #   - ghcr.io with this workflow's own GITHUB_TOKEN: the repository
-  #     variable PG_AUTOMERGE_PUBLISH=ghcr. The images default to
-  #     ghcr.io/<owner>/pg-automerge and ghcr.io/<owner>/pg-automerge-cnpg;
-  #     PG_AUTOMERGE_REGISTRY_IMAGE / _CNPG_IMAGE may name others on ghcr.io.
-  #   - any registry: the secret PG_AUTOMERGE_REGISTRY_TOKEN and the
-  #     variables PG_AUTOMERGE_REGISTRY_IMAGE (e.g. docker.io/you/pg-automerge)
-  #     and PG_AUTOMERGE_REGISTRY_USERNAME; the CNPG image goes to
-  #     PG_AUTOMERGE_REGISTRY_CNPG_IMAGE, by default <image>-cnpg.
-  # packages: write is granted here only (tags only, after every test job);
-  # the token is used for nothing but the ghcr.io login, and only in the
-  # ghcr mode.
-  publish:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [ci, docker, cnpg-e2e]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
-    env:
-      PUBLISH: ${{ vars.PG_AUTOMERGE_PUBLISH }}
-      REGISTRY_IMAGE: ${{ vars.PG_AUTOMERGE_REGISTRY_IMAGE }}
-      REGISTRY_CNPG_IMAGE: ${{ vars.PG_AUTOMERGE_REGISTRY_CNPG_IMAGE }}
-      REGISTRY_USERNAME: ${{ vars.PG_AUTOMERGE_REGISTRY_USERNAME }}
-      REGISTRY_TOKEN: ${{ secrets.PG_AUTOMERGE_REGISTRY_TOKEN }}
-    steps:
-      # Decides whether to push, where, and with which credentials; every
-      # later step is gated on its push output.
-      - name: Registry configured?
-        id: cfg
-        run: |
-          case "$PUBLISH" in
-            ghcr)
-              owner="${GITHUB_REPOSITORY_OWNER,,}"
-              image="${REGISTRY_IMAGE:-ghcr.io/$owner/pg-automerge}"
-              username="$GITHUB_ACTOR"
-              ;;
-            "")
-              if [ -z "$REGISTRY_TOKEN" ]; then
-                echo "::notice::Neither PG_AUTOMERGE_PUBLISH=ghcr nor a PG_AUTOMERGE_REGISTRY_TOKEN secret: not pushing (the images are this run's artifacts)."
-                echo "push=false" >>"$GITHUB_OUTPUT"
-                exit 0
-              fi
-              if [ -z "$REGISTRY_IMAGE" ] || [ -z "$REGISTRY_USERNAME" ]; then
-                echo "::error::PG_AUTOMERGE_REGISTRY_TOKEN is set, but PG_AUTOMERGE_REGISTRY_IMAGE or PG_AUTOMERGE_REGISTRY_USERNAME is not"
-                exit 1
-              fi
-              image="$REGISTRY_IMAGE"
-              username="$REGISTRY_USERNAME"
-              ;;
-            *)
-              echo "::error::PG_AUTOMERGE_PUBLISH is '$PUBLISH'; the only value is ghcr (or leave it unset)"
-              exit 1
-              ;;
-          esac
-          cnpg_image="${REGISTRY_CNPG_IMAGE:-$image-cnpg}"
-          # One login: both images on the same registry (ghcr.io in the
-          # ghcr mode, whose token is good for nothing else).
-          registry="${image%%/*}"
-          if [ "${cnpg_image%%/*}" != "$registry" ]; then
-            echo "::error::the CNPG image ($cnpg_image) is not on the registry of the full image ($image)"
-            exit 1
-          fi
-          if [ "$PUBLISH" = ghcr ] && [ "$registry" != ghcr.io ]; then
-            echo "::error::PG_AUTOMERGE_PUBLISH=ghcr pushes to ghcr.io only, but the image is $image"
-            exit 1
-          fi
-          echo "Pushing $image and $cnpg_image as $username"
-          {
-            echo "push=true"
-            echo "registry=$registry"
-            echo "image=$image"
-            echo "cnpg_image=$cnpg_image"
-            echo "username=$username"
-          } >>"$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@v7
-        if: steps.cfg.outputs.push == 'true'
-
-      - uses: actions/download-artifact@v8
-        if: steps.cfg.outputs.push == 'true'
-        with:
-          pattern: pg-automerge-*-linux-*
-          path: dist
-          merge-multiple: true
-
-      - uses: docker/login-action@v4
-        if: steps.cfg.outputs.push == 'true'
-        with:
-          registry: ${{ steps.cfg.outputs.registry }}
-          username: ${{ steps.cfg.outputs.username }}
-          password: ${{ env.PUBLISH == 'ghcr' && github.token || env.REGISTRY_TOKEN }}
-
-      - name: Push
-        if: steps.cfg.outputs.push == 'true'
-        env:
-          IMAGE: ${{ steps.cfg.outputs.image }}
-          CNPG_IMAGE: ${{ steps.cfg.outputs.cnpg_image }}
-        # Check both sets before pushing either; then the CNPG image
-        # (versioned tags only), then the full image, so :latest moves
-        # last. A registry refusing a push (e.g. a 403 on an existing
-        # package) can still stop it part way; the pushes are
-        # idempotent, so re-running the job completes the release.
-        run: |
-          bash scripts/docker-push.sh --dry-run --cnpg "$CNPG_IMAGE" dist/pg-automerge-cnpg-*-linux-*.tar.gz
-          bash scripts/docker-push.sh --dry-run "$IMAGE" dist/pg-automerge-[0-9]*-linux-*.tar.gz
-          bash scripts/docker-push.sh --cnpg "$CNPG_IMAGE" dist/pg-automerge-cnpg-*-linux-*.tar.gz
-          bash scripts/docker-push.sh "$IMAGE" dist/pg-automerge-[0-9]*-linux-*.tar.gz
+      # Read by release.yml (the workflow's cnpg-e2e-passed output): a
+      # skipped or failed cnpg-e2e leaves it empty, and nothing is published.
+      - name: Passed
+        id: passed
+        run: echo "passed=true" >>"$GITHUB_OUTPUT"

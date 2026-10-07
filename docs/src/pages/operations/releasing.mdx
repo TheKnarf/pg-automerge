@@ -1,0 +1,140 @@
+---
+title: "Releasing"
+section: Operations
+order: 45
+description: "Cutting a release with GitHub's \"Draft a new release\" button: what the release workflow tests, pushes to ghcr.io and attaches to the release, and how to run it again."
+---
+
+A release is a GitHub release. Publishing one with **Draft a new release**
+starts `.github/workflows/release.yml`, which builds and tests the
+release's commit the way CI does (plus arm64 and the CloudNativePG
+end-to-end test), and only once every test job has passed pushes both
+images to the GitHub Container Registry and attaches the files to the
+release:
+
+| What | Where |
+|---|---|
+| Full image (`postgres:18` + the extension), amd64 + arm64 | `ghcr.io/theknarf/pg-automerge:<version>`, and `:latest` for the latest release |
+| [CloudNativePG](../guide/cloudnativepg.mdx) extension image, amd64 + arm64 | `ghcr.io/theknarf/pg-automerge-cnpg:<version>-18-trixie` (never `latest`) |
+| Release assets | `pg_automerge-<version>-pg18-linux-amd64.tar.gz` (the [package](../guide/install.mdx), built against PGDG PostgreSQL 18 on Ubuntu 24.04), both images as `docker save` archives per architecture, `SHA256SUMS` |
+| Release notes | a section with the `docker pull` commands and a `Cluster`/`Database` snippet, after your own text |
+
+## Cutting a release
+
+1. On `main`, make the version final: `version` in `Cargo.toml` (and the
+   SQL snapshot that goes with it, see
+   [Versioning and upgrades](../design/versioning.mdx)), and the
+   `CHANGELOG.md` entry, `## <version>` with today's date instead of
+   `(unreleased)`. Commit, push, and wait for CI to pass.
+2. On GitHub: Releases > **Draft a new release**. Choose a tag: type
+   `v<version>`, exactly `v` and the `Cargo.toml` version (`v0.1.0`), and
+   let GitHub create it on publish, with `main` as the target. The
+   workflow fails at once if the tag and `Cargo.toml` at that commit
+   disagree.
+3. Title it (`pg_automerge 0.1.0`) and write the notes, for example the
+   changelog entry. Tick **Set as a pre-release** for a release candidate
+   (see below); leave **Set as the latest release** on otherwise.
+4. **Publish release.** Follow the run under Actions > Release. It takes
+   about as long as the slowest test job (the Docker builds and tests,
+   roughly half an hour to an hour when the layer cache is cold).
+
+A draft does nothing; the workflow starts when the release is published.
+If a test job fails, nothing is pushed or uploaded; the release stays
+published with your notes only. Fix the problem, then either run the
+workflow again (if the failure was transient) or delete the release and
+its tag and release a fixed commit.
+
+**Prereleases.** A release marked as a pre-release, or whose version has
+a prerelease part (`0.2.0-rc.1`, tag `v0.2.0-rc.1`), is built, tested and
+published the same way, but `:latest` does not move. `:latest` also moves
+only when the release is the repository's latest release, so running the
+workflow again for an older release never points `:latest` back at it.
+
+## What the workflow does
+
+- **check**: the tag is a version tag, the release exists and is not a
+  draft, and `Cargo.toml` at the tag says that version; it outputs the
+  version, the tag's commit and whether it is a prerelease. Every later
+  job uses that commit, so a tag moved during the run changes nothing.
+- **test**: all of `ci.yml` on that commit, called with `release: true`:
+  the `ci` job (`mise run ci`, then the package built with
+  `PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package`
+  against PGDG's PostgreSQL 18 and installed into it), the `docs` job, the
+  `docker` job on `ubuntu-24.04` and natively on `ubuntu-24.04-arm` (each
+  builds and tests both images and saves them as archives), and
+  `cnpg-e2e` on the amd64 extension image. See
+  [Testing and CI](./docker-ci.mdx).
+- **publish**, in the `release` environment, with `packages: write` and
+  `contents: write` (no other job can write anything), only after `check`
+  and every `test` job passed: logs in to ghcr.io with the workflow's
+  `GITHUB_TOKEN` and runs `scripts/release-publish.sh`, which
+  - checks every archive before pushing anything
+    (`scripts/docker-push.sh --dry-run`): the version label is the
+    release's, the architectures are exactly amd64 and arm64, no
+    duplicates, and the images' `org.opencontainers.image.source` and
+    `.revision` labels are this repository and the tag's commit;
+  - pushes the CNPG extension image, then the full image, each as a
+    multi-architecture index (the per-architecture images also stay
+    available with an `-amd64` / `-arm64` suffix), so `:latest` moves
+    last. These are the very images the test jobs tested, not a rebuild;
+  - uploads the assets with `gh release upload --clobber` and
+    `SHA256SUMS` over them;
+  - replaces its own section of the release notes (between two HTML
+    comments) with `gh release edit`, leaving your text as it is.
+
+## Running it again
+
+Actions > Release > **Run workflow**, with the tag (`v0.1.0`), runs
+everything again for that release, for example after a transient
+failure or a registry outage. That is safe: the same images are pushed
+under the same tags again, the assets are replaced (`--clobber`) and the
+notes section is replaced, not added a second time. A newer run for the
+same release waits for a running one instead of cancelling it.
+**Re-run failed jobs** on a failed run works as well.
+
+## One-time setup
+
+- **Make the packages public.** The first release creates the two
+  packages, `pg-automerge` and `pg-automerge-cnpg`, under the account and
+  links them to the repository (through the images' source label). New
+  packages are **private**: in each package's settings (Packages > the
+  package > Package settings > Change visibility), make it public, so
+  `docker pull` and a Kubernetes cluster need no credentials. Until then
+  the release's pull commands work only for you.
+- **Optional: approve every publish.** The `publish` job runs in a GitHub
+  environment called `release`, created on the first run. Give it
+  required reviewers (Settings > Environments > release > Required
+  reviewers) and each release waits for an approval after its tests pass,
+  before anything is pushed.
+- **Arm64 runners.** The `docker` job's arm64 leg runs on GitHub's
+  `ubuntu-24.04-arm` runner, which public repositories get for free. A
+  release needs both architectures; without that runner, the release fails
+  before anything is pushed.
+
+No secrets or repository variables are needed: the workflow's own
+`GITHUB_TOKEN` can push packages linked to its repository.
+
+## By hand
+
+The scripts the workflow runs work locally too. A dry run of the whole
+publish step against archives you built yourself (it loads and checks
+them, builds the assets and prints the pushes, the `gh` commands and the
+new notes, without pushing or calling GitHub):
+
+```sh
+mise run docker-build
+bash scripts/docker-archive.sh "" dist                                   # dist/pg-automerge-0.1.0-linux-amd64.tar.gz
+bash scripts/docker-archive.sh pg-automerge-cnpg:0.1.0-18-trixie dist    # dist/pg-automerge-cnpg-0.1.0-18-trixie-linux-amd64.tar.gz
+bash scripts/release-publish.sh --dry-run v0.1.0 "$(git rev-parse HEAD)" theknarf/pg-automerge dist
+```
+
+With amd64 archives only it stops at the architecture check, as it should
+(`required amd64 arm64`); the archives of both architectures come from
+the release run (they are its assets) or an arm64 machine.
+`scripts/docker-push.sh` pushes archives to any registry you are logged
+in to (`--latest` also moves `:latest`; `--cnpg` for the extension image):
+
+```sh
+bash scripts/docker-push.sh --dry-run ghcr.io/you/pg-automerge dist/pg-automerge-0.1.0-linux-*.tar.gz
+bash scripts/docker-push.sh --cnpg ghcr.io/you/pg-automerge-cnpg dist/pg-automerge-cnpg-0.1.0-18-trixie-linux-*.tar.gz
+```

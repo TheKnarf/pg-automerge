@@ -12,7 +12,7 @@
 # test says so and passes (skipped). Once a newer version exists (its
 # upgrade script sql/pg_automerge--0.1.0--<new>.sql, the Cargo.toml bump),
 # it rehearses the update from 0.1.0 with the 0.1.0 image:
-# PG_AUTOMERGE_OLD_IMAGE (e.g. the published ghcr.io/<owner>/pg-automerge:0.1.0,
+# PG_AUTOMERGE_OLD_IMAGE (e.g. the published ghcr.io/theknarf/pg-automerge:0.1.0,
 # or a local pg-automerge:0.1.0 kept from before the bump), or by default
 # one built from the release tag v<OLD> with that revision's own
 # scripts/docker-build.sh --full (the full image only, under a test tag:

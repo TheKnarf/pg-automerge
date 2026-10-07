@@ -52,12 +52,11 @@ images on a best-effort basis only.
 
 ## A cluster with pg_automerge
 
-Push the image to a registry your cluster can pull from. A tag's CI run
-can push both images, multi-architecture, to
-`ghcr.io/<owner>/pg-automerge-cnpg` (see
-[publishing](../operations/docker-ci.mdx#publishing-the-images)); by hand,
-`scripts/docker-push.sh --cnpg` does the same. Then list it in the
-`Cluster`. A `Database` resource can create the extension
+Every release publishes the image for amd64 and arm64 as
+`ghcr.io/theknarf/pg-automerge-cnpg:<version>-18-trixie` (see
+[Releasing](../operations/releasing.mdx)); a build of your own goes to a
+registry your cluster can pull from with
+`scripts/docker-push.sh --cnpg`. List it in the `Cluster`. A `Database` resource can create the extension
 for you:
 
 ```yaml
@@ -83,7 +82,7 @@ spec:
     extensions:
       - name: pg-automerge                    # mounted at /extensions/pg-automerge
         image:
-          reference: ghcr.io/<owner>/pg-automerge-cnpg:0.1.0-18-trixie
+          reference: ghcr.io/theknarf/pg-automerge-cnpg:0.1.0-18-trixie
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Database

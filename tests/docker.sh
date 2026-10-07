@@ -142,9 +142,15 @@ archive="$(bash scripts/docker-archive.sh "$IMAGE" "$DWORK/release")"
 expect "archive name" "$DWORK/release/pg-automerge-$VERSION-linux-$ARCH.tar.gz" "$archive"
 PUSH_REPO=registry.invalid/pg-automerge-test
 IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
-out="$(bash scripts/docker-push.sh --dry-run "$PUSH_REPO" "$archive")"
+# The index is annotated with the images' source, revision and version.
+label() { docker image inspect -f "{{index .Config.Labels \"$2\"}}" "$1"; }
+SOURCE="$(label "$IMAGE" org.opencontainers.image.source)"; REVISION="$(label "$IMAGE" org.opencontainers.image.revision)"
+ANNOTATIONS="${SOURCE:+--annotation index:org.opencontainers.image.source=$SOURCE }${REVISION:+--annotation index:org.opencontainers.image.revision=$REVISION }--annotation index:org.opencontainers.image.version=$VERSION"
+out="$(bash scripts/docker-push.sh --dry-run --latest "$PUSH_REPO" "$archive")"
 expect "push dry run" "$(printf '%s\n' "loaded $archive $IMAGE_ID" "+ docker push $PUSH_REPO:$VERSION-$ARCH" \
-    "+ docker buildx imagetools create -t $PUSH_REPO:$VERSION -t $PUSH_REPO:latest $PUSH_REPO:$VERSION-$ARCH")" "$out"
+    "+ docker buildx imagetools create $ANNOTATIONS -t $PUSH_REPO:$VERSION -t $PUSH_REPO:latest $PUSH_REPO:$VERSION-$ARCH")" "$out"
+out="$(bash scripts/docker-push.sh --dry-run --arch "$ARCH" ${SOURCE:+--source "$SOURCE"} "$PUSH_REPO" "$archive")"
+expect "push dry run without --latest" "+ docker buildx imagetools create $ANNOTATIONS -t $PUSH_REPO:$VERSION $PUSH_REPO:$VERSION-$ARCH" "$(tail -1 <<<"$out")"
 expect "dry run leaves no tags" "" "$(docker image ls -q "$PUSH_REPO")"
 expect "the image is still $IMAGE" "$IMAGE_ID" "$(docker image inspect -f '{{.Id}}' "$IMAGE")"
 # Loading an archive puts back the local tag it carries: an archive of
@@ -168,9 +174,14 @@ expect "dry runs leave no tags" "" "$(docker image ls -q "$PUSH_REPO")"
 rm -rf "$DWORK/release2"
 # Refused: a repository without a registry host (Docker would pick Docker
 # Hub), an archive of another version, the same architecture twice.
+# Refused too: a missing required architecture (release.yml requires
+# amd64 and arm64), another revision than the release's.
+other_arch=arm64; [[ "$ARCH" != arm64 ]] || other_arch=amd64
 for bad in "pg-automerge|REPOSITORY must be registry-host/path" \
            "$PUSH_REPO $DWORK/release/pg-automerge-0.0.0-linux-$ARCH.tar.gz|version 0.0.0, Cargo.toml says $VERSION" \
-           "$PUSH_REPO $archive|two archives for $ARCH"; do
+           "$PUSH_REPO $archive|two archives for $ARCH" \
+           "--arch $ARCH --arch $other_arch $PUSH_REPO|archives for $ARCH, required $(printf '%s\n' "$ARCH" "$other_arch" | sort | tr '\n' ' ' | sed 's/ $//')" \
+           "--revision 0000000000000000000000000000000000000000 $PUSH_REPO|image revision label '$REVISION', expected 0000000000000000000000000000000000000000"; do
     args="${bad%%|*}"; want="${bad#*|}"
     cp "$archive" "$DWORK/release/pg-automerge-0.0.0-linux-$ARCH.tar.gz"
     # shellcheck disable=SC2086 # args is a word list
@@ -196,12 +207,13 @@ if [[ "${DOCKER_TEST_CNPG:-1}" != 0 ]]; then
     CNPG_ID="$(docker image inspect -f '{{.Id}}' "$CNPG_IMAGE")"
     out="$(bash scripts/docker-push.sh --dry-run --cnpg "$CNPG_REPO" "$carchive")"
     expect "CNPG push dry run" "$(printf '%s\n' "loaded $carchive $CNPG_ID" "+ docker push $CNPG_REPO:$VERSION-18-$DEBIAN-$ARCH" \
-        "+ docker buildx imagetools create -t $CNPG_REPO:$VERSION-18-$DEBIAN $CNPG_REPO:$VERSION-18-$DEBIAN-$ARCH")" "$out"
+        "+ docker buildx imagetools create $ANNOTATIONS -t $CNPG_REPO:$VERSION-18-$DEBIAN $CNPG_REPO:$VERSION-18-$DEBIAN-$ARCH")" "$out"
     expect "the CNPG image is still $CNPG_IMAGE" "$CNPG_ID" "$(docker image inspect -f '{{.Id}}' "$CNPG_IMAGE")"
     # Each kind of archive only in its own mode.
     for bad in "$PUSH_REPO $carchive|push it with --cnpg" \
                "--cnpg $CNPG_REPO $archive|not a pg-automerge-cnpg-<version>-18-<debian>-linux-<arch>.tar.gz archive" \
-               "--cnpg $CNPG_REPO $carchive $carchive|two archives for $DEBIAN/$ARCH"; do
+               "--cnpg $CNPG_REPO $carchive $carchive|two archives for $DEBIAN/$ARCH" \
+               "--cnpg --latest $CNPG_REPO $carchive|--latest is not for the CNPG extension image"; do
         args="${bad%%|*}"; want="${bad#*|}"
         # shellcheck disable=SC2086 # args is a word list
         if out="$(bash scripts/docker-push.sh --dry-run $args 2>&1)"; then fail "docker-push.sh accepted: $args"; fi

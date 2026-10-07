@@ -161,8 +161,11 @@ description: "The test suites, and what each covers."
   `--sharedir/extension`. `tests/check_ci.sh` (part of `mise run lint`)
   checks these refusals and the workflow's concurrency group and package
   step, the Docker packaging statically (see [Docker image](./docker-image.mdx)),
-  and the workflow with actionlint and its docker and publish jobs'
-  invariants (see [Docker image in CI](./docker-image.mdx#docker-image-in-ci)).
+  and the workflows with actionlint, the invariants of `ci.yml`'s jobs
+  and of the release workflow (only its publish job may push or write,
+  after every test job), and the release scripts' order and notes (see
+  [Docker image in CI](./docker-image.mdx#docker-image-in-ci) and
+  [Releasing](../operations/releasing.mdx)).
 - `mise run docker-test` (`tests/docker.sh`, not part of `mise run test`)
   builds the Docker image and tests it and `compose.yaml` against
   throwaway containers, including the regress examples, five of the

@@ -23,10 +23,19 @@ The full image is the official `postgres:18` image, untouched
 `pg_automerge.so`, its control file and SQL scripts, and one init script.
 The extension is compiled in a builder stage from the same base image,
 against that image's own PGDG Postgres 18 (release build, no assertions),
-with Rust and cargo-pgrx as pinned in `mise.toml`. Nothing is pushed
-anywhere; the images live in your local Docker until you push them to a
-registry of your own (CI can push both, multi-architecture, for tags once
-you [configure it](../operations/docker-ci.mdx#publishing-the-images)).
+with Rust and cargo-pgrx as pinned in `mise.toml`.
+
+Every release publishes both, for amd64 and arm64, built and tested by
+the [release workflow](../operations/releasing.mdx):
+
+```sh
+docker pull ghcr.io/theknarf/pg-automerge:0.1.0          # or :latest
+docker pull ghcr.io/theknarf/pg-automerge-cnpg:0.1.0-18-trixie
+```
+
+The published `ghcr.io/theknarf/pg-automerge:<version>` is the same
+image as a local `pg-automerge:<version>`; use either name below. To
+build it yourself (a local build is never pushed anywhere):
 
 ```sh
 mise run docker-build        # both: pg-automerge:0.1.0 + :dev, and pg-automerge-cnpg:0.1.0-18-trixie

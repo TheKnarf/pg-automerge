@@ -85,13 +85,15 @@ Images (built locally with `mise run docker-build`; see
   with a PostgreSQL 18 trixie operand (CNPG 1.27 or later, Kubernetes
   image volumes); see
   [CloudNativePG](docs/src/pages/guide/cloudnativepg.mdx).
-- A `v*` tag's CI run can push both, each as one amd64 + arm64 image
-  (`<image>:<version>` and `latest`, `<image>-cnpg:<version>-18-trixie`),
-  after the `ci`, `docker` and `cnpg-e2e` jobs passed. Opt-in: the
-  repository variable `PG_AUTOMERGE_PUBLISH=ghcr` pushes to
-  `ghcr.io/<owner>/pg-automerge` and `-cnpg`, or a token secret to any
-  registry; see
-  [Publishing the images](docs/src/pages/operations/docker-ci.mdx#publishing-the-images).
+- Releases: publishing a GitHub release (tag `v<version>`) runs
+  `.github/workflows/release.yml`, which tests the tag's commit like CI
+  (plus arm64 and the CloudNativePG end-to-end test) and only then pushes
+  both images, each as one amd64 + arm64 image, to
+  `ghcr.io/theknarf/pg-automerge:<version>` (and `latest`) and
+  `ghcr.io/theknarf/pg-automerge-cnpg:<version>-18-trixie`, attaches the
+  package tarball, the image archives and `SHA256SUMS` to the release, and
+  adds the pull commands and a CNPG snippet to its notes; see
+  [Releasing](docs/src/pages/operations/releasing.mdx).
 
 Notable behaviour:
 

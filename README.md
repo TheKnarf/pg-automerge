@@ -58,7 +58,9 @@ psql postgres://postgres:postgres@localhost:5432/app
 On Kubernetes, [CloudNativePG](docs/src/pages/guide/cloudnativepg.mdx)
 mounts the extension-only image `pg-automerge-cnpg:<version>-18-trixie`
 (built by the same `mise run docker-build`) into its own PostgreSQL 18
-image; CI can publish both images, multi-architecture, to ghcr.io.
+image. Each GitHub release publishes both, for amd64 and arm64, as
+`ghcr.io/theknarf/pg-automerge` and `ghcr.io/theknarf/pg-automerge-cnpg`
+([Releasing](docs/src/pages/operations/releasing.mdx)).
 
 From source, with [mise](https://mise.jdx.dev)
 ([Install](docs/src/pages/guide/install.mdx)):

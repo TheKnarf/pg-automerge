@@ -44,12 +44,14 @@ was its `POSTGRES_USER`), and `<db>` a database with the extension (the
 service's `POSTGRES_DB`, e.g. `app`, and any other you created it in).
 
 1. Optionally, keep a dump: `docker compose exec -T postgres pg_dump -U <user> -Fc <db> >before-<version>.dump`.
-2. Build the new image in this repository: `mise run docker-build`
-   (tags `pg-automerge:<version>` and `pg-automerge:dev`), or `docker pull`
-   it from your registry if you publish one.
-3. Point the app's service at it: `image: pg-automerge:<version>` in its
-   `compose.yaml` (pin the version tag: the images are local, and a
-   rebuilt image moves `:dev`). If the service also has a `build:`
+2. Get the new image: `docker pull ghcr.io/theknarf/pg-automerge:<version>`
+   (the published image of the release), or build it in this repository
+   with `mise run docker-build` (tags `pg-automerge:<version>` and
+   `pg-automerge:dev`).
+3. Point the app's service at it: `image: ghcr.io/theknarf/pg-automerge:<version>`
+   or `image: pg-automerge:<version>` in its `compose.yaml` (pin the
+   version tag, not `:latest` or `:dev`, so the version changes only when
+   you change it). If the service also has a `build:`
    section (e.g. one that builds the image from a checkout of this
    repository), set its `args: PG_AUTOMERGE_VERSION:` to the new version
    too, or remove the section: compose builds when the tag is missing or

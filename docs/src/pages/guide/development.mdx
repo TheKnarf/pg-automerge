@@ -32,7 +32,7 @@ mise run docker-test    # build it, then test it against containers: SQL, dump/r
 mise run soak           # build it, then a 60-minute concurrent load against a memory-capped container, sampled and checked (see Operations)
 mise run docker-bench-sql  # bench-sql against the image (release build on PGDG Postgres, no assertions)
 mise run docker-up      # compose.yaml's development Postgres; docker-down stops it
-# scripts/docker-archive.sh and scripts/docker-push.sh: release archives and pushing (see Publishing the images)
+# scripts/docker-archive.sh, docker-push.sh, release-publish.sh: release archives and publishing (see Releasing)
 mise run run         # install and open psql against the pgrx-managed Postgres
 ```
 

@@ -13,7 +13,7 @@ wf=.github/workflows/ci.yml
 grep -qE '^  group: .*\$\{\{ github\.event_name \}\}.*\$\{\{ github\.ref \}\}' "$wf" \
   || fail "$wf: concurrency group must include github.event_name and github.ref"
 
-# The tag build must package against the distro/PGDG Postgres, not pgrx's.
+# The release build must package against the distro/PGDG Postgres, not pgrx's.
 grep -qE '^        run: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package$' "$wf" \
   || fail "$wf: the package step must set PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config"
 if grep -E 'mise run package' "$wf" | grep -vq 'PG_CONFIG=/usr/lib/postgresql/'; then
@@ -171,54 +171,81 @@ CASES
 echo "check_ci: docker ok"
 
 # ---------------------------------------------------------------------------
-# The workflow: actionlint (syntax, expressions, runner labels, and
+# The workflows: actionlint (syntax, expressions, runner labels, and
 # running shellcheck on every run: script), shellcheck on the scripts CI
-# runs, and the invariants of the docker and publish jobs.
+# runs, and the invariants of ci.yml's jobs and of release.yml, the only
+# workflow that publishes.
 command -v actionlint >/dev/null && command -v shellcheck >/dev/null \
   || fail "actionlint and shellcheck are needed (pinned in mise.toml: mise install)"
 docs_wf=.github/workflows/deploy-docs.yml
-actionlint "$wf" "$docs_wf" || fail "$wf, $docs_wf: actionlint"
+rel=.github/workflows/release.yml
+[ -f "$rel" ] || fail "$rel missing (releases are published by it)"
+actionlint "$wf" "$rel" "$docs_wf" || fail "$wf, $rel, $docs_wf: actionlint"
 shellcheck -x -S warning scripts/*.sh tests/check_ci.sh tests/docker.sh tests/docker_lib.sh tests/docker_bench.sh tests/docker_upgrade.sh tests/cnpg_smoke.sh tests/cnpg_e2e.sh \
   tests/soak.sh tests/soak/proc_sample.sh \
   docker/initdb-pg-automerge.sh || fail "shellcheck"
 
-# job NAME: the lines of that job (from "  NAME:" to the next job).
-job() { awk -v j="  $1:" '$0 == j {p=1; print; next} p && /^  [a-z]/ {exit} p' "$wf"; }
-for j in ci docs docker cnpg-e2e publish; do [ -n "$(job "$j")" ] || fail "$wf: no $j job"; done
-docker_job="$(job docker)"; publish_job="$(job publish)"; e2e_job="$(job cnpg-e2e)"
+# job NAME [FILE]: the lines of that job (from "  NAME:" to the next job).
+job() { awk -v j="  $1:" '$0 == j {p=1; print; next} p && /^  [a-z]/ {exit} p' "${2:-$wf}"; }
+for j in ci docs docker cnpg-e2e; do [ -n "$(job "$j")" ] || fail "$wf: no $j job"; done
+docker_job="$(job docker)"; e2e_job="$(job cnpg-e2e)"; ci_job="$(job ci)"
 has() { grep -qE -- "$2" <<<"$1"; }
 
+# Runners pinned to ubuntu-24.04 / ubuntu-24.04-arm everywhere.
+if grep -hE '^\s+runs-on:' "$wf" "$rel" "$docs_wf" | grep -E 'latest' >/dev/null; then fail "pin runners to ubuntu-24.04 / ubuntu-24.04-arm, not *-latest"; fi
+
+# ci.yml: push to main, pull requests, nightly and manual runs, and calls
+# from release.yml (workflow_call with the inputs release and ref); no tag
+# trigger and nothing that publishes.
+on_block="$(awk '/^on:$/ {p=1; next} p && /^[a-z]/ {exit} p' "$wf")"
+has "$on_block" '^  push:$' && has "$on_block" '^    branches: \[main\]$' && has "$on_block" '^  pull_request:$' \
+  && has "$on_block" '^  schedule:$' && has "$on_block" '^  workflow_dispatch:$' && has "$on_block" '^  workflow_call:$' \
+  || fail "$wf: on: push (main), pull_request, schedule, workflow_dispatch and workflow_call"
+has "$on_block" '^      release:$' && has "$on_block" '^      ref:$' || fail "$wf: workflow_call inputs release and ref"
+if has "$on_block" 'tags'; then fail "$wf: no tag trigger (releases are published by $rel)"; fi
+if [ -n "$(job publish)" ]; then fail "$wf: no publish job (publishing is $rel's)"; fi
+if grep -vE '^ *#' "$wf" | grep -qE 'docker/login-action|docker-push\.sh|release-publish\.sh|docker push|imagetools|gh release|github\.token|secrets\.'; then
+  fail "$wf: logs in, pushes, edits releases or uses a token (only $rel's publish job may)"
+fi
+if grep -qE '^ +[a-z-]+: write$|write-all|push: true' "$wf"; then fail "$wf: write permissions or push: true"; fi
+grep -qE '^permissions:$' "$wf" && grep -qE '^  contents: read$' "$wf" || fail "$wf: top-level permissions must be contents: read"
+# Every job checks out the release's commit when called with one.
+[ "$(grep -cE '^      - uses: actions/checkout@v7$' "$wf")" = "$(grep -cE '^          ref: \$\{\{ inputs\.ref \}\}$' "$wf")" ] \
+  || fail "$wf: every checkout must use ref: \${{ inputs.ref }}"
+# The release-only steps are gated on inputs.release, not on refs.
+if grep -qF "refs/tags/" "$wf"; then fail "$wf: release steps are gated on inputs.release, not on tag refs"; fi
+has "$ci_job" '^        run: PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config mise run package$' \
+  || fail "$wf: the ci job must package against PGDG's Postgres 18 for a release"
+has "$ci_job" '^          name: pg_automerge-pg18$' || fail "$wf: the ci job must upload the package as pg_automerge-pg18"
+
 # docker: runs on every push and PR (no job-level if), amd64 always and
-# arm64 on tags on the native runner, the layer cache, the tests with the
-# PGDG client tools, the tag/version check and the artifact.
+# arm64 for a release on the native runner, the layer cache, the tests
+# with the PGDG client tools, and the archives for a release.
 if has "$docker_job" '^    if:'; then fail "$wf: the docker job must run for every event"; fi
-has "$docker_job" "^        arch: .*startsWith\(github\.ref, 'refs/tags/'\).*'\[\"amd64\", \"arm64\"\]'.*'\[\"amd64\"\]'" \
-  || fail "$wf: docker matrix must be amd64, plus arm64 on tags"
-has "$docker_job" "^    runs-on: .*'ubuntu-24.04-arm'" || fail "$wf: arm64 must build on the native arm64 runner"
+has "$docker_job" "^        arch: \\$\\{\\{ fromJSON\\(inputs\\.release && '\\[\"amd64\", \"arm64\"\\]' \\|\\| '\\[\"amd64\"\\]'\\) \\}\\}$" \
+  || fail "$wf: docker matrix must be amd64, plus arm64 for a release"
+has "$docker_job" "^    runs-on: \\$\\{\\{ matrix\\.arch == 'arm64' && 'ubuntu-24\\.04-arm' \\|\\| 'ubuntu-24\\.04' \\}\\}$" \
+  || fail "$wf: arm64 must build on the native arm64 runner (ubuntu-24.04-arm)"
 has "$docker_job" 'bash scripts/docker-build.sh --full -- --load ' || fail "$wf: build the full image with scripts/docker-build.sh --full -- --load"
 has "$docker_job" 'bash scripts/docker-build.sh --cnpg -- --load ' || fail "$wf: build the CNPG image with scripts/docker-build.sh --cnpg -- --load"
 has "$docker_job" 'PG_AUTOMERGE_CNPG_IMAGE=\$cnpg" >>"\$GITHUB_ENV"' || fail "$wf: hand the CNPG image's tag to the later steps"
-has "$docker_job" 'bash scripts/docker-archive.sh "\$PG_AUTOMERGE_CNPG_IMAGE" dist' || fail "$wf: tags must save the CNPG image too"
+has "$docker_job" 'bash scripts/docker-archive.sh "\$PG_AUTOMERGE_CNPG_IMAGE" dist' || fail "$wf: a release must save the CNPG image too"
+has "$docker_job" 'bash scripts/docker-archive.sh "" dist' || fail "$wf: a release must save the full image (scripts/docker-archive.sh)"
 has "$docker_job" '--cache-from "type=gha,scope=pg-automerge-\$\{\{ matrix.arch \}\}"' || fail "$wf: cache-from type=gha per arch"
 has "$docker_job" '--cache-to "type=gha,scope=pg-automerge-\$\{\{ matrix.arch \}\},mode=max' || fail "$wf: cache-to type=gha,mode=max per arch"
 has "$docker_job" '^        run: bash tests/docker.sh$' || fail "$wf: the docker job must run tests/docker.sh"
 has "$docker_job" '^          PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config$' || fail "$wf: the docker tests use PGDG's client tools"
 has "$docker_job" 'DOCKER_TEST_SUITES' && fail "$wf: the docker job must run the suites"
-has "$docker_job" 'GITHUB_REF_NAME" != "v\$version"' || fail "$wf: tags must be checked against the crate version"
-has "$docker_job" 'bash scripts/docker-archive.sh' || fail "$wf: tags must save the image (scripts/docker-archive.sh)"
+[ "$(grep -cxF '        if: inputs.release' <<<"$docker_job")" = 3 ] || fail "$wf: the docker job saves and uploads both archives for a release only"
 
-# Pushing: only the publish job, only on tags, only after both test jobs,
-# and every step after the configuration check gated by it (so without
-# the secret nothing is pushed). Nothing else pushes or logs in.
-has "$publish_job" "^    if: startsWith\(github\.ref, 'refs/tags/'\)$" || fail "$wf: publish must be tags only"
-has "$publish_job" '^    needs: \[ci, docker, cnpg-e2e\]$' || fail "$wf: publish must need ci, docker and cnpg-e2e"
 # cnpg-e2e: the docker job's own CNPG image (saved by it under the same
-# condition), tests/cnpg_e2e.sh with the pinned kind and kubectl; on tags
-# (publish needs it), nightly, manual runs, or always if the repository says so.
+# condition), tests/cnpg_e2e.sh with the pinned kind and kubectl; for a
+# release, nightly, manual runs, or always if the repository says so; its
+# last step sets the output release.yml's publish requires.
 has "$e2e_job" '^    needs: docker$' || fail "$wf: cnpg-e2e must need docker"
-e2e_if="startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always'"
+e2e_if="inputs.release || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || vars.PG_AUTOMERGE_CNPG_E2E == 'always'"
 [ "$(grep -cxF "    if: $e2e_if" <<<"$e2e_job")" = 1 ] \
-  || fail "$wf: cnpg-e2e must run on tags, schedule, workflow_dispatch or with PG_AUTOMERGE_CNPG_E2E=always"
+  || fail "$wf: cnpg-e2e must run for a release, on schedule, workflow_dispatch or with PG_AUTOMERGE_CNPG_E2E=always"
 [ "$(grep -cxF "        if: matrix.arch == 'amd64' && ($e2e_if)" <<<"$docker_job")" = 2 ] \
   || fail "$wf: the docker job must save and upload the CNPG image for cnpg-e2e under cnpg-e2e's condition"
 has "$docker_job" 'docker image save "\$PG_AUTOMERGE_CNPG_IMAGE" \| gzip >cnpg-e2e-image\.tar\.gz$' \
@@ -226,37 +253,80 @@ has "$docker_job" 'docker image save "\$PG_AUTOMERGE_CNPG_IMAGE" \| gzip >cnpg-e
 has "$e2e_job" '^          name: cnpg-e2e-image$' || fail "$wf: cnpg-e2e must download the docker job's CNPG image"
 has "$e2e_job" '^          install_args: aqua:kubernetes-sigs/kind kubectl$' || fail "$wf: cnpg-e2e installs kind and kubectl from mise.toml"
 has "$e2e_job" '^        run: bash tests/cnpg_e2e.sh$' || fail "$wf: cnpg-e2e must run tests/cnpg_e2e.sh"
-has "$publish_job" '^              if \[ -z "\$REGISTRY_TOKEN" \]; then$' || fail "$wf: publish must check the secret"
-has "$publish_job" '^      PUBLISH: \$\{\{ vars\.PG_AUTOMERGE_PUBLISH \}\}$' || fail "$wf: publish: the ghcr mode is the variable PG_AUTOMERGE_PUBLISH"
-has "$publish_job" '^          if \[ "\$PUBLISH" = ghcr \] && \[ "\$registry" != ghcr\.io \]; then$' \
-  || fail "$wf: publish: the ghcr mode (GITHUB_TOKEN) must push to ghcr.io only"
-has "$publish_job" "^          password: \\\$\\{\\{ env\\.PUBLISH == 'ghcr' && github\\.token \\|\\| env\\.REGISTRY_TOKEN \\}\\}$" \
-  || fail "$wf: publish: GITHUB_TOKEN only in the ghcr mode"
-steps=$(grep -cE '^      - ' <<<"$publish_job")
-gated=$(grep -cE "^        if: steps\.cfg\.outputs\.push == 'true'$" <<<"$publish_job")
-[ "$gated" -eq $((steps - 1)) ] || fail "$wf: publish: $gated of $((steps - 1)) steps after the check are gated on it"
-outside="$(awk -v j="  publish:" '$0 == j {p=1} p && /^  [a-z]/ && $0 != j {p=0} !p' "$wf")"
-if has "$outside" 'docker/login-action|docker-push\.sh|docker push|imagetools'; then fail "$wf: pushing outside the publish job"; fi
-has "$publish_job" 'bash scripts/docker-push.sh "\$IMAGE" dist/pg-automerge-\[0-9\]\*-linux-\*\.tar\.gz$' \
-  || fail "$wf: publish must push the full image archives (pg-automerge-[0-9]*) without --cnpg"
-has "$publish_job" 'bash scripts/docker-push.sh --cnpg .* dist/pg-automerge-cnpg-\*-linux-\*\.tar\.gz$' \
-  || fail "$wf: publish must push the CNPG archives with --cnpg"
-# Order: a dry run of both sets, then the CNPG push, then the full image
-# (whose index moves :latest) last, so a failure part way never leaves a
-# moved :latest without its CNPG image.
-push_order="$(grep -oE 'bash scripts/docker-push\.sh( --dry-run)?( --cnpg)? ' <<<"$publish_job" | sed 's/ $//' | tr '\n' '|')"
-[ "$push_order" = 'bash scripts/docker-push.sh --dry-run --cnpg|bash scripts/docker-push.sh --dry-run|bash scripts/docker-push.sh --cnpg|bash scripts/docker-push.sh|' ] \
-  || fail "$wf: publish must dry-run both image sets, then push CNPG, then the full image (got: $push_order)"
-# Write permissions: packages: write in the publish job only (its
-# permissions block exactly contents: read + packages: write), none
-# anywhere else, and no push: true.
-if grep -qE 'push: true|write-all' "$wf"; then fail "$wf: no push: true or write-all"; fi
-if has "$outside" '^ +[a-z-]+: write$'; then fail "$wf: write permissions outside the publish job"; fi
-[ "$(grep -cE '^ +[a-z-]+: write$' <<<"$publish_job")" = 1 ] && has "$publish_job" '^      packages: write$' \
-  && has "$publish_job" '^    permissions:$' && has "$publish_job" '^      contents: read$' \
-  || fail "$wf: publish: permissions must be exactly contents: read and packages: write"
-if grep -qE 'github\.token|secrets\.GITHUB_TOKEN' <<<"$outside"; then fail "$wf: GITHUB_TOKEN used outside the publish job"; fi
-grep -qE '^permissions:$' "$wf" && grep -qE '^  contents: read$' "$wf" || fail "$wf: top-level permissions must be contents: read"
+[ "$(grep -E '^      - ' <<<"$e2e_job" | tail -1)" = '      - name: Passed' ] && has "$e2e_job" '^      passed: \$\{\{ steps\.passed\.outputs\.passed \}\}$' \
+  || fail "$wf: cnpg-e2e's last step must set its passed output"
+grep -qxF '        value: ${{ jobs.cnpg-e2e.outputs.passed }}' "$wf" || fail "$wf: workflow_call output cnpg-e2e-passed from cnpg-e2e"
+
+# release.yml: on a published release (and manual re-runs with a tag);
+# check, then ci.yml with release: true on the tag's commit, then publish,
+# which needs both, requires cnpg-e2e's output, runs in the release
+# environment and is the only job with write permissions, a registry
+# login, a push or gh release.
+for j in check test publish; do [ -n "$(job "$j" "$rel")" ] || fail "$rel: no $j job"; done
+check_job="$(job check "$rel")"; test_job="$(job test "$rel")"; rpublish_job="$(job publish "$rel")"
+rel_on="$(awk '/^on:$/ {p=1; next} p && /^[a-z]/ {exit} p' "$rel")"
+has "$rel_on" '^  release:$' && has "$rel_on" '^    types: \[published\]$' || fail "$rel: on: release: types: [published]"
+has "$rel_on" '^  workflow_dispatch:$' && has "$rel_on" '^      tag:$' || fail "$rel: workflow_dispatch with a tag input"
+[ "$(grep -cE '^  [a-z_]+:' <<<"$rel_on")" = 2 ] || fail "$rel: only the release and workflow_dispatch triggers"
+grep -qE '^  cancel-in-progress: false$' "$rel" || fail "$rel: never cancel a release run part way"
+has "$check_job" 'if \[ "\$TAG" != "v\$version" \]; then$' || fail "$rel: check must compare the tag with Cargo.toml's version"
+has "$check_job" '^          ref: refs/tags/\$\{\{ steps\.release\.outputs\.tag \}\}$' || fail "$rel: check reads the version at the tag"
+has "$check_job" '^      prerelease: ' && has "$check_job" '^      version: ' && has "$check_job" '^      sha: ' \
+  || fail "$rel: check outputs version, sha and prerelease"
+has "$test_job" '^    needs: check$' && has "$test_job" '^    uses: \./\.github/workflows/ci\.yml$' \
+  && has "$test_job" '^      release: true$' && has "$test_job" '^      ref: \$\{\{ needs\.check\.outputs\.sha \}\}$' \
+  || fail "$rel: test must call ci.yml with release: true on the checked commit"
+has "$rpublish_job" '^    needs: \[check, test\]$' || fail "$rel: publish must need check and test (all of ci.yml's jobs)"
+has "$rpublish_job" "^    if: needs\\.test\\.outputs\\.cnpg-e2e-passed == 'true'$" || fail "$rel: publish only after cnpg-e2e passed"
+has "$rpublish_job" '^      name: release$' && has "$rpublish_job" '^    environment:$' || fail "$rel: publish runs in the release environment"
+[ "$(grep -cE '^ +[a-z-]+: write$' <<<"$rpublish_job")" = 2 ] && has "$rpublish_job" '^      packages: write$' \
+  && has "$rpublish_job" '^      contents: write$' || fail "$rel: publish: permissions exactly contents: write and packages: write"
+has "$rpublish_job" '^          registry: ghcr\.io$' && has "$rpublish_job" '^          password: \$\{\{ github\.token \}\}$' \
+  || fail "$rel: publish logs in to ghcr.io with GITHUB_TOKEN"
+has "$rpublish_job" 'bash scripts/release-publish\.sh "\$\{latest\[@\]\}" "\$TAG" "\$SHA" "\$GITHUB_REPOSITORY" dist$' \
+  || fail "$rel: publish runs scripts/release-publish.sh"
+has "$rpublish_job" 'if \[ "\$PRERELEASE" != true \] && \[ "\$newest" = "\$TAG" \]; then$' \
+  || fail "$rel: :latest only for the latest release, never a prerelease"
+rel_outside="$(awk '$0 == "  publish:" {p=1; next} p && /^  [a-z]/ {p=0} !p' "$rel" | grep -vE '^ *#')"
+if has "$rel_outside" 'docker/login-action|docker-push\.sh|release-publish\.sh|docker push|imagetools|gh release (upload|edit|create)|: write$|write-all'; then
+  fail "$rel: login, pushes, release edits or write permissions outside publish"
+fi
+grep -qE '^permissions:$' "$rel" && grep -qE '^  contents: read$' "$rel" || fail "$rel: top-level permissions must be contents: read"
+if grep -qE 'secrets\.' "$rel"; then fail "$rel: no secrets (GITHUB_TOKEN only)"; fi
+# The old opt-in machinery is gone everywhere.
+stale="$(git grep -lE 'PG_AUTOMERGE_(PUBLISH|REGISTRY_|ARM64|PUSH_LATEST)' -- ':!tests/check_ci.sh' || true)"
+[ -z "$stale" ] || fail "the publish opt-in variables are gone (release.yml publishes to ghcr.io), still named in: $stale"
+# Actions at their current majors.
+for a in actions/checkout@v7 actions/cache@v6 actions/upload-artifact@v7 actions/download-artifact@v8 \
+         docker/setup-buildx-action@v4 docker/login-action@v4 crazy-max/ghaction-github-runtime@v4 jdx/mise-action@v5; do
+  name="${a%@*}"
+  if grep -hoE "uses: $name@[^ ]+" "$wf" "$rel" "$docs_wf" | grep -vqxF "uses: $a"; then fail "use $a"; fi
+done
+
+# release-publish.sh: checks both image sets (dry runs, amd64 and arm64,
+# revision and source) before pushing, CNPG before the full image (whose
+# index may move :latest), then the assets and the notes.
+rp=scripts/release-publish.sh
+order="$(grep -oE '^ *bash scripts/docker-push\.sh( --dry-run)?( --cnpg)? |^run gh release (upload|edit)' "$rp" | sed -E 's/^ +//; s/ $//' | tr '\n' '|')"
+[ "$order" = 'bash scripts/docker-push.sh --dry-run --cnpg|bash scripts/docker-push.sh --dry-run|bash scripts/docker-push.sh --cnpg|bash scripts/docker-push.sh|run gh release upload|run gh release edit|' ] \
+  || fail "$rp: dry-run both image sets, push CNPG, then the full image, then assets and notes (got: $order)"
+grep -qxF 'check=(--arch amd64 --arch arm64 --revision "$revision" --source "$source_url")' "$rp" \
+  || fail "$rp: require amd64 and arm64 and the tag's revision and source"
+grep -qF -- '--clobber' "$rp" || fail "$rp: gh release upload --clobber (re-runs)"
+# release-notes.sh replaces its section: idempotent, the author's notes kept.
+notes_args=(0.1.0 ghcr.io/o/pg-automerge ghcr.io/o/pg-automerge-cnpg trixie 0123456789abcdef0123456789abcdef01234567)
+n1="$(printf 'My notes\r\n\r\n- a\n\n' | bash scripts/release-notes.sh "${notes_args[@]}")"
+n2="$(bash scripts/release-notes.sh "${notes_args[@]}" <<<"$n1")"
+[ "$n1" = "$n2" ] || fail "scripts/release-notes.sh is not idempotent"
+[ "$(grep -c 'pg-automerge-release:begin' <<<"$n2")" = 1 ] && [ "$(head -1 <<<"$n2")" = 'My notes' ] \
+  && grep -qxF 'docker pull ghcr.io/o/pg-automerge:0.1.0' <<<"$n2" \
+  && grep -qxF '          reference: ghcr.io/o/pg-automerge-cnpg:0.1.0-18-trixie' <<<"$n2" \
+  || fail "scripts/release-notes.sh: one section after the notes, with the pull commands and the CNPG reference"
+# The release tag is refused unless it is v<Cargo.toml version>.
+crate_version="$(sed -n 's/^CRATE_VERSION=//p' <<<"$versions")"
+mkdir -p "$tmp/dist"
+if out="$(bash "$rp" --dry-run v0.0.0-nope 0123456789abcdef0123456789abcdef01234567 o/r "$tmp/dist" 2>&1)"; then fail "$rp accepted a wrong tag"; fi
+grep -qF "must be v$crate_version" <<<"$out" || fail "$rp: expected a tag/version error, got: $out"
 
 echo "check_ci: workflow ok"
 

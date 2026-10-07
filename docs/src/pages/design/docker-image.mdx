@@ -72,7 +72,7 @@ Packaging decisions:
   Debian archive (no `curl | sh`) and installs the pinned toolchain
   (minimal profile); `cargo install --locked cargo-pgrx`. The package is
   built by `scripts/package.sh`, the script behind `mise run package` and
-  the tag CI job, which now passes `--locked` to cargo, so a stale
+  the release build in CI, which now passes `--locked` to cargo, so a stale
   `Cargo.lock` fails the build instead of being updated. BuildKit cache
   mounts keep the cargo registry and `target/` between builds; since
   `target/` is a cache mount, the package is copied out to `/out` in the
@@ -90,7 +90,7 @@ Packaging decisions:
   so the image runs on any host of it. Nothing in the Dockerfile is
   architecture-specific: the base index, PGDG's `postgresql-server-dev-18`
   at the base's exact version and Debian's `rustup` all exist for arm64,
-  and CI builds and tests the arm64 image on tags (see [Docker image in
+  and CI builds and tests the arm64 image for releases (see [Docker image in
   CI](./docker-image.mdx#docker-image-in-ci)).
 - **Init script.** `10-pg-automerge.sh` runs `CREATE EXTENSION IF NOT
   EXISTS pg_automerge` in `POSTGRES_DB` on first initialization, unless
@@ -271,7 +271,7 @@ builds it after the full image (`--all`, the default of
   tag form. The labels are the OCI ones (`base.name=scratch`) plus CNPG's
   `io.cloudnativepg.image.base.{name,pgmajor,os}` and `sql.version`. CNPG's
   own images also add an immutable timestamped tag. A release here is
-  built once per version tag, so the plain tag is not re-pushed.
+  built once per version, so the plain tag only ever gets the same bytes again (when the release workflow runs again).
 - **Archives and publishing.** `scripts/docker-archive.sh` names a CNPG
   image's archive `pg-automerge-cnpg-<version>-18-<debian>-linux-<arch>.tar.gz`,
   telling the two apart by the `io.cloudnativepg.image.base.os` label.
@@ -294,7 +294,7 @@ builds it after the full image (`--all`, the default of
   license, the labels are there, and the smoke test's operand is pinned by
   digest and its settings are CNPG's.
 - **Tested with the operator on kind.** `tests/cnpg_e2e.sh`
-  (`mise run cnpg-e2e`, the CI `cnpg-e2e` job on tags, nightly and on
+  (`mise run cnpg-e2e`, the CI `cnpg-e2e` job for releases, nightly and on
   manual runs) runs the real CNPG operator
   (a pinned release, its manifest checked by sha256) in a throwaway kind
   cluster (a digest-pinned Kubernetes 1.36 node, where image volumes are
@@ -339,19 +339,20 @@ suites' fixture generators. The nightly run also benchmarks the image.
   the cache through `crazy-max/ghaction-github-runtime`, which exposes the
   runtime token that `docker/build-push-action` would otherwise handle;
   the build stays in the one script that local builds use.
-- **Tags: amd64 and native arm64.** On a `v*` tag (checked against the
-  crate version first) the job is a matrix of `ubuntu-24.04` and
-  `ubuntu-24.04-arm`; each leg builds and tests its own image natively and
-  uploads it as a workflow artifact (`scripts/docker-archive.sh`: a gzipped
-  `docker save`, 177 MB for amd64). The repository variable
-  `PG_AUTOMERGE_ARM64=false` drops the arm64 leg where GitHub's arm64
-  runners are not available. Alternatives considered for arm64:
+- **Releases: amd64 and native arm64.** For a release (`release.yml`
+  calls `ci.yml` with `release: true`) the job is a matrix of
+  `ubuntu-24.04` and `ubuntu-24.04-arm`; each leg builds and tests its own
+  image natively and uploads it as a workflow artifact
+  (`scripts/docker-archive.sh`: a gzipped `docker save`, 177 MB for
+  amd64). Pushes and pull requests build amd64 only. A release needs both
+  architectures (the publish step refuses an index without one of them).
+  Alternatives considered for arm64:
   - *QEMU* (`docker buildx build --platform linux/arm64` on an amd64
     runner): no change to the Dockerfile, but every compiler process of
     the builder stage runs emulated. The cold build is about 6 minutes of
     compilation (cargo-pgrx, then the extension with fat LTO); user-mode
     emulation typically slows `rustc` by an order of magnitude, so that
-    becomes an hour or more per cold tag build, and a source change still
+    becomes an hour or more per cold release build, and a source change still
     recompiles everything that is not in the layer cache. Not measured
     here: that would need QEMU's binfmt handlers registered in this
     machine's kernel, a host-wide change.
@@ -375,40 +376,49 @@ suites' fixture generators. The nightly run also benchmarks the image.
     emulation, and the whole of `tests/docker.sh` (memory-limit crashes,
     `pg_regress`, the suites) runs on the architecture it ships for. Its
     cost is the dependency on GitHub's arm64 runner and a second cold
-    build per tag, in parallel.
-- **Publishing is prepared, not enabled.** The `publish` job runs on tags
-  after `ci`, `docker` and `cnpg-e2e` passed, downloads the tested archives and
-  pushes them with `scripts/docker-push.sh`: each archive is loaded (the
-  local tags it carries are put back afterwards, so a by-hand run with
-  the arm64 archive on an amd64 host does not repoint
-  `pg-automerge:<version>`), checked (version label equals the crate version, architecture equals
-  the file name's), tagged `<image>:<version>-<arch>` and pushed, then
-  `docker buildx imagetools create` makes `<image>:<version>` and
-  `<image>:latest` an index of them. The CNPG archives go through the
-  same script with `--cnpg` to `<cnpg image>:<version>-18-trixie`. Both
-  sets are dry-run (loaded and checked) before anything is pushed, and the
-  CNPG image is pushed before the full image, so `latest` moves last; a
-  registry refusing a push part way still leaves an incomplete release,
-  which re-running the (idempotent) job completes. Pushing
-  the tested bytes rather than rebuilding for the registry means what is
-  published is what passed. Every step after the first is gated on an
-  explicit opt-in: the variable `PG_AUTOMERGE_PUBLISH=ghcr` (ghcr.io with
-  the workflow's `GITHUB_TOKEN`, images defaulting to
-  `ghcr.io/<owner>/pg-automerge` and `-cnpg`), or the secret
-  `PG_AUTOMERGE_REGISTRY_TOKEN` plus the variables for the image and user
-  (any registry). Without either the job logs a notice and succeeds. The
-  ghcr.io default is not automatic even on GitHub: a fork's or a private
-  copy's tag would otherwise publish packages under its owner unasked.
-  The workflow's token is `contents: read`; only `publish` gets
-  `packages: write`, used solely for the ghcr.io login in the ghcr mode.
-  `tests/check_ci.sh` fails if any step outside `publish` logs in, pushes
-  or uses `GITHUB_TOKEN`, if a `publish` step is not gated, if any other
-  job asks for write permissions or anything for `push: true`, if the
-  ghcr mode could push elsewhere, or if the job stops depending on the
-  three test jobs. The repository name must start with a
-  registry host, so a typo cannot send the image to Docker Hub.
+    build per release, in parallel.
+- **Publishing: a GitHub release.** Publishing a release (tag
+  `v<Cargo.toml version>`) runs `.github/workflows/release.yml`: a check
+  of the tag against `Cargo.toml` at the tag's commit, all of `ci.yml` on
+  that commit with `release: true`, then a `publish` job (environment
+  `release`) that needs both and also requires the `cnpg-e2e` job's
+  output (set by its last step, so a skipped or failed end-to-end test
+  publishes nothing). It downloads the tested archives and runs
+  `scripts/release-publish.sh`, which pushes them with
+  `scripts/docker-push.sh`: each archive is loaded (the local tags it
+  carries are put back afterwards, so a by-hand run with the arm64
+  archive on an amd64 host does not repoint `pg-automerge:<version>`),
+  checked (version label equals the crate version, architecture equals
+  the file name's, amd64 and arm64 both present and no duplicate, the
+  source and revision labels equal the repository and the tag's commit),
+  tagged `<image>:<version>-<arch>` and pushed, then
+  `docker buildx imagetools create` makes `<image>:<version>` (and
+  `:latest` for the repository's latest non-prerelease release) an index
+  of them, annotated with the same source, revision and version. The CNPG
+  archives go through the same script with `--cnpg` to
+  `<cnpg image>:<version>-18-trixie`. Both sets are checked before
+  anything is pushed, and the CNPG image is pushed before the full image,
+  so `latest` moves last; a registry refusing a push part way leaves an
+  incomplete release, which running the workflow again for the release
+  completes (every step is idempotent: the same bytes and tags, assets
+  uploaded with `--clobber`, the notes section replaced). Pushing the
+  tested bytes rather than rebuilding for the registry means what is
+  published is what passed. The images go to
+  `ghcr.io/theknarf/pg-automerge` and `ghcr.io/theknarf/pg-automerge-cnpg`
+  (the owner in lower case) with the workflow's `GITHUB_TOKEN`: no
+  secret, no opt-in variable. Only `publish` gets write permissions
+  (`packages: write`, `contents: write` for the release assets);
+  `ci.yml` and the other release jobs are `contents: read`.
+  `tests/check_ci.sh` fails if `ci.yml` gets a tag trigger, a publish
+  job, a registry login, a push or a write permission, if anything
+  outside `publish` logs in, pushes or edits the release, if `publish`
+  stops depending on `check` and `test` or on `cnpg-e2e`'s output, or
+  leaves the `release` environment, or if the publish script stops
+  checking both image sets before pushing. The repository name must start
+  with a registry host, so a typo cannot send the image to Docker Hub.
+  See [Releasing](../operations/releasing.mdx).
 - **Linting the workflow.** `mise.toml` pins `actionlint` and `shellcheck`
-  (prebuilt binaries); `check_ci.sh` runs actionlint on the workflow
+  (prebuilt binaries); `check_ci.sh` runs actionlint on the workflows
   (syntax, expression types, runner labels, and shellcheck on every
   `run:` script) and shellcheck (warnings and errors) on the scripts CI
   runs, then the job invariants above. Each invariant was checked by

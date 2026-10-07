@@ -54,10 +54,13 @@ and a load cannot be cancelled, so installing it into a database remains
 a superuser's decision. Details in
 [Installation, schema and privileges](../design/installation.mdx).
 
-There are no published packages yet (tag builds in CI attach a tarball,
-built against the PGDG Postgres 18 on Ubuntu, to the workflow run as an
-artifact; they are not GitHub releases). To build one for another
-machine, use that server's `pg_config` (same Postgres major version, same
+Each [GitHub release](https://github.com/TheKnarf/pg-automerge/releases)
+has a package, `pg_automerge-<version>-pg18-linux-amd64.tar.gz`, built
+against the PGDG PostgreSQL 18 on Ubuntu 24.04 (amd64, glibc 2.39) and
+checked by installing it there (see [Releasing](../operations/releasing.mdx));
+`sudo tar -C / -xzf` it on a server with the PGDG packages' layout
+(`/usr/lib/postgresql/18`), after `sha256sum -c SHA256SUMS`. To build one
+for another machine, use that server's `pg_config` (same Postgres major version, same
 platform). `PG_CONFIG` is required, and pgrx's own development Postgres
 (under `~/.pgrx`) is refused: a package built for it would unpack into
 `~/.pgrx/...` where no real server looks.

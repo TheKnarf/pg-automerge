@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Push image archives made by scripts/docker-archive.sh (one per
 # architecture) to a registry as one multi-architecture image. Used by the
-# CI publish job, which runs only on version tags and only once a registry
-# is configured (see
-# docs/src/pages/operations/docker-ci.mdx, "Publishing the images").
-# Nothing in this
-# repository calls it otherwise.
+# publish job of .github/workflows/release.yml, which runs for a published
+# GitHub release after every test job passed and pushes to ghcr.io with the
+# workflow's GITHUB_TOKEN (see docs/src/pages/operations/releasing.mdx);
+# the caller must be logged in to the registry.
 #
 # For each archive: `docker load`, check that the image's version label is
 # Cargo.toml's version and its architecture the one in the file name, tag
@@ -13,34 +12,51 @@
 # IMAGE-ID` for each. The local tags the archive carries (e.g.
 # pg-automerge:<version>) are put back as they were before the load, so
 # loading the arm64 archive does not repoint your amd64 pg-automerge tag. Then
-# `docker buildx imagetools create` makes REPOSITORY:<version> (and
-# REPOSITORY:latest, unless PG_AUTOMERGE_PUSH_LATEST=0) an index of the
-# per-architecture images. The caller must be logged in to the registry.
+# `docker buildx imagetools create` makes REPOSITORY:<version> an index of
+# the per-architecture images, annotated with the images' OCI source,
+# revision and version labels (which must be the same in every archive).
 #
 # --cnpg: the archives are CloudNativePG extension images
 # (pg-automerge-cnpg-<version>-18-<debian>-linux-<arch>.tar.gz), each also
 # checked for its io.cloudnativepg.image.base.os label, tagged
 # REPOSITORY:<version>-18-<debian>-<arch>, and indexed per Debian release as
-# REPOSITORY:<version>-18-<debian> (CNPG's tag convention; no latest).
-#
+# REPOSITORY:<version>-18-<debian> (CNPG's tag convention; never latest).
+# --latest: also point REPOSITORY:latest at the index (not with --cnpg).
+# --arch ARCH (repeatable): the archives must cover exactly these
+#   architectures (for each Debian release, with --cnpg); release.yml
+#   passes --arch amd64 --arch arm64.
+# --revision SHA, --source URL: every image's org.opencontainers.image.
+#   revision / .source label must be exactly this (release.yml: the tag's
+#   commit and the repository).
 # --dry-run: load and check everything, print the push and imagetools
-# commands instead of running them, and remove the tags it made (and an
-# image the load added that no tag refers to any more).
+#   commands instead of running them, and remove the tags it made (and an
+#   image the load added that no tag refers to any more).
 #
-# Usage: docker-push.sh [--dry-run] [--cnpg] REPOSITORY ARCHIVE...
+# Usage: docker-push.sh [--dry-run] [--cnpg] [--latest] [--arch ARCH]...
+#                       [--revision SHA] [--source URL] REPOSITORY ARCHIVE...
 #   REPOSITORY: fully qualified, registry host first, lower case, e.g.
-#   ghcr.io/you/pg-automerge or docker.io/you/pg-automerge (with --cnpg,
-#   e.g. ghcr.io/you/pg-automerge-cnpg).
+#   ghcr.io/you/pg-automerge (with --cnpg, ghcr.io/you/pg-automerge-cnpg).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail() { echo "docker-push.sh: $*" >&2; exit 1; }
 
-dry_run=0 cnpg=0
-while [[ "${1:-}" == --dry-run || "${1:-}" == --cnpg ]]; do
-    if [[ "$1" == --dry-run ]]; then dry_run=1; else cnpg=1; fi
-    shift
+dry_run=0 cnpg=0 latest=0 want_revision='' want_source=''
+want_arches=()
+while (($#)); do
+    case "$1" in
+        --dry-run) dry_run=1; shift ;;
+        --cnpg) cnpg=1; shift ;;
+        --latest) latest=1; shift ;;
+        --arch) [[ "${2:-}" =~ ^[a-z0-9]+$ ]] || fail "--arch needs an architecture"; want_arches+=("$2"); shift 2 ;;
+        --revision) [[ "${2:-}" =~ ^[0-9a-f]{40}$ ]] || fail "--revision needs a full commit SHA"; want_revision="$2"; shift 2 ;;
+        --source) [[ "${2:-}" =~ ^https://[^@[:space:]]+$ ]] || fail "--source needs an https URL"; want_source="$2"; shift 2 ;;
+        --*) fail "unknown option $1" ;;
+        *) break ;;
+    esac
 done
-(($# >= 2)) || fail "usage: docker-push.sh [--dry-run] [--cnpg] REPOSITORY ARCHIVE..."
+if ((cnpg && latest)); then fail "--latest is not for the CNPG extension image (CNPG's tags have no latest)"; fi
+usage="usage: docker-push.sh [--dry-run] [--cnpg] [--latest] [--arch ARCH]... [--revision SHA] [--source URL] REPOSITORY ARCHIVE..."
+(($# >= 2)) || fail "$usage"
 repo="$1"; shift
 # A registry host (with a dot or port, or localhost) and a path: never a
 # bare name that Docker would silently send to Docker Hub.
@@ -79,6 +95,8 @@ trap cleanup EXIT
 
 seen=" "
 declare -A index_tags=()   # index tag -> the per-arch tags it is made of
+declare -A index_arches=() # index tag -> the architectures in it
+source_label='' revision_label='' first=1
 for archive in "$@"; do
     name="$(basename "$archive")"
     debian=''
@@ -118,17 +136,48 @@ for archive in "$@"; do
     image_debian="$(docker image inspect -f '{{index .Config.Labels "io.cloudnativepg.image.base.os"}}' "$loaded")"
     [[ "$image_debian" == "$debian" ]] || fail "$archive: image io.cloudnativepg.image.base.os label '$image_debian', expected '$debian'"
 
+    # One commit and repository for every image of the release.
+    src="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.source"}}' "$loaded")"
+    rev="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$loaded")"
+    [[ -z "$want_source" || "$src" == "$want_source" ]] || fail "$archive: image source label '$src', expected $want_source"
+    [[ -z "$want_revision" || "$rev" == "$want_revision" ]] || fail "$archive: image revision label '$rev', expected $want_revision"
+    if ((first)); then
+        source_label="$src" revision_label="$rev" first=0
+    elif [[ "$src" != "$source_label" || "$rev" != "$revision_label" ]]; then
+        fail "$archive: source/revision labels '$src' '$rev' differ from the first archive's ('$source_label' '$revision_label')"
+    fi
+
     if ((cnpg)); then index_tag="$repo:$version-18-$debian"; else index_tag="$repo:$version"; fi
     tag="$index_tag-$arch"
     docker tag "$loaded" "$tag"
     tags+=("$tag")
     index_tags[$index_tag]+=" $tag"
-    run docker push "$tag"
+    index_arches[$index_tag]+=" $arch"
 done
+
+# Every index must hold exactly the required architectures (checked for
+# all of them before anything is pushed).
+if ((${#want_arches[@]})); then
+    want="$(printf '%s\n' "${want_arches[@]}" | sort -u | tr '\n' ' ')"
+    for index_tag in "${!index_arches[@]}"; do
+        # shellcheck disable=SC2086 # a word list of architectures
+        got="$(printf '%s\n' ${index_arches[$index_tag]} | sort -u | tr '\n' ' ')"
+        [[ "$got" == "$want" ]] || fail "$index_tag: archives for ${got% }, required ${want% }"
+    done
+fi
+
+for tag in "${tags[@]}"; do run docker push "$tag"; done
+
+# The index carries the images' labels as annotations (what registries
+# such as ghcr.io show for a multi-architecture image).
+annotations=()
+[[ -z "$source_label" ]] || annotations+=(--annotation "index:org.opencontainers.image.source=$source_label")
+[[ -z "$revision_label" ]] || annotations+=(--annotation "index:org.opencontainers.image.revision=$revision_label")
+annotations+=(--annotation "index:org.opencontainers.image.version=$version")
 
 for index_tag in $(printf '%s\n' "${!index_tags[@]}" | sort); do
     index=(-t "$index_tag")
-    ((cnpg)) || [[ "${PG_AUTOMERGE_PUSH_LATEST:-1}" == 0 ]] || index+=(-t "$repo:latest")
+    if ((latest)); then index+=(-t "$repo:latest"); fi
     # shellcheck disable=SC2086 # a word list of tags
-    run docker buildx imagetools create "${index[@]}" ${index_tags[$index_tag]}
+    run docker buildx imagetools create "${annotations[@]}" "${index[@]}" ${index_tags[$index_tag]}
 done

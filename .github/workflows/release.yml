@@ -1,0 +1,171 @@
+# Releases: publishing a GitHub release ("Draft a new release", tag
+# v<Cargo.toml version>) runs this workflow (see
+# docs/src/pages/operations/releasing.mdx):
+#   - check: the tag is v<Cargo.toml version> at the tag's commit, the
+#     release is published (not a draft); outputs the version, the commit
+#     and whether it is a prerelease.
+#   - test: all of ci.yml on the tag's commit with release: true (the ci
+#     and docs jobs, the docker job on amd64 and native arm64, cnpg-e2e,
+#     the package tarball built against PGDG Postgres 18, the image
+#     archives of both architectures as artifacts).
+#   - publish (environment release; only after every job of test passed):
+#     scripts/release-publish.sh pushes the tested archives to ghcr.io as
+#     multi-architecture images with the workflow's GITHUB_TOKEN, uploads
+#     the release assets and adds the docker/CNPG section to the notes.
+# Run it again for the same release with Actions > Release > Run workflow
+# and the tag: every step is idempotent.
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release's tag (v<version>) to build, test and publish again"
+        required: true
+        type: string
+
+# One run per release at a time; a second one waits instead of cancelling a
+# publish part way.
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+# Read-only by default; only publish may write (packages, release assets).
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - name: The release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${EVENT_TAG:-$INPUT_TAG}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "::error::release tag '$tag' is not v<version> (e.g. v0.1.0)"
+            exit 1
+          fi
+          json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease)" || {
+            echo "::error::no GitHub release for the tag $tag"
+            exit 1
+          }
+          if [ "$(jq -r .isDraft <<<"$json")" = true ]; then
+            echo "::error::the release $tag is a draft; publish it first"
+            exit 1
+          fi
+          prerelease="$(jq -r .isPrerelease <<<"$json")"
+          # A semver prerelease version (0.2.0-rc.1) never moves :latest,
+          # even if the release was not marked as a prerelease.
+          if [[ "$tag" == *-* ]] && [ "$prerelease" != true ]; then
+            echo "::warning::$tag has a prerelease version but the release is not marked as a prerelease; treating it as one (no :latest)"
+            prerelease=true
+          fi
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.release.outputs.tag }}
+
+      - name: The tag matches Cargo.toml's version
+        id: version
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          version="$(sh scripts/versions.sh | sed -n 's/^CRATE_VERSION=//p')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::the release tag $TAG does not match Cargo.toml's version $version at that tag: tag the commit whose Cargo.toml says the version, as v$version"
+            exit 1
+          fi
+          entry="$(grep -E "^## ${version//./\\.}( |$)" CHANGELOG.md || true)"
+          if [ -z "$entry" ]; then
+            echo "::warning::CHANGELOG.md has no '## $version' entry at $TAG"
+          elif [[ "$entry" == *unreleased* ]]; then
+            echo "::warning::CHANGELOG.md still says '$entry' at $TAG"
+          fi
+          sha="$(git rev-parse HEAD)"
+          echo "Release $TAG: version $version, commit $sha"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+
+  # Everything ci.yml runs, on the tag's commit, plus what the release
+  # publishes (arm64, cnpg-e2e, the package, the image archives).
+  test:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    with:
+      release: true
+      ref: ${{ needs.check.outputs.sha }}
+
+  # Only after check and every job of test passed (cnpg-e2e included: the
+  # workflow's cnpg-e2e-passed output is set by its last step only).
+  # packages: write for ghcr.io and contents: write for the release assets
+  # and notes, here only; the token is GITHUB_TOKEN.
+  publish:
+    needs: [check, test]
+    if: needs.test.outputs.cnpg-e2e-passed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.check.outputs.tag }}
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pg-automerge-*-linux-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: pg_automerge-pg18
+          path: dist
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # :latest only for the repository's latest release (not a
+      # prerelease, and not an older release run again after a newer one).
+      - name: Push the images, upload the assets, update the notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          SHA: ${{ needs.check.outputs.sha }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+        run: |
+          ls -l dist
+          latest=()
+          newest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          if [ "$PRERELEASE" != true ] && [ "$newest" = "$TAG" ]; then
+            latest=(--latest)
+          else
+            echo "::notice::not moving :latest ($TAG: prerelease=$PRERELEASE, the latest release is '${newest:-none}')"
+          fi
+          bash scripts/release-publish.sh "${latest[@]}" "$TAG" "$SHA" "$GITHUB_REPOSITORY" dist
