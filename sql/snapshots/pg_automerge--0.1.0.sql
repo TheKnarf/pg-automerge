@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:65
+-- src/io.rs:62
 -- creates:
 --   Type(pg_automerge::io::AutomergeDatum)
 --   Type(pg_automerge::io::AutomergeArg)
@@ -48,18 +48,6 @@ COMMENT ON FUNCTION automerge_send(automerge) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/notify.rs:135
--- requires:
---   automerge_type
-
-
-CREATE FUNCTION automerge_notify() RETURNS trigger
-    LANGUAGE c AS 'MODULE_PATHNAME', 'automerge_notify_wrapper';
-COMMENT ON FUNCTION automerge_notify() IS
-    'AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW trigger: automerge_notify(channel, key_column [, ...]) sends NOTIFY channel with the row key and the heads of changed automerge columns.';
-/* </end connected objects> */
-
-/* <begin connected objects> */
 -- src/history.rs:16
 -- requires:
 --   automerge_type
@@ -95,7 +83,19 @@ COMMENT ON TYPE automerge_change_meta IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:220
+-- src/notify.rs:138
+-- requires:
+--   automerge_type
+
+
+CREATE FUNCTION automerge_notify() RETURNS trigger
+    LANGUAGE c AS 'MODULE_PATHNAME', 'automerge_notify_wrapper';
+COMMENT ON FUNCTION automerge_notify() IS
+    'AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW trigger: automerge_notify(channel, key_column [, ...]) sends NOTIFY channel with the row key and the heads of changed automerge columns.';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/history.rs:258
 -- pg_automerge::history::automerge_change_count
 CREATE  FUNCTION "automerge_change_count"(
 	"doc" automerge /* AutomergeArg */
@@ -106,7 +106,7 @@ AS 'MODULE_PATHNAME', 'automerge_change_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:149
+-- src/history.rs:187
 -- pg_automerge::history::automerge_changes
 -- requires:
 --   automerge_change_types
@@ -121,7 +121,7 @@ AS 'MODULE_PATHNAME', 'automerge_changes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:189
+-- src/history.rs:227
 -- pg_automerge::history::automerge_changes_bytes
 CREATE  FUNCTION "automerge_changes_bytes"(
 	"doc" automerge, /* AutomergeArg */
@@ -133,7 +133,7 @@ AS 'MODULE_PATHNAME', 'automerge_changes_bytes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:168
+-- src/history.rs:206
 -- pg_automerge::history::automerge_changes_meta
 -- requires:
 --   automerge_change_types
@@ -172,7 +172,7 @@ AS 'MODULE_PATHNAME', 'automerge_contains_changes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:116
+-- src/io.rs:113
 -- pg_automerge::io::automerge_from_bytea
 CREATE  FUNCTION "automerge_from_bytea"(
 	"bytes" bytea /* & [u8] */
@@ -183,7 +183,7 @@ AS 'MODULE_PATHNAME', 'automerge_from_bytea_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:204
+-- src/history.rs:242
 -- pg_automerge::history::automerge_get_change
 -- requires:
 --   automerge_change_types
@@ -228,6 +228,43 @@ COMMENT ON FUNCTION automerge_contains(automerge, bytea) IS
 -- src/io.rs:19
 -- pg_automerge::io::automerge_in
 -- Skipped due to `#[pgrx(sql = false)]`
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/memory.rs:49
+-- pg_automerge::memory::automerge_memory_reset
+CREATE  FUNCTION "automerge_memory_reset"() RETURNS void
+STRICT VOLATILE PARALLEL RESTRICTED
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_memory_reset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/memory.rs:24
+-- pg_automerge::memory::automerge_memory_usage
+CREATE  FUNCTION "automerge_memory_usage"() RETURNS TABLE (
+	"allocated_bytes" bigint,  /* i64 */
+	"peak_allocated_bytes" bigint,  /* i64 */
+	"live_documents" bigint,  /* i64 */
+	"loads" bigint,  /* i64 */
+	"load_time" double precision  /* f64 */
+)
+STRICT VOLATILE PARALLEL RESTRICTED
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_memory_usage_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/memory.rs:55
+-- requires:
+--   automerge_memory_usage
+--   automerge_memory_reset
+
+
+COMMENT ON FUNCTION automerge_memory_usage() IS
+    'Memory of pg_automerge in this backend, outside Postgres memory contexts: bytes its Rust code holds now and at most (since the backend started or automerge_memory_reset()), loaded documents alive, Automerge loads and their total time in milliseconds.';
+COMMENT ON FUNCTION automerge_memory_reset() IS
+    'Start the peak of automerge_memory_usage() over from the current allocation, and its load count and load time from zero, in this backend.';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -309,7 +346,45 @@ AS 'MODULE_PATHNAME', 'automerge_merge_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:122
+-- src/spans.rs:46
+-- pg_automerge::spans::automerge_spans
+CREATE  FUNCTION "automerge_spans"(
+	"doc" automerge, /* AutomergeArg */
+	"path" TEXT[] /* Vec < Option < String > > */
+) RETURNS jsonb /* Option < JsonbDatum > */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_spans_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/spans.rs:54
+-- pg_automerge::spans::automerge_spans
+CREATE  FUNCTION "automerge_spans"(
+	"doc" automerge, /* AutomergeArg */
+	"path" TEXT[], /* Vec < Option < String > > */
+	"heads" TEXT[] /* Vec < Option < String > > */
+) RETURNS jsonb /* Option < JsonbDatum > */
+IMMUTABLE STRICT PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'automerge_spans_at_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/spans.rs:64
+-- requires:
+--   automerge_spans
+--   automerge_spans_at
+
+
+COMMENT ON FUNCTION automerge_spans(automerge, text[]) IS
+    'The text object at path (as for #>) as jsonb spans: text runs with their marks, and blocks, as Automerge''s JavaScript spans() returns them; NULL if nothing is at path.';
+COMMENT ON FUNCTION automerge_spans(automerge, text[], text[]) IS
+    'automerge_spans(doc, path) as of the given heads (''{}'': before any change).';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/io.rs:120
 -- pg_automerge::io::automerge_to_jsonb
 CREATE  FUNCTION "automerge_to_jsonb"(
 	"doc" automerge /* AutomergeArg */
@@ -320,7 +395,7 @@ AS 'MODULE_PATHNAME', 'automerge_to_jsonb_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/io.rs:136
+-- src/io.rs:132
 -- requires:
 --   automerge_type
 --   automerge_from_bytea
@@ -347,7 +422,7 @@ COMMENT ON CAST (automerge AS jsonb) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:231
+-- src/history.rs:269
 -- pg_automerge::history::automerge_to_jsonb
 CREATE  FUNCTION "automerge_to_jsonb"(
 	"doc" automerge, /* AutomergeArg */
@@ -359,7 +434,7 @@ AS 'MODULE_PATHNAME', 'automerge_to_jsonb_at_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/history.rs:244
+-- src/history.rs:282
 -- requires:
 --   automerge_changes
 --   automerge_changes_meta
