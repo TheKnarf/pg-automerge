@@ -94,13 +94,16 @@ same release waits for a running one instead of cancelling it.
 
 ## One-time setup
 
-- **Make the packages public.** The first release creates the two
+- **Check the packages are public.** The first release creates the two
   packages, `pg-automerge` and `pg-automerge-cnpg`, under the account and
-  links them to the repository (through the images' source label). New
-  packages are **private**: in each package's settings (Packages > the
-  package > Package settings > Change visibility), make it public, so
-  `docker pull` and a Kubernetes cluster need no credentials. Until then
-  the release's pull commands work only for you.
+  links them to the repository (through the images' source label). For
+  this public repository they came out **public** on the first release
+  (v0.1.0): anyone can `docker pull` them and a Kubernetes cluster needs no
+  credentials. Confirm it once without logging in, e.g.
+  `DOCKER_CONFIG=$(mktemp -d) docker buildx imagetools inspect ghcr.io/theknarf/pg-automerge:<version>`.
+  If a package is private (a private repository, or a package created
+  before it was linked), change it in the package's settings (Packages >
+  the package > Package settings > Change visibility).
 - **Optional: approve every publish.** The `publish` job runs in a GitHub
   environment called `release`, created on the first run. Give it
   required reviewers (Settings > Environments > release > Required
