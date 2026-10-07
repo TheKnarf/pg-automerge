@@ -8,7 +8,7 @@ documentation). Each entry
 says whether an update needs more than recreating the container (or
 installing the package) and `ALTER EXTENSION pg_automerge UPDATE`.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-10-07)
 
 First release: PostgreSQL 18 only, Automerge 0.12.0 (pinned). As a source
 build (`cargo pgrx install`, or a package with `mise run package`) and as
